@@ -14,64 +14,6 @@ env:
   ZIG_VERSION: "0.15.2"
 
 jobs:
-  build-macos:
-    name: Build macOS Release (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      matrix:
-        include:
-          - arch: arm64
-            runner: macos-15
-            zig_host: aarch64-macos
-          - arch: x86_64
-            runner: macos-15-intel
-            zig_host: x86_64-macos
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install dependencies (Homebrew)
-        run: brew install freetype harfbuzz
-
-      - name: Download and Setup Zig
-        run: |
-          curl -L -o zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-${{ matrix.zig_host }}-${ZIG_VERSION}.tar.xz"
-          tar -xf zig.tar.xz
-          echo "$PWD/zig-${{ matrix.zig_host }}-${ZIG_VERSION}" >> $GITHUB_PATH
-
-      - name: Build Zig Core (macOS)
-        run: zig build -Doptimize=ReleaseFast
-
-      - name: Build macOS App (Release)
-        run: |
-          xcodebuild -project macos/zonvie.xcodeproj \
-            -scheme zonvie \
-            -configuration Release \
-            -derivedDataPath macos/.derived \
-            -destination "platform=macOS,arch=${{ matrix.arch }}" \
-            build
-
-      - name: Create macOS DMG
-        run: |
-          APP_PATH="macos/.derived/Build/Products/Release/zonvie.app"
-          DMG_NAME="zonvie-${{ github.ref_name }}-macos-${{ matrix.arch }}.dmg"
-
-          # Create temporary directory for DMG contents
-          mkdir -p dmg_contents
-          cp -R "$APP_PATH" dmg_contents/
-          ln -s /Applications dmg_contents/Applications
-
-          # Create DMG
-          hdiutil create -volname "Zonvie" \
-            -srcfolder dmg_contents \
-            -ov -format UDZO \
-            "$DMG_NAME"
-
-      - name: Upload macOS DMG
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-release-${{ matrix.arch }}
-          path: "*.dmg"
-
   build-windows:
     name: Build Windows Release (${{ matrix.arch }})
     runs-on: ubuntu-latest
@@ -80,8 +22,6 @@ jobs:
         include:
           - arch: x64
             target: x86_64-windows-gnu
-          - arch: arm64
-            target: aarch64-windows-gnu
     steps:
       - uses: actions/checkout@v4
 
@@ -109,7 +49,7 @@ jobs:
 
   create-release:
     name: Create GitHub Release
-    needs: [build-macos, build-windows]
+    needs: [build-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
