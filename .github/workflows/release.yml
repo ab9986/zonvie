@@ -33,10 +33,6 @@ jobs:
 
       - name: Build Windows App (Release)
         run: zig build windows -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
-             ts=`date +'%Y%m%d'`
-          commit=`git rev-parse --short=7 HEAD`
-          version=`echo ${major_ver}.${{ github.run_number }}.${ts}.${commit}`
-          echo "version=${version}" >> $GITHUB_ENV
 
       - name: Create Windows ZIP
         run: |
