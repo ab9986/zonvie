@@ -792,6 +792,33 @@ test "retry entry points reject work after stop is requested" {
     try std.testing.expectEqual(@as(u32, 0), state.callback_count);
 }
 
+test "grid text extraction trims blanks and reports the size a short buffer needs" {
+    const p = zonvie_core_create(null, 0, null) orelse return error.OutOfMemory;
+    defer zonvie_core_destroy(p);
+    const box = asBox(p);
+
+    const gid = grid_mod.MESSAGE_GRID_ID;
+    try box.core.grid.resizeGrid(gid, 4, 8);
+    box.core.grid.clearGrid(gid);
+    // Row 0 "hi", row 1 blank, row 2 "ok" with trailing blanks, row 3 blank.
+    _ = box.core.grid.putCellGrid(gid, 0, 0, 'h', 0);
+    _ = box.core.grid.putCellGrid(gid, 0, 1, 'i', 0);
+    _ = box.core.grid.putCellGrid(gid, 2, 0, 'o', 0);
+    _ = box.core.grid.putCellGrid(gid, 2, 1, 'k', 0);
+
+    var buf: [32]u8 = undefined;
+    const needed = zonvie_core_try_get_grid_text(p, gid, &buf, buf.len);
+    try std.testing.expectEqual(@as(isize, 6), needed);
+    try std.testing.expectEqualStrings("hi\n\nok", buf[0..@intCast(needed)]);
+
+    // A buffer that cannot hold the whole text still reports the full size.
+    var short: [2]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 6), zonvie_core_try_get_grid_text(p, gid, &short, short.len));
+
+    // An unknown grid is empty, not an error.
+    try std.testing.expectEqual(@as(isize, 0), zonvie_core_try_get_grid_text(p, 4242, &buf, buf.len));
+}
+
 test "current mode accessor returns a snapshot independent of core storage" {
     const p = zonvie_core_create(null, 0, null) orelse return error.OutOfMemory;
     defer zonvie_core_destroy(p);
@@ -1046,7 +1073,9 @@ pub export fn zonvie_core_update_layout_px(
 /// section: pass 0 to keep the drawable-width-derived value that
 /// updateLayoutPxLocked computes, or a display-derived count to override it.
 /// Taking grid_mu a second time via the blocking set_screen_cols would negate
-/// the whole point of this entry point.
+/// the whole point of this entry point. `cmdline_default_cols` folds
+/// zonvie_core_set_cmdline_default_cols in for the same reason; 0 keeps the
+/// current value.
 pub export fn zonvie_core_try_update_layout_px(
     p: ?*zonvie_core,
     drawable_w_px: u32,
@@ -1054,6 +1083,7 @@ pub export fn zonvie_core_try_update_layout_px(
     cell_w_px: u32,
     cell_h_px: u32,
     screen_cols: u32,
+    cmdline_default_cols: u32,
 ) callconv(.c) bool {
     // A null handle is permanently unusable, not transiently busy. Returning
     // "busy" here would make a conforming caller retry forever.
@@ -1071,6 +1101,7 @@ pub export fn zonvie_core_try_update_layout_px(
         // thread already owns. Same reasoning as the blocking twin above.
         _ = cp.updateLayoutPxLocked(drawable_w_px, drawable_h_px, cell_w_px, cell_h_px);
         if (screen_cols != 0) cp.grid.screen_cols = screen_cols;
+        if (cmdline_default_cols != 0) cp.grid.cmdline_default_cols = cmdline_default_cols;
         return true;
     }
 
@@ -1080,6 +1111,7 @@ pub export fn zonvie_core_try_update_layout_px(
     defer cp.grid_mu.unlock(clock.io());
     const changed = cp.updateLayoutPxLocked(drawable_w_px, drawable_h_px, cell_w_px, cell_h_px);
     if (screen_cols != 0) cp.grid.screen_cols = screen_cols;
+    if (cmdline_default_cols != 0) cp.grid.cmdline_default_cols = cmdline_default_cols;
     if (changed) {
         // Standalone layout changes must publish main and external vertices
         // together, still holding the lock tryLock just acquired. Dropping it
@@ -1099,6 +1131,16 @@ pub export fn zonvie_core_set_screen_cols(p: ?*zonvie_core, cols: u32) callconv(
     if (p == null) return;
     const box = asBox(p.?);
     box.core.setScreenCols(cols);
+}
+
+/// Set the cmdline's default width in cells: the width it shows before its
+/// content needs more, clamped up by zonvie_core_set_screen_cols. Only the
+/// frontend knows the window chrome beside the cmdline grid, so it derives
+/// this from the main window width. 0 restores the main grid's width.
+pub export fn zonvie_core_set_cmdline_default_cols(p: ?*zonvie_core, cols: u32) callconv(.c) void {
+    if (p == null) return;
+    const box = asBox(p.?);
+    box.core.setCmdlineDefaultCols(cols);
 }
 
 pub export fn zonvie_core_set_log_enabled(p: ?*zonvie_core, enabled: i32) callconv(.c) void {
@@ -1382,6 +1424,20 @@ pub export fn zonvie_core_try_get_viewport(
     return box.core.tryGetViewportInfo(grid_id, out_viewport.?) orelse -1;
 }
 
+/// Borrow 'smoothscroll' for a grid's window while a trackpad gesture runs, and
+/// hand it back afterwards. No-op off macOS. Returns 0 when the request could
+/// not be issued (grid lock busy, or no window known yet) — the caller must try
+/// again, which matters most for the restore.
+pub export fn zonvie_core_set_gesture_smooth_scroll(
+    p: ?*zonvie_core,
+    grid_id: i64,
+    enable: bool,
+) callconv(.c) i32 {
+    if (p == null) return 0;
+    const box = asBox(p.?);
+    return if (box.core.setGestureSmoothScroll(grid_id, enable)) 1 else 0;
+}
+
 /// Get current cursor position.
 /// Returns the grid_id of the cursor.
 pub export fn zonvie_core_get_cursor_position(
@@ -1478,6 +1534,16 @@ pub export fn zonvie_core_get_option_as_meta(p: ?*zonvie_core) callconv(.c) u8 {
     if (p == null) return 0;
     const box = asBox(p.?);
     return box.core.option_as_meta.load(.acquire);
+}
+
+/// Rows one wheel event scrolls: the 'ver' component of 'mousescroll'.
+/// Reported by the auto-injected reporter (macOS only) and refreshed when the
+/// option changes. Returns 0 for 'ver:0', which disables mouse scrolling in
+/// Neovim rather than making it page-relative. Lock-free atomic read.
+pub export fn zonvie_core_get_mousescroll_ver(p: ?*zonvie_core) callconv(.c) u32 {
+    if (p == null) return 0;
+    const box = asBox(p.?);
+    return box.core.mousescroll_ver.load(.acquire);
 }
 
 /// Set option_as_meta initial value from config (0=both, 1=none, 2=only_left, 3=only_right).
@@ -1918,8 +1984,10 @@ pub const zonvie_config_values = extern struct {
     scrollbar_delay: f32 = 1.0,
     // ext features
     cmdline_external: bool = false,
+    cmdline_copy_button: bool = true,
     popup_external: bool = false,
     messages_external: bool = false,
+    messages_copy_button: bool = true,
     messages_ext_float_pos: i32 = 0, // 0=window, 1=grid, 2=display
     messages_mini_pos: i32 = 1, // 0=window, 1=grid, 2=display
     tabline_external: bool = false,
@@ -2037,8 +2105,10 @@ fn buildConfigValues(alloc: std.mem.Allocator, cfg: *const config.Config) zonvie
         .scrollbar_delay = cfg.scrollbar.delay,
         // ext features
         .cmdline_external = cfg.cmdline.external,
+        .cmdline_copy_button = cfg.cmdline.copy_button,
         .popup_external = cfg.popup.external,
         .messages_external = cfg.messages.external,
+        .messages_copy_button = cfg.messages.copy_button,
         .messages_ext_float_pos = msgPosToInt(cfg.messages.msg_pos.ext_float),
         .messages_mini_pos = msgPosToInt(cfg.messages.msg_pos.mini),
         .tabline_external = cfg.tabline.external,
@@ -2066,10 +2136,10 @@ fn buildConfigValues(alloc: std.mem.Allocator, cfg: *const config.Config) zonvie
         .perf_hl_cache_size = @intCast(cfg.performance.hl_cache_size),
         .perf_shape_cache_size = @intCast(cfg.performance.shape_cache_size),
         .perf_atlas_size = @intCast(cfg.performance.atlas_size),
-        // ime
-        .ime_disable_on_activate = cfg.ime.disable_on_activate,
-        .ime_disable_on_modechange = cfg.ime.disable_on_modechange,
-        .ime_option_as_meta = @intFromEnum(cfg.ime.option_as_meta),
+        // ime (config surface lives in [input])
+        .ime_disable_on_activate = cfg.input.ime_disable_on_activate,
+        .ime_disable_on_modechange = cfg.input.ime_disable_on_modechange,
+        .ime_option_as_meta = @intFromEnum(cfg.input.option_as_meta),
         // shaders
         .shader_enabled = cfg.shaders.enabled,
         .shader_post_process = @intFromEnum(cfg.shaders.post_process),
@@ -2158,6 +2228,108 @@ pub export fn zonvie_core_try_cell_has_url(
     const hl_id = box.core.grid.getCellHLGrid(grid_id, @intCast(row), @intCast(col));
     const attr = box.core.hl.map.get(hl_id) orelse return 0;
     return if (attr.has_url) @as(i32, 1) else @as(i32, 0);
+}
+
+/// Truncating UTF-8 sink for zonvie_core_try_get_grid_text. `needed` keeps
+/// counting past `cap` so the caller learns the exact size to retry with.
+const GridTextSink = struct {
+    buf: ?[*]u8,
+    cap: usize,
+    needed: usize = 0,
+    written: usize = 0,
+
+    fn pushBytes(self: *GridTextSink, src: []const u8) void {
+        self.needed += src.len;
+        const buf = self.buf orelse return;
+        for (src) |ch| {
+            if (self.written >= self.cap) return;
+            buf[self.written] = ch;
+            self.written += 1;
+        }
+    }
+
+    fn pushCodepoint(self: *GridTextSink, cp: u32) void {
+        const cp21 = std.math.cast(u21, cp) orelse return;
+        var scratch: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(cp21, &scratch) catch return;
+        self.pushBytes(scratch[0..n]);
+    }
+};
+
+/// Non-blocking extraction of a grid's rendered text as UTF-8.
+///
+/// Rows are joined with '\n' and each row is trimmed of trailing blanks; a
+/// wide glyph's continuation cell (cp == 0) contributes nothing. Backs the
+/// frontends' "copy content" button on the decorated ext_cmdline /
+/// ext_messages surfaces, so it must never block the UI thread: the core
+/// thread holds `grid_mu` for the whole of handleRedraw and its callbacks
+/// can wait on the UI thread, so a blocking lock here would deadlock.
+///
+/// Returns the byte length the full text needs (NUL terminator excluded),
+/// or -1 when the grid lock is unavailable. When the return value is
+/// <= out_cap the buffer holds the complete text.
+pub export fn zonvie_core_try_get_grid_text(
+    p: ?*zonvie_core,
+    grid_id: i64,
+    out_buf: ?[*]u8,
+    out_cap: usize,
+) callconv(.c) isize {
+    if (p == null) return 0;
+    const box = asBox(p.?);
+    if (!box.core.grid_mu.tryLock()) return -1;
+    defer box.core.grid_mu.unlock(clock.io());
+
+    const g = &box.core.grid;
+    var rows: u32 = 0;
+    var cols: u32 = 0;
+    if (grid_id == 1) {
+        rows = g.rows;
+        cols = g.cols;
+    } else if (g.sub_grids.getPtr(grid_id)) |sg| {
+        rows = sg.rows;
+        cols = sg.cols;
+    } else {
+        return 0;
+    }
+
+    // `needed` counts the full text; `written` only what fit in out_buf, so
+    // a caller with a too-small buffer learns the exact size to retry with.
+    var sink = GridTextSink{ .buf = out_buf, .cap = out_cap };
+
+    // Newlines are emitted lazily so a run of blank rows costs nothing until
+    // a row with content follows; trailing blank rows produce no newlines.
+    var pending_newlines: usize = 0;
+    var row: u32 = 0;
+    while (row < rows) : (row += 1) {
+        // Trim trailing blanks by locating the last meaningful cell first.
+        var last_non_blank: ?u32 = null;
+        var probe: u32 = 0;
+        while (probe < cols) : (probe += 1) {
+            const cell = g.getCellGrid(grid_id, row, probe);
+            if (cell.cp != 0 and cell.cp != ' ') last_non_blank = probe;
+        }
+        const end_col = if (last_non_blank) |lc| lc + 1 else 0;
+        if (end_col == 0) {
+            if (sink.needed > 0) pending_newlines += 1;
+            continue;
+        }
+        while (pending_newlines > 0) : (pending_newlines -= 1) sink.pushBytes("\n");
+        if (sink.needed > 0 and row > 0) sink.pushBytes("\n");
+
+        var col: u32 = 0;
+        while (col < end_col) : (col += 1) {
+            const cell = g.getCellGrid(grid_id, row, col);
+            // cp == 0 is a wide glyph's continuation cell: it has no text.
+            if (cell.cp == 0) continue;
+            sink.pushCodepoint(cell.cp);
+            if (g.getOverflow(grid_id, row, col)) |extras| {
+                for (extras) |extra_cp| sink.pushCodepoint(extra_cp);
+            }
+        }
+    }
+    const needed = sink.needed;
+
+    return std.math.cast(isize, needed) orelse std.math.maxInt(isize);
 }
 
 // Invalidate glyph cache, shape cache, and atlas state.

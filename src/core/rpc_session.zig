@@ -1142,9 +1142,10 @@ pub fn setupClipboard(self: *Core) void {
 /// a per-tabpage state and reports it via the zonvie_agent_status notification:
 ///   0=none  1=idle (agent present)  2=working/claude  3=working/braille(codex).
 /// Agent presence + kind are latched per buffer (claude is recognized by its
-/// '✳' U+2733 idle marker or "Claude" in the title; anything else with a Braille
-/// spinner is treated as codex/generic). The frontend renders/animates from the
-/// low 7 bits of the wire state.
+/// '✳' U+2733 idle marker, its U+25D0..U+25D3 rotating-circle working spinner,
+/// or "Claude" in the title; anything else with a Braille spinner is treated as
+/// codex/generic). The frontend renders/animates from the low 7 bits of the
+/// wire state.
 /// Bit 7 (0x80) of the wire state is a "fire the OS notification now" flag,
 /// only ever set together with base state 1 (finished) or 4 (needs input).
 /// Completion is edge-detected per BUFFER (prevb[]), not per tab, because a
@@ -1184,17 +1185,30 @@ pub fn setupAgentStatus(self: *Core) void {
         \\    or t:find('to proceed') ~= nil or t:find('tell Claude') ~= nil
         \\    or t:find('%[y/n%]') ~= nil or t:find('Allow command') ~= nil
         \\end
-        \\local function spinning(title)
+        \\-- Leading marker of an agent's OSC title. Claude Code animates a
+        \\-- rotating circle (U+25D0..U+25D3) while working and shows the '✳'
+        \\-- U+2733 star when idle; codex and generic agents animate a Braille
+        \\-- spinner. While Claude works, the title body is its task summary --
+        \\-- the word "Claude" is absent -- so the circle is the only thing that
+        \\-- keeps the tab from looking like the agent exited.
+        \\local function marker(title)
         \\  local cp = title ~= '' and vim.fn.char2nr(title) or 0
-        \\  return cp >= 0x2800 and cp <= 0x28FF
+        \\  if cp >= 0x2800 and cp <= 0x28FF then return 'braille' end
+        \\  if cp >= 0x25D0 and cp <= 0x25D3 then return 'circle' end
+        \\  if cp == 0x2733 then return 'idle' end
+        \\  return nil
+        \\end
+        \\local function spinning(title)
+        \\  local m = marker(title)
+        \\  return m == 'braille' or m == 'circle'
         \\end
         \\-- classify returns 2/3 = working, 0 = gone, 1 = present-but-stopped
         \\-- (done OR waiting -- decided later by a deferred scrape, because the
         \\-- prompt box may not be in the buffer yet at the instant the spinner stops).
         \\local function classify(buf, title)
-        \\  local cp = title ~= '' and vim.fn.char2nr(title) or 0
-        \\  local spin = cp >= 0x2800 and cp <= 0x28FF
-        \\  local claudeish = cp == 0x2733 or title:find('Claude') ~= nil
+        \\  local m = marker(title)
+        \\  local spin = m == 'braille' or m == 'circle'
+        \\  local claudeish = m == 'idle' or m == 'circle' or title:find('Claude') ~= nil
         \\  if claudeish then present[buf] = true; kind[buf] = 'claude' end
         \\  if spin then present[buf] = true; if not kind[buf] then kind[buf] = 'braille' end end
         \\  if spin then return (kind[buf] == 'claude') and 2 or 3 end
@@ -1318,8 +1332,7 @@ pub fn setupAgentStatus(self: *Core) void {
         \\    local body = seq:match('^\27%]0;(.*)$') or seq:match('^\27%]1;(.*)$') or seq:match('^\27%]2;(.*)$')
         \\    if not body then return end
         \\    local s = classify(ev.buf, body)
-        \\    local cp0 = body ~= '' and vim.fn.char2nr(body) or 0
-        \\    local title = (cp0 == 0x2733 or (cp0 >= 0x2800 and cp0 <= 0x28FF)) and (body:gsub('^[^ ]+%s*', '')) or body
+        \\    local title = marker(body) and (body:gsub('^[^ ]+%s*', '')) or body
         \\    if s == 1 then
         \\      decide_stopped(ev.buf, title)
         \\    else
@@ -1355,8 +1368,7 @@ pub fn setupAgentStatus(self: *Core) void {
         \\    if vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].buftype == 'terminal' then
         \\      local ok, t = pcall(function() return vim.b[buf].term_title end)
         \\      t = (ok and t) or ''
-        \\      local cp = t ~= '' and vim.fn.char2nr(t) or 0
-        \\      local agentish = cp == 0x2733 or (cp >= 0x2800 and cp <= 0x28FF) or t:find('Claude') ~= nil
+        \\      local agentish = marker(t) ~= nil or t:find('Claude') ~= nil
         \\      -- Gone if the title is empty (zsh after exit), or a claude tab no
         \\      -- longer shows any agent marker (cmd.exe took the title over).
         \\      if t == '' or (kind[buf] == 'claude' and not agentish) then
@@ -1379,6 +1391,133 @@ pub fn setupAgentStatus(self: *Core) void {
         return;
     };
     self.log.write("agent status reporter installed\n", .{});
+}
+
+/// Report the 'ver' component of 'mousescroll' — how many rows one wheel
+/// event scrolls — and keep reporting it when the option changes.
+///
+/// The trackpad's sub-cell scrolling has to know this: it asks Neovim for
+/// rows before the finger has travelled them and cancels each arrival against
+/// the pixel offset it holds, so an event worth N rows must be accounted as N
+/// rows of travel. Assuming one row made a fast gesture jump, because the
+/// lookahead paid for one row while the content moved N.
+///
+/// 'ver:0' disables mouse scrolling entirely (it is not a page-relative
+/// setting) and reports 0; the frontend then has no row count to reason with
+/// and leaves the precise path alone. A setting with no 'ver' component at all
+/// reports 3, matching the default Neovim uses for an omitted direction — the
+/// Lua fallback is for a missing component, never for an explicit 0.
+/// augroup clear=true keeps re-injection idempotent. Fire-and-forget.
+///
+/// macOS only: sub-cell trackpad scrolling is a macOS frontend feature, and
+/// the Windows frontend scrolls by whole rows, so injecting the reporter
+/// there would cost an exec_lua and an autocmd for a value nothing reads.
+pub fn setupMouseScrollReporter(self: *Core) void {
+    if (comptime builtin.os.tag != .macos) return;
+    const lua_code =
+        \\local function report()
+        \\  local ms = vim.o.mousescroll or ''
+        \\  local n = tonumber(ms:match('ver:(%d+)'))
+        \\  vim.rpcnotify(0, 'zonvie_mousescroll', n or 3)
+        \\end
+        \\report()
+        \\local grp = vim.api.nvim_create_augroup('zonvie_mousescroll', { clear = true })
+        \\vim.api.nvim_create_autocmd('OptionSet', {
+        \\  group = grp,
+        \\  pattern = 'mousescroll',
+        \\  callback = function() report() end,
+        \\})
+    ;
+
+    self.requestExecLua(lua_code) catch |e| {
+        self.log.write("setupMouseScrollReporter: requestExecLua failed: {any}\n", .{e});
+        return;
+    };
+    self.log.write("mousescroll reporter installed\n", .{});
+}
+
+/// Borrow 'smoothscroll' for the duration of a trackpad gesture, and hand it
+/// back when the gesture ends.
+///
+/// Without it a 'wrap'ped window can only move a whole buffer line at a time,
+/// which is however many screen rows that line occupies — measured, one wheel
+/// event books 3 rows and moves 12. No amount of frontend accounting smooths
+/// that: the picture either jumps at every wrapped line or the offset runs away
+/// from the finger. With 'smoothscroll' the quantum becomes one screen row and
+/// a wheel event moves exactly the 'mousescroll' count, so booking and movement
+/// agree and the sub-cell model holds.
+///
+/// The previous value is stashed in a window variable and restored from it, so
+/// a restore that arrives twice is harmless. One that never arrives leaves the
+/// stash behind, and the borrow does NOT undo that by itself — the stash makes
+/// the next enable a no-op, so recovery takes a whole further gesture over that
+/// window, borrow and hand-back both.
+///
+/// Windows without 'wrap' are skipped, where the option would do nothing — but
+/// 'wrap' is on by default, so that is not the common case. Expect TWO
+/// OptionSet events per gesture on a normally configured window (the borrow and
+/// the restore are each a set, and Neovim fires OptionSet even when the value
+/// does not change), which user config can observe.
+///
+/// macOS only: sub-cell trackpad scrolling is a macOS frontend feature.
+///
+/// Returns false when the request could not be issued — the grid lock was busy,
+/// or no window is known yet. Called from the input path, so it never blocks on
+/// the lock; the caller is expected to try again, which matters most for the
+/// restore.
+pub fn setGestureSmoothScroll(self: *Core, grid_id: i64, enable: bool) bool {
+    if (comptime builtin.os.tag != .macos) return true;
+
+    const win = blk: {
+        if (!self.grid_mu.tryLock()) {
+            self.log.write("[ss_borrow] grid={d} enable={any} lock busy\n", .{ grid_id, enable });
+            return false;
+        }
+        defer self.grid_mu.unlock(clock.io());
+        const vp = self.grid.getViewport(grid_id) orelse break :blk 0;
+        break :blk vp.win;
+    };
+    if (win == 0) {
+        // Reported as done, not as busy. No window means the grid is gone —
+        // its window-local option and the stash went with it, so there is
+        // nothing left to restore and a caller retrying would do so forever.
+        self.log.write("[ss_borrow] grid={d} enable={any} no window\n", .{ grid_id, enable });
+        return true;
+    }
+
+    const enable_lua =
+        \\local w = {d}
+        \\if vim.api.nvim_win_is_valid(w)
+        \\  and vim.api.nvim_get_option_value('wrap', {{ win = w }})
+        \\  and not pcall(vim.api.nvim_win_get_var, w, 'zonvie_ss_prev') then
+        \\  vim.api.nvim_win_set_var(w, 'zonvie_ss_prev',
+        \\    vim.api.nvim_get_option_value('smoothscroll', {{ win = w }}))
+        \\  vim.api.nvim_set_option_value('smoothscroll', true, {{ win = w }})
+        \\end
+    ;
+    const restore_lua =
+        \\local w = {d}
+        \\if vim.api.nvim_win_is_valid(w) then
+        \\  local ok, prev = pcall(vim.api.nvim_win_get_var, w, 'zonvie_ss_prev')
+        \\  if ok then
+        \\    pcall(vim.api.nvim_set_option_value, 'smoothscroll', prev, {{ win = w }})
+        \\    pcall(vim.api.nvim_win_del_var, w, 'zonvie_ss_prev')
+        \\  end
+        \\end
+    ;
+
+    var buf: [640]u8 = undefined;
+    const lua_code = (if (enable)
+        std.fmt.bufPrint(&buf, enable_lua, .{win})
+    else
+        std.fmt.bufPrint(&buf, restore_lua, .{win})) catch return false;
+
+    self.requestExecLua(lua_code) catch |e| {
+        self.log.write("[ss_borrow] grid={d} win={d} enable={any} exec_lua failed: {any}\n", .{ grid_id, win, enable, e });
+        return false;
+    };
+    self.log.write("[ss_borrow] grid={d} win={d} enable={any} issued\n", .{ grid_id, win, enable });
+    return true;
 }
 
 fn prepareRenderStateForFlush(ctx: *flush.FlushCtx) !void {
@@ -1682,7 +1821,7 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
         // Check IME off request (from mode_change event)
         if (self.grid.ime_off_requested) {
             self.grid.ime_off_requested = false;
-            if (self.msg_config.ime.disable_on_modechange) {
+            if (self.msg_config.input.ime_disable_on_modechange) {
                 if (self.cb.on_ime_off) |cb| {
                     cb(self.ctx);
                 }
@@ -1725,6 +1864,16 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
             const val_str = params[0].str;
             const val: u8 = if (std.mem.eql(u8, val_str, "both")) 0 else if (std.mem.eql(u8, val_str, "none")) 1 else if (std.mem.eql(u8, val_str, "only_left")) 2 else if (std.mem.eql(u8, val_str, "only_right")) 3 else return; // unknown value: keep existing setting
             self.option_as_meta.store(val, .release);
+        }
+    } else if (std.mem.eql(u8, method, "zonvie_mousescroll")) {
+        // Rows one wheel event scrolls; see setupMouseScrollReporter. Clamped
+        // to what the frontend's lookahead can carry — a pathological
+        // 'mousescroll' must not make it hold an unbounded pixel offset.
+        if (params.len > 0 and params[0] == .int) {
+            const v = params[0].int;
+            const clamped: u32 = if (v <= 0) 0 else if (v > 32) 32 else @intCast(v);
+            self.mousescroll_ver.store(clamped, .release);
+            self.log.write("mousescroll ver={d}\n", .{clamped});
         }
     } else if (std.mem.eql(u8, method, "zonvie_agent_status")) {
         // Custom RPC notification: AI-agent work state for one tabpage.
@@ -2381,6 +2530,10 @@ pub fn runLoop(self: *Core) void {
 
         // Install the AI-agent tab-status reporter (zero user-side config).
         setupAgentStatus(self);
+
+        // Report 'mousescroll' so the trackpad path knows how many rows one
+        // wheel event is worth. No-op off macOS (see the function).
+        setupMouseScrollReporter(self);
 
         if (self.stdout_file == null) {
             self.log.write("read transport is null\n", .{});

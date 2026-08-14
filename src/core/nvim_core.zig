@@ -306,7 +306,7 @@ pub const Callbacks = struct {
     /// notification can stand for several scrolls.
     on_grid_scroll: ?*const fn (ctx: ?*anyopaque, grid_id: i64, rows_delta: i32) callconv(.c) void = null,
 
-    /// Called when IME should be turned off (mode change with ime.disable_on_modechange,
+    /// Called when IME should be turned off (mode change with input.ime_disable_on_modechange,
     /// or RPC zonvie_ime_off notification).
     on_ime_off: ?*const fn (ctx: ?*anyopaque) callconv(.c) void = null,
 
@@ -1075,6 +1075,15 @@ pub const Core = struct {
     // Updated via RPC notification "zonvie_option_as_meta". Atomic for
     // cross-thread reads from the frontend UI thread.
     option_as_meta: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+
+    // Rows one wheel event scrolls: the 'ver' component of Neovim's
+    // 'mousescroll'. Seeded with Neovim's own default so the value is usable
+    // before the reporter's first notification lands. Updated via RPC
+    // notification "zonvie_mousescroll" (see setupMouseScrollReporter); read
+    // from the frontend UI thread on every precise scroll event, hence atomic.
+    // 'ver:0' disables mouse scrolling in Neovim and reports 0, which the
+    // frontend treats as "no row count to reason with".
+    mousescroll_ver: std.atomic.Value(u32) = std.atomic.Value(u32).init(3),
 
     // IME preedit-via-extmark state. Written from the frontend UI thread (IME
     // composition callbacks) and also from the RPC thread (resetSessionState
@@ -3696,6 +3705,20 @@ pub const Core = struct {
         self.grid.screen_cols = cols;
     }
 
+    /// Set the cmdline's default width in cells. Same re-entrancy rules as
+    /// setScreenCols: the redraw thread already owns grid_mu.
+    pub fn setCmdlineDefaultCols(self: *Core, cols: u32) void {
+        const current_tid: usize = @intCast(std.Thread.getCurrentId());
+        const redraw_tid = self.redraw_thread_id.load(.seq_cst);
+        if (redraw_tid != 0 and redraw_tid == current_tid) {
+            self.grid.cmdline_default_cols = cols;
+            return;
+        }
+        self.grid_mu.lockUncancelable(clock.io());
+        defer self.grid_mu.unlock(clock.io());
+        self.grid.cmdline_default_cols = cols;
+    }
+
     // ---- Key event encoding (OS trap -> Zig common encode) ----
     fn emitInputString(self: *Core, s: []const u8) void {
         if (s.len == 0) return;
@@ -5237,7 +5260,7 @@ pub const Core = struct {
     /// with ZonviePreeditTarget. When target_start >= target_end the whole
     /// preedit uses the normal ZonviePreedit group.
     pub fn setPreedit(self: *Core, text: []const u8, target_start: usize, target_end: usize) bool {
-        if (self.msg_config.ime.preedit_mode != .extmark) return false;
+        if (self.msg_config.input.ime_preedit_mode != .extmark) return false;
 
         // Read the current mode under grid_mu, but keep the critical section
         // tiny: never send RPC (alloc + write-queue lock + possible blocking
@@ -5498,6 +5521,10 @@ pub const Core = struct {
 
     pub fn logEnvHints(self: *Core) void {
         rpc_session.logEnvHints(self);
+    }
+
+    pub fn setGestureSmoothScroll(self: *Core, grid_id: i64, enable: bool) bool {
+        return rpc_session.setGestureSmoothScroll(self, grid_id, enable);
     }
 
     pub fn handleRpcResponse(self: *Core, top: []mp.Value) void {
@@ -7157,7 +7184,10 @@ test "visible-grid and cursor snapshots saturate hostile stored u32 fields" {
     defer core.deinitForTest();
 
     try core.grid.resizeGrid(1, 4, 4);
-    try core.grid.resizeGrid(2, 2, 2);
+    // Deliberately non-square: with equal dimensions the margin assertions
+    // below read the same number whether the clamp pairs top/bottom with rows
+    // and left/right with cols, or swaps them.
+    try core.grid.resizeGrid(2, 2, 3);
     try core.grid.win_pos.put(core.grid.alloc, 2, .{
         .row = std.math.maxInt(u32),
         .col = std.math.maxInt(u32),
@@ -7174,8 +7204,11 @@ test "visible-grid and cursor snapshots saturate hostile stored u32 fields" {
     try std.testing.expectEqual(@as(usize, 2), count);
     try std.testing.expectEqual(std.math.maxInt(i32), out[1].start_row);
     try std.testing.expectEqual(std.math.maxInt(i32), out[1].start_col);
-    try std.testing.expectEqual(std.math.maxInt(i32), out[1].margin_top);
-    try std.testing.expectEqual(std.math.maxInt(i32), out[1].margin_right);
+    // Margins are clamped to the grid on the way out — stricter than the
+    // saturating conversion the placement fields fall back to, and the reason
+    // they can be stored before the grid that bounds them exists.
+    try std.testing.expectEqual(@as(i32, 2), out[1].margin_top);
+    try std.testing.expectEqual(@as(i32, 3), out[1].margin_right);
 
     core.grid.cursor_grid = 1;
     core.grid.cursor_row = std.math.maxInt(u32);
