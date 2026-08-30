@@ -4619,6 +4619,53 @@ final class SurfacePingPongTextures {
     }
 }
 
+/// The feedback pair backing a custom shader's `iPrevFrame`. While a chain
+/// that reads the edit inputs runs, its last pass writes into `write` instead
+/// of the drawable, a copy moves that onto the drawable, and the NEXT frame
+/// reads it back as `read`. Per surface, because each has its own drawable
+/// and history.
+final class SurfaceFeedbackTextures {
+    private var textures: [MTLTexture?] = [nil, nil]
+    private var size: CGSize = .zero
+    private var index = 0
+    /// True once a full frame has been written into the slot `read` names;
+    /// before that it holds uninitialized memory.
+    private(set) var primed = false
+
+    var write: MTLTexture? { textures[index] }
+    var read: MTLTexture? { textures[1 - index] }
+
+    func invalidate() {
+        textures = [nil, nil]
+        size = .zero
+        index = 0
+        primed = false
+    }
+
+    /// Allocate only when the size changed, as the ping-pong pair does: this
+    /// is reached from the present path every frame.
+    func ensure(device: MTLDevice, size newSize: CGSize, pixelFormat: MTLPixelFormat) {
+        if textures[0] != nil, textures[1] != nil, size == newSize { return }
+        let desc = makeSurfaceTextureDescriptor(
+            size: newSize,
+            pixelFormat: pixelFormat,
+            usage: [.renderTarget, .shaderRead]
+        )
+        textures[0] = device.makeTexture(descriptor: desc)
+        textures[1] = device.makeTexture(descriptor: desc)
+        size = newSize
+        index = 0
+        primed = false
+    }
+
+    /// The frame written into `write` reached the drawable: it becomes the
+    /// next frame's `read`.
+    func rotate() {
+        index = 1 - index
+        primed = true
+    }
+}
+
 /// The off-screen copy of the back buffer a scroll blit reads from, so the
 /// shift cannot sample pixels it has already written.
 final class SurfaceScrollScratchTexture {

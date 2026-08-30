@@ -23,6 +23,12 @@ pub const CustomShaderPipeline = struct {
     /// source so the renderer knows to run a ~60Hz WM_TIMER loop instead of
     /// relying purely on flush-driven WM_PAINT.
     needs_animation: bool = false,
+    /// True when the source references any Zonvie edit-effect input. Gates
+    /// allocation of the feedback pair and the cell-age texture, so a shader
+    /// that does not use them costs exactly what it did before.
+    uses_edit_inputs: bool = false,
+    /// True when the source declared `@zonvie-owns-cursor`.
+    owns_cursor: bool = false,
 
     pub fn deinit(self: *CustomShaderPipeline) void {
         if (self.pixel_shader) |ps| {

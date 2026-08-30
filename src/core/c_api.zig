@@ -572,6 +572,16 @@ pub const Callbacks = extern struct {
     // this is informational. Appended at the end for ABI compat.
     on_callback_error: ?*const fn (ctx: ?*anyopaque, code: u32, component: [*]const u8, component_len: usize) callconv(.c) void = null,
 
+    // Cells stamped as "just edited" this flush, for the iCellAge shader
+    // input. Appended at the end for ABI compat; only fired after the
+    // frontend opts in via zonvie_core_set_shader_inputs_enabled.
+    on_cell_age_stamps: ?*const fn (
+        ctx: ?*anyopaque,
+        stamps: ?[*]const zonvie_cell_stamp,
+        n: usize,
+        clear: i32,
+    ) callconv(.c) void = null,
+
     // Field layout is checked against include/zonvie_core.h in
     // abi_header_test.zig; the version must stay readable at offset 0.
     comptime {
@@ -711,6 +721,9 @@ pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, c
         // Per-surface layer placement and grid buffer lifetime
         .on_surface_layout = box.cb.on_surface_layout,
         .on_grid_destroy = box.cb.on_grid_destroy,
+
+        // Cell-age stamps for the iCellAge shader input
+        .on_cell_age_stamps = box.cb.on_cell_age_stamps,
 
         // Grid scroll notification
         .on_grid_scroll = box.cb.on_grid_scroll,
@@ -1552,6 +1565,19 @@ pub export fn zonvie_core_set_ext_tabline(p: ?*zonvie_core, enabled: i32) callco
 }
 
 /// Enable ext_windows UI extension. Must be called before zonvie_core_start().
+/// Opt in to the per-flush cell-age stamp list (on_cell_age_stamps). Off by
+/// default: with it off the core records nothing and never fires the
+/// callback, so a frontend without an edit-effect shader pays nothing.
+/// Turning it off also drops anything recorded for the in-flight flush.
+pub export fn zonvie_core_set_shader_inputs_enabled(p: ?*zonvie_core, enabled: i32) callconv(.c) void {
+    if (p == null) return;
+    const box = asBox(p.?);
+    const on = (enabled != 0);
+    box.core.grid.shader_inputs_enabled = on;
+    if (!on) box.core.grid.resetCellStamps();
+    box.core.log.write("[c_api] zonvie_core_set_shader_inputs_enabled: enabled={any}\n", .{on});
+}
+
 pub export fn zonvie_core_set_ext_windows(p: ?*zonvie_core, enabled: i32) callconv(.c) void {
     if (p == null) return;
     const box = asBox(p.?);
@@ -2068,6 +2094,16 @@ pub export fn zonvie_core_escape_path_for_cmdline(
 pub export fn zonvie_core_shader_needs_animation(source: ?[*]const u8, len: usize) callconv(.c) bool {
     const s = source orelse return false;
     return frontend_rules.shaderNeedsAnimation(s[0..len]);
+}
+
+pub export fn zonvie_core_shader_uses_edit_inputs(source: ?[*]const u8, len: usize) callconv(.c) bool {
+    const s = source orelse return false;
+    return frontend_rules.shaderUsesEditInputs(s[0..len]);
+}
+
+pub export fn zonvie_core_shader_owns_cursor(source: ?[*]const u8, len: usize) callconv(.c) bool {
+    const s = source orelse return false;
+    return frontend_rules.shaderOwnsCursor(s[0..len]);
 }
 
 pub export fn zonvie_core_tab_drop_index(pos: f64, count: u32, origin: f64, stride: f64, size: f64) callconv(.c) u32 {
@@ -3604,10 +3640,34 @@ pub const zonvie_shader_uniforms = extern struct {
     iPreviousCursorColor: [4]f32 = .{ 0, 0, 0, 0 }, // 128..143
     iTimeCursorChange: f32 = 0, // 144..147
     _pad_cursor: [3]f32 = .{ 0, 0, 0 }, // 148..159 — keep UBO size %16==0
+    // Zonvie edit-effect extensions, appended after the Ghostty-compatible
+    // block so shaders built against the 160-byte layout keep their offsets.
+    // iCellSize/iGridOrigin map fragCoord to a grid cell (the index space of
+    // the iCellAge sampler); iTimeLastEdit lets a shader skip per-cell work
+    // outside its effect window. The three ints mirror Ghostty's uniforms of
+    // the same name; style values are Ghostty's cursor style enum
+    // (0 block, 1 block_hollow, 2 bar, 3 underline, 4 lock) and Zonvie emits
+    // only 0/2/3.
+    iCellSize: [2]f32 = .{ 0, 0 }, // 160..167
+    iGridOrigin: [2]f32 = .{ 0, 0 }, // 168..175
+    iTimeLastEdit: f32 = 0, // 176..179
+    iCursorVisible: i32 = 1, // 180..183
+    iCurrentCursorStyle: i32 = 0, // 184..187
+    iPreviousCursorStyle: i32 = 0, // 188..191
 };
 
 comptime {
-    std.debug.assert(@sizeOf(zonvie_shader_uniforms) == 160);
+    std.debug.assert(@sizeOf(zonvie_shader_uniforms) == 192);
+}
+
+/// One contiguous run of cells stamped as "just edited". The core-side type
+/// is `grid.CellStamp`; this alias is the name the C header uses. Keeping it
+/// an alias rather than a copy means the array the core builds can be handed
+/// to the frontend without a conversion pass.
+pub const zonvie_cell_stamp = grid_mod.CellStamp;
+
+comptime {
+    std.debug.assert(@sizeOf(zonvie_cell_stamp) == 8);
 }
 
 /// Result of a shader compile. Owns an internal allocation; the caller must

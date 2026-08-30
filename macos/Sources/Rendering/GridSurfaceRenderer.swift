@@ -401,6 +401,14 @@ enum SurfaceDrawablePresentation {
     var tookCustomShaderChain: Bool { self == .customShaderChain }
 }
 
+/// The Zonvie edit-effect inputs one surface hands its chain: its own
+/// feedback pair (iPrevFrame) and its cell-age texture (iCellAge, nil until
+/// its store is sized). Nil as a whole when no loaded shader reads them.
+struct SurfaceEditInputs {
+    let feedback: SurfaceFeedbackTextures
+    let cellAge: MTLTexture?
+}
+
 @discardableResult
 func encodeSurfaceBackBufferToDrawable(
     cmd: MTLCommandBuffer,
@@ -414,26 +422,50 @@ func encodeSurfaceBackBufferToDrawable(
     copyVertexBuffer: MTLBuffer?,
     sampler: MTLSamplerState?,
     bilinearSampler: MTLSamplerState?,
+    editInputs: SurfaceEditInputs? = nil,
     makeUniforms: () -> zonvie_shader_uniforms,
     prepareCopy: (MTLRenderPassDescriptor) -> Void = { _ in }
 ) -> SurfaceDrawablePresentation {
     if runsCustomShaderChain,
        !customShaderPipelines.isEmpty,
        let copyVB = copyVertexBuffer,
-       let bilinSamp = bilinearSampler,
-       encodeSurfaceCustomShaderChain(
-           cmd: cmd,
-           pipelines: customShaderPipelines,
-           input: backTex,
-           output: drawableTexture,
-           pong: customShaderPong,
-           pongSize: pongSize,
-           copyVertexBuffer: copyVB,
-           sampler: bilinSamp,
-           uniforms: makeUniforms()
-       )
+       let bilinSamp = bilinearSampler
     {
-        return .customShaderChain
+        // With edit inputs the last pass writes into the feedback slot, so
+        // the NEXT frame can sample it as iPrevFrame, and a copy then moves it
+        // onto the drawable. Frame 0 has nothing in the read slot yet; the
+        // shader gets the current composite instead of uninitialized memory.
+        let feedback = editInputs?.feedback
+        feedback?.ensure(device: drawableTexture.device, size: pongSize, pixelFormat: drawableTexture.pixelFormat)
+        let feedbackWrite = feedback?.write
+        let prevFrame = feedbackWrite == nil ? nil : (feedback!.primed ? feedback!.read : backTex)
+        if encodeSurfaceCustomShaderChain(
+            cmd: cmd,
+            pipelines: customShaderPipelines,
+            input: backTex,
+            output: feedbackWrite ?? drawableTexture,
+            pong: customShaderPong,
+            pongSize: pongSize,
+            copyVertexBuffer: copyVB,
+            sampler: bilinSamp,
+            uniforms: makeUniforms(),
+            prevFrame: prevFrame,
+            cellAge: editInputs?.cellAge
+        ) {
+            guard let feedbackWrite else { return .customShaderChain }
+            // Rotate only once the slot reached the drawable: a failed copy
+            // falls back to the plain copy below and must not consume it.
+            if let copyPipe = copyPipeline, let samp = sampler,
+               encodeSurfaceDrawableCopy(
+                   cmd: cmd, input: feedbackWrite, output: drawableTexture,
+                   pipeline: copyPipe, copyVertexBuffer: copyVB, sampler: samp,
+                   prepare: { _ in }
+               )
+            {
+                feedback!.rotate()
+                return .customShaderChain
+            }
+        }
     }
     guard let copyPipe = copyPipeline,
           let copyVB = copyVertexBuffer,
@@ -768,7 +800,9 @@ func encodeSurfaceCustomShaderChain(
     pongSize: CGSize,
     copyVertexBuffer: MTLBuffer,
     sampler: MTLSamplerState,
-    uniforms: zonvie_shader_uniforms
+    uniforms: zonvie_shader_uniforms,
+    prevFrame: MTLTexture? = nil,
+    cellAge: MTLTexture? = nil
 ) -> Bool {
     guard !pipelines.isEmpty else { return false }
     if pipelines.count > 1 {
@@ -785,7 +819,9 @@ func encodeSurfaceCustomShaderChain(
             output: outputTex,
             copyVertexBuffer: copyVertexBuffer,
             sampler: sampler,
-            uniforms: uniforms
+            uniforms: uniforms,
+            prevFrame: prevFrame,
+            cellAge: cellAge
         ) {
             return false
         }
@@ -2299,6 +2335,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// Ping-pong render targets for multi-pass shader chains. Allocated
     /// only when pipelines.count > 1. Size matches backBufferSize.
     private let customShaderPong = SurfacePingPongTextures()
+    /// iPrevFrame for this surface; allocated only while a loaded shader
+    /// reads the edit inputs.
+    private let customShaderFeedback = SurfaceFeedbackTextures()
     /// Last cursor rect handed to a shader, so the log fires on change only.
     /// Per-surface, because each logs the rect IT hands its own shader.
     private var lastLoggedShaderCursor: (Float, Float, Float, Float) = (0, 0, 0, 0)
@@ -3652,7 +3691,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 t_copy_start = CFAbsoluteTimeGetCurrent()
             }
 
-            let presentation = encodeBackBufferToDrawable(cmd: cmd, backTex: backTex, drawable: drawable, view: view)
+            let presentation = encodeBackBufferToDrawable(&f, cmd: cmd, backTex: backTex, drawable: drawable, view: view)
 
             guard presentation.encoded else {
                 // Submit the already-encoded back-buffer work so Metal can
@@ -3674,8 +3713,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // Cursor is composited only on the final drawable.
             // This keeps the persistent back buffer cursor-free and prevents stale
             // cursor pixels from being moved by GPU scroll-region copies.
-            ZonvieCore.appLog("[cursor-draw] cursorBlinkState=\(f.cursorBlink) cursorCount=\(f.cursorCount)")
-            if !encodeCursorOverlay(&f, cmd: cmd, drawable: drawable, committedCursor: committedCursor) {
+            // A shader that declared @zonvie-owns-cursor draws the cursor
+            // itself, but only on a frame its chain actually ran.
+            let shaderDrawsCursor = presentation.tookCustomShaderChain && shared.shaderDrawsCursorNow()
+            ZonvieCore.appLog("[cursor-draw] cursorBlinkState=\(f.cursorBlink) cursorCount=\(f.cursorCount) shaderDrawsCursor=\(shaderDrawsCursor)")
+            if !shaderDrawsCursor, !encodeCursorOverlay(&f, cmd: cmd, drawable: drawable, committedCursor: committedCursor) {
                 // The drawable copy was encoded, but presenting it without
                 // the requested cursor would consume cursor_rev and leave a
                 // visibly incomplete transaction. Submit the already-
@@ -4585,8 +4627,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         }
 
         // Cursor glow
-        // The surface's whole offset array stays bound.
-        if f.cursorBlink, f.cursorCount > 0, let cvb = committedCursor.vertexBuffer {
+        // The surface's whole offset array stays bound. Skipped when a shader
+        // owns the cursor: this pass runs before the chain, so ownership is
+        // the only predicate available, and a halo baked here at the
+        // undeformed native rect would show through the shader's own cursor.
+        if !shared.shaderDrawsCursorNow(), f.cursorBlink, f.cursorCount > 0, let cvb = committedCursor.vertexBuffer {
             encodeSurfaceCursorGlowExtract(
                 encoder: enc,
                 vertexBuffer: cvb,
@@ -4613,6 +4658,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// function now, and the two closures are the only places the
     /// surfaces differ.
     private func encodeBackBufferToDrawable(
+        _ f: inout MainSurfaceFrame,
         cmd: MTLCommandBuffer, backTex: MTLTexture, drawable: CAMetalDrawable, view: MTKView
     ) -> SurfaceDrawablePresentation {
         // Cleared HERE, not at the gate: between the two this frame can
@@ -4621,24 +4667,44 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // once, so a frame that consumed it and then bailed left every
         // later frame with nothing to say and the effect at its old place.
         shaderCursorMovedThisFrame = false
+        let runsChain = shared.customShaderPostProcess == .afterBloom
+        // The main window's iCellAge is screen-space cells covering the
+        // drawable, indexed with the shader's own formula
+        // ((fragCoord - iGridOrigin) / iCellSize), so it only has to cover the
+        // window, not agree with Neovim's grid size.
+        var editInputs: SurfaceEditInputs? = nil
+        if runsChain, shared.shaderWantsEditInputs {
+            let cw = cellWidthPx, ch = cellHeightPx
+            let cellAge: MTLTexture? = (cw > 0 && ch > 0)
+                ? shared.cellAge.texture(
+                    grid: 1,
+                    cols: max(1, Int((Float(view.drawableSize.width) / cw).rounded(.up))),
+                    rows: max(1, Int((Float(view.drawableSize.height) / ch).rounded(.up))),
+                    device: shared.device)
+                : nil
+            editInputs = SurfaceEditInputs(feedback: customShaderFeedback, cellAge: cellAge)
+        }
+        let cursorVisible = f.cursorBlink && f.cursorCount > 0
         return encodeSurfaceBackBufferToDrawable(
             cmd: cmd,
             backTex: backTex,
             drawableTexture: drawable.texture,
             customShaderPipelines: shared.customShaderChain(decorated: false),
-            runsCustomShaderChain: shared.customShaderPostProcess == .afterBloom,
+            runsCustomShaderChain: runsChain,
             customShaderPong: customShaderPong,
             pongSize: view.drawableSize,
             copyPipeline: shared.copyPipeline,
             copyVertexBuffer: shared.copyVertexBuffer,
             sampler: shared.sampler,
             bilinearSampler: shared.bilinearSampler,
+            editInputs: editInputs,
             makeUniforms: {
                 shared.makeShaderUniforms(
                     screenResolution: view.drawableSize,
                     windowOffset: .zero,
                     windowSize: view.drawableSize,
                     backingScale: backingScale,
+                    cursorVisible: cursorVisible,
                     lastLoggedCursor: &lastLoggedShaderCursor
                 )
             },

@@ -414,6 +414,44 @@ pub const Renderer = struct {
     shader_cursor_current_color: [4]f32 = .{ 0, 0, 0, 0 },
     shader_cursor_previous_color: [4]f32 = .{ 0, 0, 0, 0 },
     shader_cursor_change_time: f32 = 0,
+    /// Ghostty-compatible cursor style for the shader uniforms: 0 block,
+    /// 2 bar, 3 underline. Derived from the committed cursor rect, because
+    /// the rect is what is actually on screen.
+    shader_cursor_style: i32 = 0,
+    shader_prev_cursor_style: i32 = 0,
+
+    // --- Zonvie edit-effect shader inputs (iPrevFrame / iCellAge) ---
+    //
+    // Allocated only when a loaded shader references them, so a shader-less
+    // or plain-shader configuration costs exactly what it did before.
+    shader_wants_edit_inputs: bool = false,
+    /// Cell metrics mirrored from the app, for iCellSize and the cell-age
+    /// grid. The renderer does not otherwise track them.
+    cell_w_px: u32 = 0,
+    cell_h_px: u32 = 0,
+    /// Cursor blink visibility mirrored from the app, for iCursorVisible.
+    cursor_blink_on: bool = true,
+    shader_owns_cursor: bool = false,
+    /// Feedback pair: the LAST pass writes here instead of the backbuffer so
+    /// the NEXT frame can sample it as iPrevFrame; a copy then moves it to
+    /// the backbuffer.
+    feedback_tex: [2]?*c.ID3D11Texture2D = .{ null, null },
+    feedback_srv: [2]?*c.ID3D11ShaderResourceView = .{ null, null },
+    feedback_rtv: [2]?*c.ID3D11RenderTargetView = .{ null, null },
+    feedback_w: u32 = 0,
+    feedback_h: u32 = 0,
+    feedback_index: usize = 0,
+    feedback_primed: bool = false,
+    /// Cell-age grid, screen-space cells indexed with the same formula the
+    /// shader uses. CPU mirror written from the core callback, uploaded once
+    /// per frame when dirty.
+    cell_age_tex: ?*c.ID3D11Texture2D = null,
+    cell_age_srv: ?*c.ID3D11ShaderResourceView = null,
+    cell_age_values: []f32 = &.{},
+    cell_age_cols: u32 = 0,
+    cell_age_rows: u32 = 0,
+    cell_age_dirty: bool = false,
+    cell_age_last_edit: f32 = 0,
     /// True when any loaded custom shader references a time-varying
     /// Shadertoy uniform. The main loop reads this to decide whether to
     /// arm a ~60Hz WM_TIMER for continuous redraw; without it shaders
@@ -2533,6 +2571,184 @@ pub const Renderer = struct {
         self.custom_shader_pong_h = back_desc.Height;
     }
 
+    /// Allocate the feedback pair used to expose iPrevFrame. Same
+    /// size/format contract as ensureCustomShaderPong.
+    fn ensureFeedbackTextures(self: *Renderer) void {
+        if (self.feedback_tex[0] != null and self.feedback_tex[1] != null and
+            self.feedback_w == self.width and self.feedback_h == self.height) return;
+
+        self.releaseFeedbackTextures();
+
+        const dev = self.device orelse return;
+        const back = self.back_tex orelse return;
+
+        var back_desc: c.D3D11_TEXTURE2D_DESC = undefined;
+        const back_vtbl = back.*.lpVtbl;
+        const get_desc = back_vtbl.*.GetDesc orelse return;
+        get_desc(back, &back_desc);
+
+        var td: c.D3D11_TEXTURE2D_DESC = std.mem.zeroes(c.D3D11_TEXTURE2D_DESC);
+        td.Width = back_desc.Width;
+        td.Height = back_desc.Height;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = back_desc.Format;
+        td.SampleDesc.Count = 1;
+        td.Usage = c.D3D11_USAGE_DEFAULT;
+        td.BindFlags = c.D3D11_BIND_RENDER_TARGET | c.D3D11_BIND_SHADER_RESOURCE;
+
+        const dev_vtbl = dev.*.lpVtbl;
+        const create_tex = dev_vtbl.*.CreateTexture2D orelse return;
+        const create_srv = dev_vtbl.*.CreateShaderResourceView orelse return;
+        const create_rtv = dev_vtbl.*.CreateRenderTargetView orelse return;
+
+        var i: usize = 0;
+        while (i < 2) : (i += 1) {
+            var tex: ?*c.ID3D11Texture2D = null;
+            if (c.FAILED(create_tex(dev, &td, null, &tex)) or tex == null) {
+                self.releaseFeedbackTextures();
+                return;
+            }
+            var srv_i: ?*c.ID3D11ShaderResourceView = null;
+            if (c.FAILED(create_srv(dev, @ptrCast(tex.?), null, &srv_i)) or srv_i == null) {
+                safeRelease(&tex);
+                self.releaseFeedbackTextures();
+                return;
+            }
+            var rtv_i: ?*c.ID3D11RenderTargetView = null;
+            if (c.FAILED(create_rtv(dev, @ptrCast(tex.?), null, &rtv_i)) or rtv_i == null) {
+                safeRelease(&srv_i);
+                safeRelease(&tex);
+                self.releaseFeedbackTextures();
+                return;
+            }
+            self.feedback_tex[i] = tex;
+            self.feedback_srv[i] = srv_i;
+            self.feedback_rtv[i] = rtv_i;
+        }
+        self.feedback_w = back_desc.Width;
+        self.feedback_h = back_desc.Height;
+        self.feedback_index = 0;
+        self.feedback_primed = false;
+    }
+
+    fn releaseFeedbackTextures(self: *Renderer) void {
+        for (&self.feedback_srv) |*x| safeRelease(x);
+        for (&self.feedback_rtv) |*x| safeRelease(x);
+        for (&self.feedback_tex) |*x| safeRelease(x);
+        self.feedback_w = 0;
+        self.feedback_h = 0;
+        self.feedback_index = 0;
+        self.feedback_primed = false;
+    }
+
+    /// Resize the CPU mirror to cover the window. A resize invalidates every
+    /// stamp position, so start clean rather than remapping ages onto cells
+    /// that now hold different text.
+    fn ensureCellAgeGrid(self: *Renderer, cols: u32, rows: u32) void {
+        if (cols == 0 or rows == 0) return;
+        if (self.cell_age_cols == cols and self.cell_age_rows == rows and
+            self.cell_age_values.len == cols * rows) return;
+        const n: usize = @as(usize, cols) * @as(usize, rows);
+        const buf = self.alloc.alloc(f32, n) catch return;
+        if (self.cell_age_values.len != 0) self.alloc.free(self.cell_age_values);
+        @memset(buf, 0);
+        self.cell_age_values = buf;
+        self.cell_age_cols = cols;
+        self.cell_age_rows = rows;
+        self.cell_age_dirty = true;
+        // The texture must follow the grid.
+        safeRelease(&self.cell_age_srv);
+        safeRelease(&self.cell_age_tex);
+    }
+
+    /// Apply one flush's stamps. Called from the core thread via
+    /// on_cell_age_stamps; touches only the CPU mirror.
+    pub fn applyCellAgeStamps(self: *Renderer, stamps: []const core.zonvie_cell_stamp, clear: bool, now: f32) void {
+        if (self.cell_age_cols == 0 or self.cell_age_rows == 0) return;
+        if (clear) {
+            @memset(self.cell_age_values, 0);
+            self.cell_age_dirty = true;
+            return;
+        }
+        if (now <= 0) return;
+        for (stamps) |st| {
+            // Only the main window keeps a cell-age texture on Windows;
+            // stamps for external windows (grid != 1) have nowhere to go.
+            if (st.grid != 1) continue;
+            if (st.count == 0) {
+                // Clear marker for the main texture.
+                @memset(self.cell_age_values, 0);
+                self.cell_age_dirty = true;
+                continue;
+            }
+            const row: u32 = st.row;
+            if (row >= self.cell_age_rows) continue;
+            const base: usize = @as(usize, row) * @as(usize, self.cell_age_cols);
+            const col_start: u32 = st.col;
+            const col_end: u32 = @min(self.cell_age_cols, col_start + @as(u32, st.count));
+            if (col_start >= col_end) continue;
+            var col = col_start;
+            while (col < col_end) : (col += 1) self.cell_age_values[base + col] = now;
+        }
+        self.cell_age_last_edit = now;
+        self.cell_age_dirty = true;
+    }
+
+    /// Create/refresh the cell-age texture and upload the mirror when dirty.
+    fn ensureCellAgeTexture(self: *Renderer, ctx: *c.ID3D11DeviceContext, ctx_vtbl: anytype) ?*c.ID3D11ShaderResourceView {
+        if (self.cell_age_cols == 0 or self.cell_age_rows == 0) return null;
+        const dev = self.device orelse return null;
+        if (self.cell_age_tex == null) {
+            var td: c.D3D11_TEXTURE2D_DESC = std.mem.zeroes(c.D3D11_TEXTURE2D_DESC);
+            td.Width = self.cell_age_cols;
+            td.Height = self.cell_age_rows;
+            td.MipLevels = 1;
+            td.ArraySize = 1;
+            td.Format = c.DXGI_FORMAT_R32_FLOAT;
+            td.SampleDesc.Count = 1;
+            td.Usage = c.D3D11_USAGE_DEFAULT;
+            td.BindFlags = c.D3D11_BIND_SHADER_RESOURCE;
+            const dev_vtbl = dev.*.lpVtbl;
+            const create_tex = dev_vtbl.*.CreateTexture2D orelse return null;
+            const create_srv = dev_vtbl.*.CreateShaderResourceView orelse return null;
+            var tex: ?*c.ID3D11Texture2D = null;
+            if (c.FAILED(create_tex(dev, &td, null, &tex)) or tex == null) return null;
+            var srv: ?*c.ID3D11ShaderResourceView = null;
+            if (c.FAILED(create_srv(dev, @ptrCast(tex.?), null, &srv)) or srv == null) {
+                safeRelease(&tex);
+                return null;
+            }
+            self.cell_age_tex = tex;
+            self.cell_age_srv = srv;
+            // A fresh texture holds garbage until the first upload.
+            self.cell_age_dirty = true;
+        }
+        if (self.cell_age_dirty) {
+            if (ctx_vtbl.*.UpdateSubresource) |update| {
+                update(
+                    ctx,
+                    @ptrCast(self.cell_age_tex.?),
+                    0,
+                    null,
+                    @ptrCast(self.cell_age_values.ptr),
+                    self.cell_age_cols * @sizeOf(f32),
+                    0,
+                );
+                self.cell_age_dirty = false;
+            }
+        }
+        return self.cell_age_srv;
+    }
+
+    /// Classify a cursor rect into Ghostty's cursor style enum.
+    pub fn cursorStyleForRect(rect: [4]f32, cell_w: f32, cell_h: f32) i32 {
+        if (cell_w <= 0 or cell_h <= 0) return 0;
+        if (rect[2] < cell_w * 0.5) return 2; // bar
+        if (rect[3] < cell_h * 0.5) return 3; // underline
+        return 0; // block
+    }
+
     fn bloomShadersReady(self: *const Renderer) bool {
         return self.vs_fullscreen != null and
             self.ps_glow_extract != null and
@@ -2681,6 +2897,8 @@ pub const Renderer = struct {
         for (self.custom_shader_pipelines.items) |*p| p.deinit();
         self.custom_shader_pipelines.clearRetainingCapacity();
         self.any_custom_shader_needs_animation = false;
+        self.shader_wants_edit_inputs = false;
+        self.shader_owns_cursor = false;
 
         if (!cfg.shaders.enabled or cfg.shaders.paths.len == 0) return;
         const dev = self.device orelse return;
@@ -2701,6 +2919,8 @@ pub const Renderer = struct {
                 continue;
             };
             if (pipeline.needs_animation) self.any_custom_shader_needs_animation = true;
+            if (pipeline.uses_edit_inputs) self.shader_wants_edit_inputs = true;
+            if (pipeline.owns_cursor) self.shader_owns_cursor = true;
         }
         applog.appLog(
             "[CustomShader] loaded {d}/{d} custom shaders, anyNeedsAnimation={}\n",
@@ -2921,6 +3141,8 @@ pub const Renderer = struct {
             .source_path = path_copy,
             .pixel_shader = ps_out,
             .needs_animation = core.frontend_rules.shaderNeedsAnimation(glsl),
+            .uses_edit_inputs = core.frontend_rules.shaderUsesEditInputs(glsl),
+            .owns_cursor = core.frontend_rules.shaderOwnsCursor(glsl),
         };
     }
 
@@ -2947,20 +3169,30 @@ pub const Renderer = struct {
         self.shader_cursor_previous_color = self.shader_cursor_current_color;
         self.shader_cursor_current = rect;
         self.shader_cursor_current_color = color;
+        self.shader_prev_cursor_style = self.shader_cursor_style;
+        self.shader_cursor_style = cursorStyleForRect(
+            rect,
+            @floatFromInt(self.cell_w_px),
+            @floatFromInt(self.cell_h_px),
+        );
 
         // iTimeCursorChange is in the same "seconds since shader start"
         // space as iTime, so recompute from QPC here.
-        if (self.custom_shader_start_qpc != 0) {
-            var freq: c.LARGE_INTEGER = undefined;
-            var now: c.LARGE_INTEGER = undefined;
-            _ = c.QueryPerformanceFrequency(&freq);
-            _ = c.QueryPerformanceCounter(&now);
-            const denom: f64 = @floatFromInt(freq.QuadPart);
-            self.shader_cursor_change_time =
-                @floatCast(@as(f64, @floatFromInt(now.QuadPart - self.custom_shader_start_qpc)) / denom);
-        } else {
-            self.shader_cursor_change_time = 0;
-        }
+        self.shader_cursor_change_time = self.shaderTimeNow();
+    }
+
+    /// Seconds since the shader clock started, in the same base as iTime.
+    /// Zero before the first shaded frame, which callers read as "no time
+    /// origin yet".
+    pub fn shaderTimeNow(self: *const Renderer) f32 {
+        if (self.custom_shader_start_qpc == 0) return 0;
+        var freq: c.LARGE_INTEGER = undefined;
+        var now: c.LARGE_INTEGER = undefined;
+        _ = c.QueryPerformanceFrequency(&freq);
+        _ = c.QueryPerformanceCounter(&now);
+        const denom: f64 = @floatFromInt(freq.QuadPart);
+        if (denom == 0) return 0;
+        return @floatCast(@as(f64, @floatFromInt(now.QuadPart - self.custom_shader_start_qpc)) / denom);
     }
 
     /// A window moved, not the cursor: carry both cursor rects by the move
@@ -3046,6 +3278,17 @@ pub const Renderer = struct {
         u.iCurrentCursorColor = self.shader_cursor_current_color;
         u.iPreviousCursorColor = self.shader_cursor_previous_color;
         u.iTimeCursorChange = self.shader_cursor_change_time;
+        // Zonvie edit-effect uniforms. iGridOrigin is (0,0): the main grid
+        // starts at the window's top-left and the cell-age grid is indexed in
+        // that same screen space (see ensureCellAgeGrid).
+        u.iCellSize[0] = @floatFromInt(self.cell_w_px);
+        u.iCellSize[1] = @floatFromInt(self.cell_h_px);
+        u.iGridOrigin[0] = 0;
+        u.iGridOrigin[1] = 0;
+        u.iTimeLastEdit = self.cell_age_last_edit;
+        u.iCursorVisible = if (self.cursor_blink_on) 1 else 0;
+        u.iCurrentCursorStyle = self.shader_cursor_style;
+        u.iPreviousCursorStyle = self.shader_prev_cursor_style;
         // Shadertoy iDate: (year, month [1..12], day, seconds-in-day).
         // Shadertoy's howto just lists the fields as "Year, month, day,
         // time in seconds" without spelling out indexing. Forward
@@ -3125,6 +3368,31 @@ pub const Renderer = struct {
 
         self.ensureCustomShaderScratch();
         if (pipelines.len > 1) self.ensureCustomShaderPong();
+        // Edit-effect inputs, allocated only when a shader reads them.
+        var prev_frame_srv: ?*c.ID3D11ShaderResourceView = null;
+        var cell_age_srv_bind: ?*c.ID3D11ShaderResourceView = null;
+        var feedback_rtv_target: ?*c.ID3D11RenderTargetView = null;
+        var feedback_src_tex: ?*c.ID3D11Texture2D = null;
+        if (self.shader_wants_edit_inputs) {
+            self.ensureFeedbackTextures();
+            if (self.cell_w_px > 0 and self.cell_h_px > 0) {
+                const cols = (self.width + self.cell_w_px - 1) / self.cell_w_px;
+                const rows = (self.height + self.cell_h_px - 1) / self.cell_h_px;
+                self.ensureCellAgeGrid(@max(1, cols), @max(1, rows));
+                cell_age_srv_bind = self.ensureCellAgeTexture(ctx, ctx_vtbl);
+            }
+            if (self.feedback_rtv[self.feedback_index]) |w| {
+                if (self.feedback_srv[1 - self.feedback_index]) |r| {
+                    feedback_rtv_target = w;
+                    feedback_src_tex = self.feedback_tex[self.feedback_index];
+                    // Frame 0 has nothing in the read slot; hand the shader
+                    // the current composite instead of uninitialized memory.
+                    prev_frame_srv = if (self.feedback_primed) r else scratch_srv_early: {
+                        break :scratch_srv_early self.custom_shader_scratch_srv;
+                    };
+                }
+            }
+        }
         self.updateCustomShaderUniforms(ctx, ctx_vtbl);
         const scratch = self.custom_shader_scratch_tex orelse {
             if (applog.isEnabled()) applog.appLog("[CustomShader] skip: scratch_tex null\n", .{});
@@ -3209,7 +3477,7 @@ pub const Renderer = struct {
                 };
             };
             const output_rtv: *c.ID3D11RenderTargetView = blk: {
-                if (is_last) break :blk out_rtv;
+                if (is_last) break :blk feedback_rtv_target orelse out_rtv;
                 const cur_idx = i % 2;
                 break :blk self.custom_shader_pong_rtv[cur_idx] orelse {
                     if (applog.isEnabled()) applog.appLog("[CustomShader] skip pass {d}: pong_rtv[{d}] null\n", .{ i, cur_idx });
@@ -3227,9 +3495,35 @@ pub const Renderer = struct {
 
             var in_srvs: [1]?*c.ID3D11ShaderResourceView = .{input_srv};
             set_srvs_fn(ctx, 0, 1, &in_srvs[0]);
+            if (prev_frame_srv) |pf| {
+                var pf_srvs: [1]?*c.ID3D11ShaderResourceView = .{pf};
+                set_srvs_fn(ctx, 2, 1, &pf_srvs[0]);
+            }
+            if (cell_age_srv_bind) |ca| {
+                var ca_srvs: [1]?*c.ID3D11ShaderResourceView = .{ca};
+                set_srvs_fn(ctx, 3, 1, &ca_srvs[0]);
+            }
 
             set_ps_fn(ctx, ps_i, null, 0);
             draw_fn(ctx, 3, 0);
+        }
+
+        // The last pass wrote into the feedback slot so the next frame can
+        // read it as iPrevFrame; copy it to the backbuffer and rotate. Also
+        // unbind the feedback SRV first — the slot we are about to write next
+        // frame must not still be bound for read.
+        if (feedback_src_tex) |src| {
+            var null_srv2: [1]?*c.ID3D11ShaderResourceView = .{null};
+            set_srvs_fn(ctx, 2, 1, &null_srv2[0]);
+            set_rtvs(ctx, 0, null, null);
+            const bb = if (sc_idx < self.bb_texs.len) self.bb_texs[sc_idx] else null;
+            if (bb) |dst| {
+                if (ctx_vtbl.*.CopyResource) |copy_res| {
+                    copy_res(ctx, @ptrCast(dst), @ptrCast(src));
+                    self.feedback_index = 1 - self.feedback_index;
+                    self.feedback_primed = true;
+                } else return false;
+            } else return false;
         }
 
         // Restore the main grid pipeline state so later overlays /

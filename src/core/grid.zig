@@ -1321,6 +1321,41 @@ pub const Viewport = struct {
     scroll_covered: bool = false,
 };
 
+/// Distinct rows one flush may stamp before the whole cell-age texture is
+/// cleared instead. Two covers the cursor row plus one wrapped continuation;
+/// anything wider is a bulk update whose ghosts would be misplaced. A core
+/// constant on purpose — no config key until a second caller needs one.
+pub const max_stamped_rows: usize = 2;
+
+/// Upper bound on stamp runs per flush. Each grid_line tuple contributes at
+/// most one run; a flush producing more than this is bulk by definition, so
+/// overflow takes the clear path.
+pub const cell_stamp_capacity: usize = 64;
+/// Distinct cell-age textures one flush can invalidate before it escalates
+/// to a full clear.
+pub const max_stamp_clear_grids: usize = 8;
+
+/// One contiguous run of just-edited cells. Layout matches
+/// `zonvie_cell_stamp` in `include/zonvie_core.h`; the C API hands the array
+/// straight to the frontend, so field order is load-bearing.
+pub const CellStamp = extern struct {
+    row: u16,
+    col: u16,
+    count: u16,
+    /// 1 = the main window's screen-space cell grid (composited floats are
+    /// stamped there at their win_pos). Any other value is the Neovim grid
+    /// id of an EXTERNAL window (win_external_pos, or CMDLINE_GRID_ID for
+    /// the ext-cmdline surface), with row/col local to that grid.
+    grid: i16 = 1,
+};
+
+/// One row that received stamps this flush, for the bulk guard. Keyed by
+/// (grid, row): the same row index on two different grids is two rows.
+pub const StampRow = struct {
+    grid: i64,
+    row: u32,
+};
+
 pub const Grid = struct {
     alloc: std.mem.Allocator,
 
@@ -1423,6 +1458,30 @@ pub const Grid = struct {
     /// A msg_showmode arrived since the last flush event (mode_change clears
     /// showmode on leaving insert only when none did).
     showmode_set_since_flush: bool = false,
+
+    // --- Cell-age stamps for the iCellAge custom-shader input ---
+    //
+    // Disabled unless a frontend shader actually reads the edit inputs, so
+    // the default path builds nothing and fires no callback. Core-thread
+    // only: written while handling redraw events, drained during flush.
+    shader_inputs_enabled: bool = false,
+    /// Runs of cells edited during the current flush.
+    cell_stamps: [cell_stamp_capacity]CellStamp = undefined,
+    cell_stamp_count: usize = 0,
+    /// Distinct rows stamped this flush, for the bulk guard.
+    cell_stamp_rows: [max_stamped_rows]StampRow = undefined,
+    cell_stamp_row_count: usize = 0,
+    /// Set when this flush must zero the whole cell-age texture instead of
+    /// stamping: a bulk update (scroll, paste, redraw) whose ghosts would
+    /// otherwise linger at the wrong screen position.
+    cell_stamp_clear: bool = false,
+    /// Cell-age textures an event other than a small grid_line invalidated
+    /// this flush (see noteNonEditRedraw): 1 for the main window's, else an
+    /// external grid's id. Each is cleared at flush and its stamps dropped;
+    /// stamps on other textures still go out. Overflow escalates to a full
+    /// clear (cell_stamp_clear).
+    cell_stamp_clear_grids: [max_stamp_clear_grids]i64 = undefined,
+    cell_stamp_clear_grid_count: usize = 0,
 
     win_layer: std.AutoHashMapUnmanaged(i64, WinLayer) = .{},
 
@@ -1925,6 +1984,135 @@ pub const Grid = struct {
 
     pub fn getCellHL(self: *const Grid, row: u32, col: u32) u32 {
         return self.main_buf.getCell(row, col).hl;
+    }
+
+    /// Record a run of cells edited by a keystroke, for the iCellAge shader
+    /// input. No-op unless a frontend shader asked for the data.
+    ///
+    /// Caller has already applied the per-event gates (Insert-like mode,
+    /// grid_line on the main grid, not a full-row rewrite); this applies the
+    /// flush-level bulk guard: once more than `max_stamped_rows` distinct
+    /// rows have been touched, the flush switches to clearing the whole
+    /// texture. A scroll that arrives as row-by-row grid_line with ragged
+    /// right edges slips past the per-event width check but not this one.
+    pub fn stampEditedCells(self: *Grid, stamp_grid: i64, row: u32, col: u32, count: u32) void {
+        if (!self.shader_inputs_enabled) return;
+        if (self.cell_stamp_clear) return; // already bulk; nothing to add
+        if (count == 0) return;
+        const grid_i16 = std.math.cast(i16, stamp_grid) orelse return;
+
+        // New row? Apply the bulk guard before recording it.
+        var seen = false;
+        for (self.cell_stamp_rows[0..self.cell_stamp_row_count]) |r| {
+            if (r.grid == stamp_grid and r.row == row) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) {
+            if (self.cell_stamp_row_count >= max_stamped_rows) {
+                self.markCellStampBulk();
+                return;
+            }
+            self.cell_stamp_rows[self.cell_stamp_row_count] = .{ .grid = stamp_grid, .row = row };
+            self.cell_stamp_row_count += 1;
+        }
+
+        if (self.cell_stamp_count >= cell_stamp_capacity) {
+            // More runs than a keystroke edit can plausibly produce.
+            self.markCellStampBulk();
+            return;
+        }
+        self.cell_stamps[self.cell_stamp_count] = .{
+            .row = std.math.cast(u16, row) orelse return,
+            .col = std.math.cast(u16, col) orelse return,
+            .count = std.math.cast(u16, count) orelse return,
+            .grid = grid_i16,
+        };
+        self.cell_stamp_count += 1;
+    }
+
+    /// Switch this flush to "clear the whole cell-age texture". Used for bulk
+    /// updates, where keeping in-flight ghosts would leave them at a screen
+    /// position their text no longer occupies.
+    pub fn markCellStampBulk(self: *Grid) void {
+        if (!self.shader_inputs_enabled) return;
+        self.cell_stamp_clear = true;
+        self.cell_stamp_count = 0;
+        self.cell_stamp_row_count = 0;
+    }
+
+    /// Which cell-age texture a grid's cells live on: the main window's (1)
+    /// for grid 1 and every composited sub-grid, an external window's own
+    /// for a grid shown in a separate OS window.
+    pub fn stampTargetForGrid(self: *const Grid, grid_id: i64) i64 {
+        if (grid_id != 1 and self.external_grids.contains(grid_id)) return grid_id;
+        return 1;
+    }
+
+    /// Note that an event OTHER than a small `grid_line` changed what this
+    /// flush draws on `grid_id` — a scroll, a clear, a resize, a window
+    /// move. Such a flush is not a keystroke edit on that grid's texture,
+    /// whatever the mode: its stamps there must not be delivered and any
+    /// ghost still on that texture must be dropped (its text is no longer
+    /// where the ghost is). Other textures are untouched: the main window
+    /// repainting its ruler must not erase the smoke in an external float
+    /// that was typed into a frame earlier. The decision is made per texture
+    /// at flush time by buildCellStampDelivery.
+    ///
+    /// Mode is deliberately not consulted. It looked like a good proxy but
+    /// it is wrong in both directions: Normal-mode `x` is an edit, and a
+    /// `mode_change` can trail the first typed character's `grid_line`
+    /// inside one batch.
+    pub fn noteNonEditRedraw(self: *Grid, grid_id: i64) void {
+        if (!self.shader_inputs_enabled) return;
+        if (self.cell_stamp_clear) return;
+        const target = self.stampTargetForGrid(grid_id);
+        for (self.cell_stamp_clear_grids[0..self.cell_stamp_clear_grid_count]) |g| {
+            if (g == target) return;
+        }
+        if (self.cell_stamp_clear_grid_count >= max_stamp_clear_grids) {
+            self.markCellStampBulk();
+            return;
+        }
+        self.cell_stamp_clear_grids[self.cell_stamp_clear_grid_count] = target;
+        self.cell_stamp_clear_grid_count += 1;
+    }
+
+    /// True when this flush invalidated the texture `target` (1 = main).
+    pub fn cellStampGridCleared(self: *const Grid, target: i64) bool {
+        if (self.cell_stamp_clear) return true;
+        for (self.cell_stamp_clear_grids[0..self.cell_stamp_clear_grid_count]) |g| {
+            if (g == target) return true;
+        }
+        return false;
+    }
+
+    /// Assemble what on_cell_age_stamps delivers for this flush: one
+    /// `count == 0` marker per invalidated texture (the frontend zeroes that
+    /// texture), then every stamp whose texture was NOT invalidated. Returns
+    /// the number of entries written. Not used when cell_stamp_clear is
+    /// set — that is the `clear` argument's job.
+    pub fn buildCellStampDelivery(self: *const Grid, out: *[cell_stamp_capacity + max_stamp_clear_grids]CellStamp) usize {
+        var n: usize = 0;
+        for (self.cell_stamp_clear_grids[0..self.cell_stamp_clear_grid_count]) |g| {
+            out[n] = .{ .row = 0, .col = 0, .count = 0, .grid = std.math.cast(i16, g) orelse continue };
+            n += 1;
+        }
+        for (self.cell_stamps[0..self.cell_stamp_count]) |st| {
+            if (self.cellStampGridCleared(st.grid)) continue;
+            out[n] = st;
+            n += 1;
+        }
+        return n;
+    }
+
+    /// Drop everything recorded for the flush that just ended.
+    pub fn resetCellStamps(self: *Grid) void {
+        self.cell_stamp_count = 0;
+        self.cell_stamp_row_count = 0;
+        self.cell_stamp_clear = false;
+        self.cell_stamp_clear_grid_count = 0;
     }
 
     pub fn getCellHLGrid(self: *const Grid, grid_id: i64, row: u32, col: u32) u32 {

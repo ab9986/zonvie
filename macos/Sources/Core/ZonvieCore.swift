@@ -1612,6 +1612,17 @@ final class ZonvieCore {
                     String(bytes: UnsafeRawBufferPointer(start: ptr, count: Int(componentLen)), encoding: .utf8) ?? ""
                 } ?? ""
                 ZonvieCore.appLog("callback error: code=\(code) component=\(componentStr)")
+            },
+            on_cell_age_stamps: { ctx, stamps, n, clear in
+                guard let ctx else { return }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                // Core thread, grid_mu held. Only the CPU mirror is written;
+                // each surface uploads its own texture when it draws.
+                guard let shared = me.terminalView?.renderer.shared else { return }
+                let buf = (stamps != nil && n > 0)
+                    ? UnsafeBufferPointer(start: stamps!, count: n)
+                    : UnsafeBufferPointer<zonvie_cell_stamp>(start: nil, count: 0)
+                shared.cellAge.apply(buf, clear: clear != 0, now: shared.shaderTimeNow())
             }
         )
 
@@ -3016,6 +3027,14 @@ final class ZonvieCore {
         return zonvie_core_try_update_layout_px(
             core, drawableW, drawableH, cellW, cellH, screenCols, cmdlineDefaultCols
         )
+    }
+
+    /// Tell the core whether to build per-flush cell-age stamp lists. Driven
+    /// by the loaded shader set: only a shader that reads the edit inputs
+    /// turns this on, so the default path costs nothing.
+    func setShaderInputsEnabled(_ enabled: Bool) {
+        guard let core else { return }
+        zonvie_core_set_shader_inputs_enabled(core, enabled ? 1 : 0)
     }
 
     /// Neovim changed the main grid size itself (`:set columns=` / `:set lines=`).
@@ -5363,6 +5382,7 @@ final class ZonvieCore {
         externalWindowInstalledSessionGenerations.removeValue(forKey: gridId)
         externalGridViewsLock.lock()
         let removedView = externalGridViews.removeValue(forKey: gridId)
+        terminalView?.renderer.shared.cellAge.drop(grid: gridId)
         externalGridViewsLock.unlock()
         // The view's own vertex storage goes when the view does, not on
         // on_grid_destroy: that fires while this close is still queued and

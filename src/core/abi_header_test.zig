@@ -55,6 +55,7 @@ const pairs = .{
     .{ c.zonvie_route_result, c_api.zonvie_route_result },
     .{ c.zonvie_config_values, c_api.zonvie_config_values },
     .{ c.zonvie_shader_uniforms, c_api.zonvie_shader_uniforms },
+    .{ c.zonvie_cell_stamp, c_api.zonvie_cell_stamp },
     .{ c.zonvie_shader_result, c_api.zonvie_shader_result },
     .{ c.zonvie_surface_frame_terms, frontend_rules.SurfaceFrameTerms },
     .{ c.zonvie_surface_frame_decision, frontend_rules.SurfaceFrameDecision },

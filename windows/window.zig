@@ -1469,6 +1469,7 @@ fn makeCoreCbs() core.Callbacks {
         .on_flush_begin = callbacks.onFlushBegin,
         .on_flush_end = callbacks.onFlushEnd,
         .on_main_grid_size = callbacks.onMainGridSize,
+        .on_cell_age_stamps = callbacks.onCellAgeStamps,
         .on_grid_row_scroll = callbacks.onGridRowScroll,
         .on_surface_layout = callbacks.onSurfaceLayout,
         .on_grid_destroy = callbacks.onGridDestroy,

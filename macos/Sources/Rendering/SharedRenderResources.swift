@@ -156,6 +156,42 @@ final class SharedRenderResources {
     /// the loaded chain, so they belong with it.
     var customShaderPostProcess: ZonvieConfig.ShaderPostProcess = .afterBloom
     var anyCustomShaderNeedsAnimation: Bool = false
+    /// True when a loaded shader reads the Zonvie edit inputs. Gates every
+    /// feedback/cell-age allocation and upload, on every surface.
+    private(set) var shaderWantsEditInputs: Bool = false
+    /// True when a loaded shader declared `@zonvie-owns-cursor`.
+    private(set) var shaderOwnsCursor: Bool = false
+    /// Fired when the loaded chain starts or stops reading the edit inputs.
+    /// The main view forwards it to the core, so stamp lists are built only
+    /// while something reads them.
+    var onShaderEditInputsChanged: ((Bool) -> Void)?
+    /// The iCellAge state of every surface, keyed the way the core stamps it.
+    let cellAge = SurfaceCellAgeStores()
+
+    /// True when a shader declared @zonvie-owns-cursor and can draw it now.
+    /// Every surface that draws a native cursor or its glow consults this, or
+    /// the shader and the native pass both draw (or neither does).
+    ///
+    /// `guicursor` still decides the SHAPE — it reaches the shader as
+    /// iCurrentCursorStyle. What the marker overrides is only WHO draws: a
+    /// shader that opts into the cursor owns every shape, block included, and
+    /// takes on inverting the glyph under a block itself.
+    func shaderDrawsCursorNow() -> Bool {
+        guard shaderOwnsCursor else { return false }
+        // The shader can only draw from iCurrentCursor. Until a cursor rect has
+        // been published the native pass stays in charge, or nothing draws the
+        // cursor at all.
+        let cur = shaderCursor.snapshot().current
+        return cur.2 > 0 && cur.3 > 0
+    }
+
+    /// Seconds on the shared shader clock, the base iTime and iTimeLastEdit
+    /// are measured in. Zero before any surface drew with a shader, which
+    /// reads as "never edited".
+    func shaderTimeNow() -> Float {
+        let start = shaderTimeBase.startTimeSec
+        return start == 0 ? 0 : Float(CACurrentMediaTime() - start)
+    }
 
     /// Why the last pipeline build failed, for the draw that skips on it.
     private(set) var initializationError: String?
@@ -325,12 +361,23 @@ final class SharedRenderResources {
     /// Each caller passes the result inline via `setFragmentBytes`, so
     /// multiple MTKViews animating at 60fps never race on a shared
     /// buffer.
+    ///
+    /// `cursorVisible` says whether the cursor is drawn on the surface being
+    /// shaded this frame. iCurrentCursor is one global rect handed to every
+    /// surface, so without it a shader that owns the cursor paints it on every
+    /// window whose drawable covers that screen position. `gridOrigin` and
+    /// `cellAgeGrid` place this surface's iCellAge texture: the main window's
+    /// (grid 1) starts at its drawable's top-left; an external window's is
+    /// indexed by its own grid.
     func makeShaderUniforms(
         screenResolution: CGSize,
         windowOffset: CGPoint,
         windowSize: CGSize,
         backingScale: CGFloat,
         timing: SurfaceShaderTiming? = nil,
+        cursorVisible: Bool,
+        gridOrigin: CGPoint = .zero,
+        cellAgeGrid: Int64 = 1,
         lastLoggedCursor: inout (Float, Float, Float, Float)
     ) -> zonvie_shader_uniforms {
         let state = timing ?? shaderTimeBase
@@ -394,6 +441,16 @@ final class SharedRenderResources {
         uniforms.iCurrentCursorColor = cursor.currentColor
         uniforms.iPreviousCursorColor = cursor.previousColor
         uniforms.iTimeCursorChange = cursor.changeTimeSec
+        // Zonvie edit-effect uniforms.
+        let cellW = cellWidthPx, cellH = cellHeightPx
+        uniforms.iCellSize.0 = cellW
+        uniforms.iCellSize.1 = cellH
+        uniforms.iGridOrigin.0 = Float(gridOrigin.x)
+        uniforms.iGridOrigin.1 = Float(gridOrigin.y)
+        uniforms.iTimeLastEdit = shaderWantsEditInputs ? cellAge.lastEdit(grid: cellAgeGrid) : 0
+        uniforms.iCursorVisible = cursorVisible ? 1 : 0
+        uniforms.iCurrentCursorStyle = Self.cursorStyleForRect(cursorCur, cellW: cellW, cellH: cellH)
+        uniforms.iPreviousCursorStyle = Self.cursorStyleForRect(cursor.previous, cellW: cellW, cellH: cellH)
         // Shadertoy iDate: (year, month [1..12], day, seconds-in-day).
         // Shadertoy's howto lists the fields as "Year, month, day,
         // time in seconds" without specifying month indexing. Forward
@@ -426,6 +483,18 @@ final class SharedRenderResources {
 
         state.frameIndex &+= 1
         return uniforms
+    }
+
+    /// Classify a cursor rect into Ghostty's cursor style enum, from what is
+    /// on screen rather than from the mode name: a rect narrower than half a
+    /// cell is a bar, one shorter than half a cell an underline, anything
+    /// else a block. Degenerate cell metrics (before the first font load)
+    /// fall back to block.
+    static func cursorStyleForRect(_ rect: SurfaceShaderCursor.Rect, cellW: Float, cellH: Float) -> Int32 {
+        guard cellW > 0, cellH > 0 else { return 0 }
+        if rect.2 < cellW * 0.5 { return 2 }      // bar
+        if rect.3 < cellH * 0.5 { return 3 }      // underline
+        return 0                                  // block
     }
 
     /// Close the transaction: publish this flush's staged CPU pixels, then swap
@@ -743,6 +812,175 @@ final class SurfaceShaderCursor {
             ? Float(CACurrentMediaTime() - timeBase.startTimeSec)
             : 0
         return true
+    }
+}
+
+/// The iCellAge state of every surface: one store per texture, keyed the way
+/// the core stamps (`zonvie_cell_stamp.grid`) — 1 for the main window's
+/// screen-space cells, otherwise the grid id of an external window, indexed by
+/// that window's own grid.
+///
+/// The core thread writes the CPU mirror from on_cell_age_stamps (grid_mu
+/// held); each surface's draw sizes its store and uploads it. `lock` is a
+/// **leaf**: nothing under it calls out, and the GPU upload runs outside it.
+final class SurfaceCellAgeStores {
+    final class Store {
+        var cols = 0                    // Protected by lock
+        var rows = 0                    // Protected by lock
+        var values: [Float] = []        // Protected by lock
+        var dirty = false               // Protected by lock
+        var lastEdit: Float = 0         // Protected by lock
+        var texture: MTLTexture?        // Drawing thread only
+        var uploadScratch: [Float] = [] // Drawing thread only
+    }
+
+    private let lock = NSLock()
+    private var stores: [Int64: Store] = [:]
+    /// Stamps for a texture whose store is not sized yet — the first keystroke
+    /// after a window opens arrives before that window's first shaded draw.
+    /// Applied by `ensure`, capped so a window that never draws cannot grow it.
+    private var pending: [Int64: [(row: Int, col: Int, count: Int, time: Float)]] = [:]
+    private static let pendingCap = 16
+
+    /// Apply one flush's stamps, in the order the ABI documents. Core thread.
+    func apply(_ stamps: UnsafeBufferPointer<zonvie_cell_stamp>, clear: Bool, now: Float) {
+        lock.lock()
+        defer { lock.unlock() }
+        if clear {
+            // Every texture: a bulk repaint invalidates whatever any window
+            // still shows.
+            for st in stores.values { Self.zero(st) }
+            pending.removeAll()
+            return
+        }
+        guard now > 0 else { return }
+        for s in stamps {
+            let grid = Int64(s.grid)
+            if s.count == 0 {
+                // Clear marker: zero just this texture.
+                if let st = stores[grid] { Self.zero(st) }
+                pending.removeValue(forKey: grid)
+                continue
+            }
+            guard let st = stores[grid], st.cols > 0, st.rows > 0 else {
+                var list = pending[grid] ?? []
+                if list.count < Self.pendingCap {
+                    list.append((row: Int(s.row), col: Int(s.col), count: Int(s.count), time: now))
+                }
+                pending[grid] = list
+                continue
+            }
+            Self.stamp(st, row: Int(s.row), col: Int(s.col), count: Int(s.count), time: now)
+        }
+    }
+
+    /// Size `grid`'s store to cols x rows, creating it if needed. A resize
+    /// invalidates every stamp position, so it starts clean rather than
+    /// remapping ages onto cells that now hold different text.
+    func ensure(grid: Int64, cols: Int, rows: Int) {
+        guard cols > 0, rows > 0 else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        let st = stores[grid] ?? {
+            let st = Store()
+            stores[grid] = st
+            return st
+        }()
+        guard st.cols != cols || st.rows != rows else { return }
+        st.cols = cols
+        st.rows = rows
+        st.values = [Float](repeating: 0, count: cols * rows)
+        st.dirty = true
+        for p in pending.removeValue(forKey: grid) ?? [] {
+            Self.stamp(st, row: p.row, col: p.col, count: p.count, time: p.time)
+        }
+    }
+
+    /// Size `grid`'s store and return its texture with the mirror uploaded.
+    /// Drawing thread. The texture is made only when the size changes.
+    func texture(grid: Int64, cols: Int, rows: Int, device: MTLDevice) -> MTLTexture? {
+        ensure(grid: grid, cols: cols, rows: rows)
+        lock.lock()
+        guard let st = stores[grid], st.cols == cols, st.rows == rows else {
+            lock.unlock()
+            return nil
+        }
+        lock.unlock()
+
+        if st.texture == nil || st.texture?.width != cols || st.texture?.height != rows {
+            let desc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .r32Float, width: cols, height: rows, mipmapped: false)
+            desc.usage = [.shaderRead]
+            desc.storageMode = .shared
+            guard let tex = device.makeTexture(descriptor: desc) else { return nil }
+            st.texture = tex
+            // A fresh texture holds garbage; force the upload below.
+            lock.lock(); st.dirty = true; lock.unlock()
+        }
+        // Copy out under the lock, upload outside it: replace() on a shared
+        // texture is a memcpy, but holding the core thread's peer lock across
+        // it would put that thread behind a GPU-facing call for no reason.
+        if st.uploadScratch.count != cols * rows {
+            st.uploadScratch = [Float](repeating: 0, count: cols * rows)
+        }
+        do {
+            lock.lock()
+            defer { lock.unlock() }
+            guard st.dirty, st.values.count == cols * rows else { return st.texture }
+            st.uploadScratch.withUnsafeMutableBufferPointer { dst in
+                _ = st.values.withUnsafeBufferPointer { src in
+                    memcpy(dst.baseAddress!, src.baseAddress!, cols * rows * MemoryLayout<Float>.size)
+                }
+            }
+            st.dirty = false
+        }
+        st.uploadScratch.withUnsafeBytes { raw in
+            st.texture?.replace(
+                region: MTLRegionMake2D(0, 0, cols, rows),
+                mipmapLevel: 0,
+                withBytes: raw.baseAddress!,
+                bytesPerRow: cols * MemoryLayout<Float>.size
+            )
+        }
+        return st.texture
+    }
+
+    /// iTimeLastEdit for one texture: the time of its last stamp, so each
+    /// surface gates its effect on its own edits.
+    func lastEdit(grid: Int64) -> Float {
+        lock.lock()
+        defer { lock.unlock() }
+        return stores[grid]?.lastEdit ?? 0
+    }
+
+    /// Forget an external window's store when that window goes away.
+    func drop(grid: Int64) {
+        lock.lock()
+        defer { lock.unlock() }
+        stores.removeValue(forKey: grid)
+        pending.removeValue(forKey: grid)
+    }
+
+    func removeAll() {
+        lock.lock()
+        defer { lock.unlock() }
+        stores.removeAll()
+        pending.removeAll()
+    }
+
+    private static func zero(_ st: Store) {
+        for i in st.values.indices { st.values[i] = 0 }
+        st.dirty = true
+    }
+
+    private static func stamp(_ st: Store, row: Int, col: Int, count: Int, time: Float) {
+        guard row >= 0, row < st.rows, col >= 0 else { return }
+        let colEnd = min(st.cols, col + count)
+        guard col < colEnd else { return }
+        let base = row * st.cols
+        for c in col..<colEnd { st.values[base + c] = time }
+        st.lastEdit = max(st.lastEdit, time)
+        st.dirty = true
     }
 }
 
@@ -1217,6 +1455,15 @@ extension SharedRenderResources {
         customShaderPipelines.removeAll()
         customShaderPipelinesDecorated.removeAll()
         anyCustomShaderNeedsAnimation = false
+        shaderWantsEditInputs = false
+        shaderOwnsCursor = false
+        // Only ask the core to build stamp lists when a shader reads them,
+        // and drop the stores when none does, so an unused input costs no
+        // memory.
+        defer {
+            if !shaderWantsEditInputs { cellAge.removeAll() }
+            onShaderEditInputsChanged?(shaderWantsEditInputs)
+        }
         if !config.enabled || config.paths.isEmpty {
             return
         }
@@ -1231,6 +1478,8 @@ extension SharedRenderResources {
         ) {
             customShaderPipelines.append(loaded)
             if loaded.needsAnimation { anyCustomShaderNeedsAnimation = true }
+            if loaded.usesEditInputs { shaderWantsEditInputs = true }
+            if loaded.ownsCursor { shaderOwnsCursor = true }
         }
         // Decorated variant: always opaque (preserve_alpha OFF). Only a
         // separate compile is needed when the main set is NOT already opaque;
@@ -1244,7 +1493,7 @@ extension SharedRenderResources {
         } else {
             customShaderPipelinesDecorated = customShaderPipelines
         }
-        ZonvieCore.appLog("[Renderer] Loaded \(customShaderPipelines.count)/\(config.paths.count) custom shaders (decorated=\(customShaderPipelinesDecorated.count)), anyNeedsAnimation=\(anyCustomShaderNeedsAnimation)")
+        ZonvieCore.appLog("[Renderer] Loaded \(customShaderPipelines.count)/\(config.paths.count) custom shaders (decorated=\(customShaderPipelinesDecorated.count)), anyNeedsAnimation=\(anyCustomShaderNeedsAnimation), editInputs=\(shaderWantsEditInputs), ownsCursor=\(shaderOwnsCursor)")
     }
 
     private func loadPipelineFromArchive(lib: MTLLibrary, vs: MTLFunction, fs: MTLFunction, vsCopy: MTLFunction, fsCopy: MTLFunction, vertexDesc: MTLVertexDescriptor, copyVertexDesc: MTLVertexDescriptor, pixelFormat: MTLPixelFormat) -> Bool {

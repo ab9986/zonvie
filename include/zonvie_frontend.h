@@ -771,6 +771,21 @@ ZONVIE_API size_t zonvie_core_escape_path_for_cmdline(
    Pure — no core pointer, no lock. */
 ZONVIE_API bool zonvie_core_shader_needs_animation(const char *source, size_t len);
 
+/* Whether a custom shader's source reads any Zonvie edit-effect input
+   (iPrevFrame, iCellAge, iCellSize, iGridOrigin, iTimeLastEdit). Frontends
+   allocate the feedback pair and the cell-age texture, and opt in with
+   zonvie_core_set_shader_inputs_enabled, only when a loaded shader does.
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API bool zonvie_core_shader_uses_edit_inputs(const char *source, size_t len);
+
+/* Whether a custom shader's source carries the `@zonvie-owns-cursor` token:
+   the frontend then skips its native pass for bar/underline cursors and
+   leaves them to the shader. Block cursors stay native.
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API bool zonvie_core_shader_owns_cursor(const char *source, size_t len);
+
 /* The insertion index a tab drag at `pos` drops on: the first of `count`
    equal tabs (tab i starts at origin + i*stride and is `size` long) whose
    centre is past `pos`, else `count`. One axis: x on a tab bar, y down a
@@ -962,6 +977,23 @@ typedef struct zonvie_shader_uniforms {
     float    iPreviousCursorColor[4]; /* 128..143 */
     float    iTimeCursorChange;       /* 144..147 */
     float    _pad_cursor[3];          /* 148..159 — UBO size must be 16-aligned */
+    /* Zonvie edit-effect extensions. Appended after the Ghostty-compatible
+       block so shaders compiled against the 160-byte layout keep reading the
+       same offsets.
+       iCellSize/iGridOrigin let a shader map fragCoord to a grid cell, which
+       is what the iCellAge sampler is indexed by.
+       iTimeLastEdit is the iTime of the most recent cell stamp, so a shader
+       can skip all per-cell work outside its effect window.
+       iCursorVisible/iCurrentCursorStyle/iPreviousCursorStyle mirror
+       Ghostty's uniforms of the same name and type. Style values match
+       Ghostty's renderer cursor style enum: 0 block, 1 block_hollow, 2 bar,
+       3 underline, 4 lock. Zonvie emits only 0/2/3. */
+    float    iCellSize[2];            /* 160..167  cell (w, h) in drawable px */
+    float    iGridOrigin[2];          /* 168..175  main grid top-left, drawable px */
+    float    iTimeLastEdit;           /* 176..179 */
+    int32_t  iCursorVisible;          /* 180..183  0 while blink-off */
+    int32_t  iCurrentCursorStyle;     /* 184..187 */
+    int32_t  iPreviousCursorStyle;    /* 188..191 */
 } zonvie_shader_uniforms;
 
 /* Result of a GLSL -> target shading language compile.

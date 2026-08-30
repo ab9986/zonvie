@@ -466,6 +466,17 @@ pub const Callbacks = struct {
     ) callconv(.c) void = null,
     /// Neovim destroyed the grid; the frontend may release its buffers.
     on_grid_destroy: ?*const fn (ctx: ?*anyopaque, grid_id: i64) callconv(.c) void = null,
+    /// Cells stamped as "just edited" during this flush, for the iCellAge
+    /// texture a custom shader samples. Fired at most once per flush, after
+    /// vertices are submitted and before on_flush_end, and only while the
+    /// frontend has opted in via zonvie_core_set_shader_inputs_enabled.
+    /// `clear != 0` means "zero the whole texture"; `stamps` may be empty.
+    on_cell_age_stamps: ?*const fn (
+        ctx: ?*anyopaque,
+        stamps: ?[*]const c_api.zonvie_cell_stamp,
+        n: usize,
+        clear: i32,
+    ) callconv(.c) void = null,
 };
 
 const GridEntry = flush.GridEntry;

@@ -797,6 +797,21 @@ typedef void (*zonvie_on_callback_error_fn)(
    the core's Zig declaration. */
 #define ZONVIE_CALLBACKS_ABI_VERSION 2
 
+/* One contiguous run of cells the core stamped as "just edited", consumed by
+   on_cell_age_stamps to update the iCellAge texture a custom shader samples.
+   `grid` selects the texture: 1 is the main window's screen-space cell grid
+   (composited floats are stamped there at their win_pos offset); any other
+   value is the Neovim grid id of an EXTERNAL window (a win_external_pos
+   grid, or -100 for the ext-cmdline surface), and row/col are then local to
+   that grid. A frontend that keeps no per-window texture must ignore stamps
+   whose grid is not 1. */
+typedef struct zonvie_cell_stamp {
+    uint16_t row;
+    uint16_t col;
+    uint16_t count;
+    int16_t grid;
+} zonvie_cell_stamp;
+
 typedef struct zonvie_callbacks {
     /* Must be set to ZONVIE_CALLBACKS_ABI_VERSION; zonvie_core_create returns
        NULL otherwise. callbacks_size only sees the struct's length, not a
@@ -996,6 +1011,27 @@ typedef struct zonvie_callbacks {
        Optional: NULL disables error reporting. Core continues after error;
        this is informational. Appended at the end for ABI compat. */
     zonvie_on_callback_error_fn on_callback_error;
+
+    /* Cells the core stamped as "just edited" during this flush, for the
+       iCellAge texture a custom shader samples. Called at most once per
+       flush, after all vertices are submitted and before on_flush_end, and
+       ONLY after the frontend opted in with
+       zonvie_core_set_shader_inputs_enabled — a frontend without a custom
+       shader never sees this callback and the core never builds the list.
+
+       When `clear` is non-zero the frontend must zero EVERY cell-age
+       texture it keeps (main and per-external-window alike); `stamps` may
+       be empty in that case. Otherwise the entries are processed in order:
+       an entry with `count == 0` means "zero the texture `grid` selects"
+       (row/col are 0 and meaningless), and any other entry is a run of
+       `count` cells starting at (row, col) on that texture whose age must
+       be set to "now". Clear markers precede the stamps of one flush, and
+       a stamp never targets a texture cleared in the same call.
+
+       Runs on the core thread with grid_mu held. Appended at the end of the
+       struct for ABI compat. */
+    void (*on_cell_age_stamps)(void* ctx, const zonvie_cell_stamp* stamps,
+                               size_t n, int clear);
 } zonvie_callbacks;
 
 ZONVIE_API void zonvie_core_set_log_enabled(zonvie_core *core, int enabled);
@@ -1045,6 +1081,13 @@ ZONVIE_API void zonvie_core_set_ext_tabline(zonvie_core *core, int enabled);
 /* Enable ext_windows UI extension (must call before zonvie_core_start).
  * When enabled, Neovim external windows are rendered as separate OS windows. */
 ZONVIE_API void zonvie_core_set_ext_windows(zonvie_core *core, int enabled);
+
+/* Opt in to the per-flush cell-age stamp list delivered via
+   on_cell_age_stamps. Off by default: with it off the core builds no list
+   and never fires the callback, so a frontend without a custom shader that
+   reads the edit inputs pays nothing. Frontends toggle this when such a
+   shader is loaded or unloaded. */
+ZONVIE_API void zonvie_core_set_shader_inputs_enabled(zonvie_core *core, int enabled);
 
 /* Process due message timeouts (including the throttled message float scroll)
  * and render-maintenance retries. Frontends

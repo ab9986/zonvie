@@ -670,6 +670,9 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     /// Ping-pong render targets for multi-pass custom shader chains.
     /// Allocated lazily inside draw() when pipelines.count > 1.
     private let customShaderPong = SurfacePingPongTextures()
+    /// iPrevFrame for this surface. Its own, because this view has its own
+    /// drawable and history.
+    private let customShaderFeedback = SurfaceFeedbackTextures()
     private let scrollScratch = SurfaceScrollScratchTexture()
 
     // Blur transparency support
@@ -2673,7 +2676,10 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                 return
             }
 
-            let presentation = encodeBackBufferToDrawable(&f, cmd: cmd, backTex: backTex, drawable: drawable, view: view)
+            let presentation = encodeBackBufferToDrawable(
+                &f, cmd: cmd, backTex: backTex, drawable: drawable, view: view,
+                cursorVisible: f.fontIsCurrent && f.cursorBlink && committedCursor.vertexCount > 0
+            )
 
             guard presentation.encoded else {
                 // Back-buffer work is valid and must be submitted to release
@@ -2685,7 +2691,12 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                 return
             }
 
-            if !encodeCursorOverlay(
+            // A shader that declared @zonvie-owns-cursor draws the cursor
+            // itself, on a frame its chain actually ran. Without this check
+            // the cmdline surface kept painting its own undeformed cursor on
+            // top.
+            let shaderDrawsCursor = presentation.tookCustomShaderChain && shared.shaderDrawsCursorNow()
+            if !shaderDrawsCursor, !encodeCursorOverlay(
                 &f, cmd: cmd, drawable: drawable, committedCursor: committedCursor,
                 pipeline: pipeline, sampler: sampler, atlasTex: atlasTex
             ) {
@@ -3363,8 +3374,10 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
 
         encodeHostedLayers(&f, encoder: enc, glowPipeline: extractPipe, pipeline: pipeline, backTex: backTex)
 
-        // Cursor vertices for cursor glow
+        // Cursor vertices for cursor glow. Skipped when a shader owns the
+        // cursor (see the main surface's glow pass).
         if f.fontIsCurrent,
+           !shared.shaderDrawsCursorNow(),
            f.cursorBlink,
            committedCursor.vertexCount > 0,
            let cvb = committedCursor.vertexBuffer {
@@ -3405,25 +3418,42 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         cmd: MTLCommandBuffer,
         backTex: MTLTexture,
         drawable: CAMetalDrawable,
-        view: MTKView
+        view: MTKView,
+        cursorVisible: Bool
     ) -> SurfaceDrawablePresentation {
         // Cleared here, past every bail, as on the main surface.
         shaderCursorMovedThisFrame = false
         let cursorShaderOffsetPx = f.cursorShaderOffsetPx
         let lastKnownCursorRowSnapshot = f.lastKnownCursorRow
+        let runsChain = shared.customShaderPostProcess == .afterBloom
+            && mainTerminalView?.renderer != nil
+        // This window's iCellAge: the core stamps an external window under
+        // its own grid id, in that grid's coordinates (see zonvie_cell_stamp).
+        var editInputs: SurfaceEditInputs? = nil
+        if runsChain, shared.shaderWantsEditInputs {
+            editInputs = SurfaceEditInputs(
+                feedback: customShaderFeedback,
+                cellAge: shared.cellAge.texture(
+                    grid: gridId, cols: Int(gridCols), rows: Int(gridRows), device: shared.device)
+            )
+        }
+        // Where this grid starts in this window's drawable: a decorated
+        // surface insets its viewport for its icon/padding (the same mapping
+        // the cursor rect uses).
+        let gridOriginInViewPx = CGPoint(x: f.vpOriginX, y: f.vpOriginY)
         return encodeSurfaceBackBufferToDrawable(
             cmd: cmd,
             backTex: backTex,
             drawableTexture: drawable.texture,
             customShaderPipelines: surfaceCustomShaderPipelines(),
-            runsCustomShaderChain: shared.customShaderPostProcess == .afterBloom
-                && mainTerminalView?.renderer != nil,
+            runsCustomShaderChain: runsChain,
             customShaderPong: customShaderPong,
             pongSize: view.drawableSize,
             copyPipeline: shared.copyPipeline,
             copyVertexBuffer: shared.copyVertexBuffer,
             sampler: shared.sampler,
             bilinearSampler: shared.bilinearSampler,
+            editInputs: editInputs,
             makeUniforms: { [weak self] in
                 guard let self, let renderer = self.mainTerminalView?.renderer else {
                     return zonvie_shader_uniforms()
@@ -3463,6 +3493,12 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                     windowSize: view.drawableSize,
                     backingScale: self.backingScale,
                     timing: self.shaderTiming,
+                    cursorVisible: cursorVisible,
+                    gridOrigin: CGPoint(
+                        x: windowOffset.x + gridOriginInViewPx.x,
+                        y: windowOffset.y + gridOriginInViewPx.y
+                    ),
+                    cellAgeGrid: self.gridId,
                     lastLoggedCursor: &self.lastLoggedShaderCursor
                 )
             }

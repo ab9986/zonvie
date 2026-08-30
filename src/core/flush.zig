@@ -3601,6 +3601,31 @@ pub const FlushCtx = struct {
                 }
             }
         }
+        // Hand the frontend this flush's cell-age stamps. Registered AFTER
+        // the on_flush_end defer and BEFORE the external-grid one, so LIFO
+        // runs it after vertices are submitted and before on_flush_end —
+        // the ordering the ABI documents. Always drains, so an aborted flush
+        // does not leak stamps into the next one.
+        defer {
+            const g = &ctx.core.grid;
+            if (g.shader_inputs_enabled and !ctx.core.flush_aborted) {
+                if (ctx.core.cb.on_cell_age_stamps) |cb| {
+                    if (g.cell_stamp_clear) {
+                        // Bulk update: whatever ghost is on any texture no
+                        // longer sits on its text. Clear everything.
+                        cb(ctx.core.ctx, null, 0, 1);
+                    } else {
+                        // Per-texture: a `count == 0` marker for each texture
+                        // a non-edit event invalidated, then the stamps on
+                        // the textures that were not.
+                        var out: [grid_mod.cell_stamp_capacity + grid_mod.max_stamp_clear_grids]grid_mod.CellStamp = undefined;
+                        const n = g.buildCellStampDelivery(&out);
+                        if (n > 0) cb(ctx.core.ctx, out[0..].ptr, n, 0);
+                    }
+                }
+            }
+            g.resetCellStamps();
+        }
         // Grid scroll events are NOT dispatched or cleared — they are preserved
         // for the retry flush so smooth-scroll offsets stay in sync with vertices.
         if (ctx.core.flush_aborted) {
@@ -5492,6 +5517,26 @@ pub fn notifyCmdlineChanges(self: *Core) void {
         const scroll_offset = cmdlineScrollOffset(state.scroll_offset, cursor_display_col, line.cursor_cells, display_width, width);
         state.scroll_offset = scroll_offset;
 
+        // Cell-age stamps for the ext-cmdline surface. The cmdline grid is
+        // rebuilt from scratch on every cmdline_show, so "what changed" has
+        // to be recovered by diffing against the previous contents: snapshot
+        // the old row here (before the resize can drop it), compare after the
+        // rewrite below. Only the glyphs matter, as in grid_line stamping.
+        const cmdline_stamp_cap = 512;
+        var old_cps: [cmdline_stamp_cap]u32 = undefined;
+        var old_len: u32 = 0;
+        if (self.grid.shader_inputs_enabled) {
+            if (self.grid.sub_grids.get(cmdline_grid_id)) |sg| {
+                if (sg.rows >= 1) {
+                    old_len = @min(sg.cols, cmdline_stamp_cap);
+                    var c: u32 = 0;
+                    while (c < old_len) : (c += 1) {
+                        old_cps[c] = self.grid.getCellGrid(cmdline_grid_id, 0, c).cp;
+                    }
+                }
+            }
+        }
+
         // Create or resize cmdline grid
         self.grid.resizeGrid(cmdline_grid_id, 1, width) catch |e| {
             self.log.write("[cmdline] resizeGrid failed: {any}\n", .{e});
@@ -5508,6 +5553,36 @@ pub fn notifyCmdlineChanges(self: *Core) void {
         // Cursor position in the visible grid: reuse pre-computed cursor_display_col,
         // adjusted for scroll offset.
         const cursor_col: u32 = if (cursor_display_col >= scroll_offset) cursor_display_col - scroll_offset else 0;
+
+        // Diff the rebuilt row against the snapshot and stamp what changed.
+        // A cmdline that just opened (no previous row) or one where more
+        // than half the row changed (scroll, a pasted line) is a repaint,
+        // not typing.
+        if (self.grid.shader_inputs_enabled) {
+            if (width > cmdline_stamp_cap) {
+                self.grid.markCellStampBulk();
+            } else {
+                var lo: u32 = std.math.maxInt(u32);
+                var hi: u32 = 0;
+                var c: u32 = 0;
+                while (c < width) : (c += 1) {
+                    // Cleared cells hold a space; a column beyond the old
+                    // width was blank too.
+                    const old_cp: u32 = if (c < old_len) old_cps[c] else ' ';
+                    if (self.grid.getCellGrid(cmdline_grid_id, 0, c).cp != old_cp) {
+                        lo = @min(lo, c);
+                        hi = @max(hi, c + 1);
+                    }
+                }
+                if (hi > lo) {
+                    if (old_len == 0 or (hi - lo) * 2 > width) {
+                        self.grid.markCellStampBulk();
+                    } else {
+                        self.grid.stampEditedCells(cmdline_grid_id, 0, lo, hi - lo);
+                    }
+                }
+            }
+        }
 
         // Mark as external grid
         _ = self.grid.setWinExternalPos(cmdline_grid_id, 0) catch |e| {

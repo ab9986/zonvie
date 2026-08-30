@@ -1513,6 +1513,15 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
     if (ctx_bits % @alignOf(App) != 0) return;
     const app: *App = @ptrFromInt(ctx_bits);
 
+    // Mirror the cell metrics onto the renderer for iCellSize and the
+    // cell-age grid. The renderer does not otherwise track them, and this
+    // runs once per flush, which is when they can change.
+    if (app.renderer) |*r| {
+        r.cell_w_px = app.cell_w_px;
+        r.cell_h_px = app.cell_h_px;
+        r.cursor_blink_on = app.cursor_blink.visible;
+    }
+
     // Resolve the external transaction before releasing app.mu to any
     // UI-thread pending-seed consumer. The active flag, failure decision, and
     // every external commit/cancel form one publication point: after unlock a
@@ -2167,6 +2176,26 @@ pub fn onMainGridSize(ctx: ?*anyopaque, rows: u32, cols: u32) callconv(.c) void 
     if (app.hwnd) |h| {
         _ = c.PostMessageW(h, app_mod.WM_APP_RESIZE_TO_GRID, rows, @intCast(cols));
     }
+}
+
+/// Cells the core stamped as "just edited" this flush, for the iCellAge
+/// shader input. Core thread, grid_mu held — this only writes the renderer's
+/// CPU mirror; the GPU upload happens on the next draw.
+pub fn onCellAgeStamps(
+    ctx: ?*anyopaque,
+    stamps: ?[*]const core.zonvie_cell_stamp,
+    n: usize,
+    clear: i32,
+) callconv(.c) void {
+    const app: *App = @ptrCast(@alignCast(ctx.?));
+    if (app.renderer == null) return;
+    const r = &app.renderer.?;
+    // iTime base: the same origin updateCustomShaderUniforms uses, so the
+    // shader can compute `iTime - stamp` directly.
+    const now = r.shaderTimeNow();
+    const slice: []const core.zonvie_cell_stamp =
+        if (stamps != null and n > 0) stamps.?[0..n] else &.{};
+    r.applyCellAgeStamps(slice, clear != 0, now);
 }
 
 pub fn onLineSpace(ctx: ?*anyopaque, linespace_px: i32) callconv(.c) void {
