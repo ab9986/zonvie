@@ -2944,7 +2944,16 @@ fn onGridLine(
                 grid.win_pos.get(grid_id);
 
             if (origin) |o| {
-                const screen_row = row + o.row;
+                // Saturating adds throughout. `row` only passed
+                // checkedU32 (it is bounds-checked against the
+                // grid where cells are WRITTEN, not here), and a
+                // win_pos origin is equally unvalidated, so a
+                // wrapping `row + o.row` would land a hostile row
+                // on top of a real one — and panic in a safe
+                // build before it got the chance. Saturation puts
+                // the value nowhere near a cursor row, so the
+                // guard below rejects it.
+                const screen_row = row +| o.row;
                 const written = col - stamp_col_start;
                 const changed: u32 = if (changed_hi > changed_lo) changed_hi - changed_lo else 0;
                 // The cursor's row in the same coordinate space
@@ -2957,7 +2966,7 @@ fn onGridLine(
                 else if (grid.cursor_grid == 1)
                     grid.cursor_row
                 else if (grid.win_pos.get(grid.cursor_grid)) |cp|
-                    grid.cursor_row + cp.row
+                    grid.cursor_row +| cp.row
                 else
                     null;
                 // Only the cursor's row and its neighbours are an
@@ -2969,7 +2978,7 @@ fn onGridLine(
                 // showmode, ruler) and the row guard cleared the
                 // very keystroke that entered Insert mode.
                 const near_cursor = if (cursor_row_here) |cr|
-                    screen_row + 1 >= cr and screen_row <= cr + 1
+                    screen_row +| 1 >= cr and screen_row <= cr +| 1
                 else
                     false;
                 if (written > 0 and near_cursor) {
@@ -2981,7 +2990,7 @@ fn onGridLine(
                     // typed glyph into a bulk repaint with no
                     // smoke. A span of changed glyphs wider than
                     // half the row is a reflow/scroll/substitute.
-                    if (grid_cols > 0 and changed * 2 > grid_cols) {
+                    if (grid_cols > 0 and changed *| 2 > grid_cols) {
                         grid.markCellStampBulk();
                     } else if (changed > 0) {
                         // Stamp only the cells that changed, so
@@ -2991,7 +3000,7 @@ fn onGridLine(
                         grid.stampEditedCells(
                             stamp_grid,
                             screen_row,
-                            changed_lo + o.col,
+                            changed_lo +| o.col,
                             changed,
                         );
                     }
@@ -5273,6 +5282,84 @@ test "an external grid stamps under its own id with grid-local coordinates" {
     try std.testing.expectEqual(@as(u16, 1), grid.cell_stamps[0].row);
     try std.testing.expectEqual(@as(u16, 3), grid.cell_stamps[0].col);
     try std.testing.expectEqual(@as(u16, 1), grid.cell_stamps[0].count);
+}
+
+test "a grid_line row that would overflow screen space neither panics nor stamps" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(4, 20);
+    armCellStamps(&grid, "insert");
+    grid.cursor_grid = 1;
+    grid.cursor_row = 0;
+
+    // maxInt(u32) passes checkedU32; the stamp block used to compute
+    // `row + o.row` and `screen_row + 1` on it and trap in a safe build.
+    const cells = [_]mp.Value{try testCell(arena, "a", 0, null)};
+    var events = [_]mp.Value{try testGridLineEvent(arena, 1, std.math.maxInt(u32), 0, &cells)};
+    try runRedrawEvents(&grid, &hl, arena, &events);
+
+    try std.testing.expectEqual(@as(usize, 0), grid.cell_stamp_count);
+    try std.testing.expect(!grid.cellStampGridCleared(1));
+}
+
+test "a composited float row that would overflow when offset by win_pos neither panics nor stamps" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(4, 20);
+    // A composited float placed with a non-zero win_pos row: the stamp block
+    // adds that origin to the event's row. maxInt(u32) + 2 wrapped.
+    try grid.resizeGrid(3, 2, 10);
+    try grid.setWinPos(3, 1000, 2, 0);
+    armCellStamps(&grid, "insert");
+    grid.cursor_grid = 1;
+    grid.cursor_row = 2;
+
+    const cells = [_]mp.Value{try testCell(arena, "a", 0, null)};
+    var events = [_]mp.Value{try testGridLineEvent(arena, 3, std.math.maxInt(u32), 0, &cells)};
+    try runRedrawEvents(&grid, &hl, arena, &events);
+
+    try std.testing.expectEqual(@as(usize, 0), grid.cell_stamp_count);
+    try std.testing.expect(!grid.cellStampGridCleared(1));
+}
+
+test "a cursor on a composited float at a hostile row neither panics nor stamps" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(4, 20);
+    try grid.resizeGrid(3, 2, 10);
+    try grid.setWinPos(3, 1000, 1, 0);
+    armCellStamps(&grid, "insert");
+    // The cursor sits on the float; the stamp block adds the float's
+    // win_pos row to cursor_row to compare in screen space. setCursor
+    // bounds-checks, so plant the hostile value directly, as a torn or
+    // stale field would.
+    grid.cursor_grid = 3;
+    grid.cursor_row = std.math.maxInt(u32);
+
+    const cells = [_]mp.Value{try testCell(arena, "a", 0, null)};
+    var events = [_]mp.Value{try testGridLineEvent(arena, 1, 0, 3, &cells)};
+    try runRedrawEvents(&grid, &hl, arena, &events);
+
+    try std.testing.expectEqual(@as(usize, 0), grid.cell_stamp_count);
+    try std.testing.expect(!grid.cellStampGridCleared(1));
 }
 
 test "gate 2: a sub-grid with no screen position stamps nothing" {

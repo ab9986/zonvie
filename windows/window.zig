@@ -896,6 +896,18 @@ pub fn scheduleReliableWindowMessage(
     return true;
 }
 
+/// Tell the core whether any loaded custom shader wants the edit inputs
+/// (iCellAge / iTimeLastEdit). The core records no cell-age stamps and never
+/// fires on_cell_age_stamps until this is on, so a shader that declares the
+/// inputs would silently get an all-zero iCellAge without this call. Must run
+/// after every loadCustomShaderPipelines on the MAIN renderer (external
+/// windows compile the same config, so the flag they derive is identical).
+fn syncShaderInputsEnabled(app: *App) void {
+    const corep = app.corep orelse return;
+    const want = if (app.renderer) |*r| r.shader_wants_edit_inputs else false;
+    core.zonvie_core_set_shader_inputs_enabled(corep, if (want) 1 else 0);
+}
+
 pub fn scheduleDeviceLostRetry(hwnd: c.HWND, app: *App) void {
     if (app.device_lost_recovery_cancelled) return;
     const delay_ms = render_helpers.deviceLostRetryDelayMs(app.device_lost_recover_attempts);
@@ -5149,6 +5161,7 @@ pub export fn WndProc(
                 app.renderer = recovered_gpu.?;
                 app.device_lost_shader_carry = null;
                 app.mu.unlock(core.clock.io());
+                syncShaderInputsEnabled(app);
 
                 // 4. Full reseed: GPU atlas + all rows + tabline texture.
                 app.atlas_upload.forceFull();
@@ -5612,6 +5625,7 @@ pub export fn WndProc(
                 // live D3D11 device.
                 if (app.renderer) |*r| {
                     r.loadCustomShaderPipelines(&app.config);
+                    syncShaderInputsEnabled(app);
                     if (r.any_custom_shader_needs_animation) {
                         // Kick continuous-redraw ticker. Runs ~60Hz until
                         // the renderer (or a future config reload) tells

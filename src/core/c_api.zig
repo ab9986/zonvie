@@ -1573,8 +1573,17 @@ pub export fn zonvie_core_set_shader_inputs_enabled(p: ?*zonvie_core, enabled: i
     if (p == null) return;
     const box = asBox(p.?);
     const on = (enabled != 0);
+    // Called from the frontend's render/UI thread after zonvie_core_start,
+    // while the core thread may be inside handleRedraw recording stamps into
+    // the same fields. grid_mu serialises the two; without it the OFF path's
+    // resetCellStamps() raced stampEditedCells' `cell_stamp_count += 1`.
+    // Callers must not invoke this from inside a core callback (grid_mu is
+    // held there and this mutex is not recursive) — both frontends call it
+    // from their shader-pipeline build, which runs on their own thread.
+    box.core.grid_mu.lockUncancelable(clock.io());
     box.core.grid.shader_inputs_enabled = on;
     if (!on) box.core.grid.resetCellStamps();
+    box.core.grid_mu.unlock(clock.io());
     box.core.log.write("[c_api] zonvie_core_set_shader_inputs_enabled: enabled={any}\n", .{on});
 }
 

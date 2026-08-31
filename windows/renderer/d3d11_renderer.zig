@@ -447,6 +447,12 @@ pub const Renderer = struct {
     /// per frame when dirty.
     cell_age_tex: ?*c.ID3D11Texture2D = null,
     cell_age_srv: ?*c.ID3D11ShaderResourceView = null,
+    /// Guards the CPU mirror below. The core thread writes it from
+    /// on_cell_age_stamps while the UI thread resizes, frees and uploads it
+    /// from the draw path — without this a window resize frees the slice out
+    /// from under a keystroke's stamp. Always taken INSIDE ctx_mu when both
+    /// are held (the draw path is the only place that holds both).
+    cell_age_mu: std.Io.Mutex = .init,
     cell_age_values: []f32 = &.{},
     cell_age_cols: u32 = 0,
     cell_age_rows: u32 = 0,
@@ -2651,8 +2657,10 @@ pub const Renderer = struct {
             self.cell_age_values.len == cols * rows) return;
         const n: usize = @as(usize, cols) * @as(usize, rows);
         const buf = self.alloc.alloc(f32, n) catch return;
-        if (self.cell_age_values.len != 0) self.alloc.free(self.cell_age_values);
         @memset(buf, 0);
+        self.cell_age_mu.lockUncancelable(core.clock.io());
+        defer self.cell_age_mu.unlock(core.clock.io());
+        if (self.cell_age_values.len != 0) self.alloc.free(self.cell_age_values);
         self.cell_age_values = buf;
         self.cell_age_cols = cols;
         self.cell_age_rows = rows;
@@ -2665,6 +2673,8 @@ pub const Renderer = struct {
     /// Apply one flush's stamps. Called from the core thread via
     /// on_cell_age_stamps; touches only the CPU mirror.
     pub fn applyCellAgeStamps(self: *Renderer, stamps: []const core.zonvie_cell_stamp, clear: bool, now: f32) void {
+        self.cell_age_mu.lockUncancelable(core.clock.io());
+        defer self.cell_age_mu.unlock(core.clock.io());
         if (self.cell_age_cols == 0 or self.cell_age_rows == 0) return;
         if (clear) {
             @memset(self.cell_age_values, 0);
@@ -2690,9 +2700,13 @@ pub const Renderer = struct {
             if (col_start >= col_end) continue;
             var col = col_start;
             while (col < col_end) : (col += 1) self.cell_age_values[base + col] = now;
+            // Per stamp, not per call: a list carrying only external-window
+            // stamps (which this frontend drops) must not advance the MAIN
+            // window's iTimeLastEdit, and a call that stamped nothing must
+            // not force a full texture upload.
+            self.cell_age_last_edit = now;
+            self.cell_age_dirty = true;
         }
-        self.cell_age_last_edit = now;
-        self.cell_age_dirty = true;
     }
 
     /// Create/refresh the cell-age texture and upload the mirror when dirty.
@@ -2724,6 +2738,9 @@ pub const Renderer = struct {
             // A fresh texture holds garbage until the first upload.
             self.cell_age_dirty = true;
         }
+        // The core thread writes the mirror; hold it still for the copy.
+        self.cell_age_mu.lockUncancelable(core.clock.io());
+        defer self.cell_age_mu.unlock(core.clock.io());
         if (self.cell_age_dirty) {
             if (ctx_vtbl.*.UpdateSubresource) |update| {
                 update(
