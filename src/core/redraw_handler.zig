@@ -389,6 +389,32 @@ fn checkedGridCoord(v: i64) ?u32 {
     return @intCast(v);
 }
 
+/// msg_show's id is an Integer or, for nvim_echo({id = "..."}), a String
+/// (api-ui-events: "It can either be an integer or string"). The message
+/// model and the frontend ABI carry an i64, so a String maps to a stable
+/// negative i64: Neovim's own Integer ids are positive (message.c
+/// msg_id_next starts at 1), and -1 belongs to kind "empty". 0 means no id.
+fn msgIdFromValue(v: mp.Value) i64 {
+    return switch (v) {
+        .int => |i| i,
+        .str => |s| blk: {
+            const h: u64 = std.hash.Wyhash.hash(0, s) | (1 << 63);
+            const id: i64 = @bitCast(h);
+            break :blk if (id == -1) -2 else id;
+        },
+        else => 0,
+    };
+}
+
+test "a String msg_show id maps to a stable negative id distinct from Neovim's" {
+    const a = msgIdFromValue(.{ .str = "my-progress" });
+    try std.testing.expect(a < -1);
+    try std.testing.expectEqual(a, msgIdFromValue(.{ .str = "my-progress" }));
+    try std.testing.expect(a != msgIdFromValue(.{ .str = "other" }));
+    try std.testing.expectEqual(@as(i64, 7), msgIdFromValue(.{ .int = 7 }));
+    try std.testing.expectEqual(@as(i64, 0), msgIdFromValue(.nil));
+}
+
 test "a disabled cursor style returns the cursor to the UI default" {
     var grid = Grid.init(std.testing.allocator);
     defer grid.deinit();
@@ -2796,7 +2822,7 @@ pub fn handleRedraw(
                     const replace_last: bool = if (t.len > 2 and t[2] == .bool) t[2].bool else false;
                     const history: bool = if (t.len > 3 and t[3] == .bool) t[3].bool else false;
                     const append_flag: bool = if (t.len > 4 and t[4] == .bool) t[4].bool else false;
-                    const msg_id: i64 = if (t.len > 5 and t[5] == .int) t[5].int else 0;
+                    const msg_id: i64 = if (t.len > 5) msgIdFromValue(t[5]) else 0;
 
                     try grid.setMsgShow(kind, chunks.items, replace_last, history, append_flag, msg_id);
                     if (log.cb != null) log.write("msg_show kind={s} chunks={d} replace_last={} history={} append={} msg_id={d}\n", .{ kind, chunks.items.len, replace_last, history, append_flag, msg_id });

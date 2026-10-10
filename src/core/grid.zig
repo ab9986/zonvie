@@ -3513,8 +3513,14 @@ pub const Grid = struct {
         append: bool,
         msg_id: i64,
     ) !void {
-        // Discard empty messages (chunks=0). Neovim sends these (e.g., kind="empty")
-        // as no-op events that should not create visible display.
+        // `:echo ""` arrives as kind "empty" with no content and clears the
+        // message line (ui2/messages.lua: "A sole empty message clears the
+        // cmdline").
+        if (std.mem.eql(u8, kind, "empty")) {
+            self.setMsgClear();
+            return;
+        }
+        // Any other content-less event creates no visible display.
         if (content.len == 0) return;
 
         // Route confirm/confirm_sub to singleton ConfirmMessage (noice.nvim pattern:
@@ -3568,22 +3574,18 @@ pub const Grid = struct {
             std.mem.eql(u8, kind, "return_prompt");
         const clear_existing = !append and !replace_last and !is_accumulating;
 
-        // If replace_last is true, replace the last message (or find by msg_id if non-zero)
-        if (replace_last and self.message_state.messages.items.len > 0) {
-            // Find message to replace: by msg_id if non-zero, otherwise last message
-            var msg_to_replace: ?*Message = null;
-            if (msg_id != 0) {
-                for (self.message_state.messages.items) |*msg| {
-                    if (msg.id == msg_id) {
-                        msg_to_replace = msg;
-                        break;
-                    }
-                }
-            }
-            // If not found by msg_id, replace last message
-            if (msg_to_replace == null) {
-                msg_to_replace = &self.message_state.messages.items[self.message_state.messages.items.len - 1];
-            }
+        // A visible message with the same id is updated whatever replace_last
+        // says (api-ui-events msg_show): replaced, or appended to when append
+        // is set (ui2/messages.lua writes at the id's row). Neovim gives each
+        // emitted message a fresh id (message.c msg_ext_ui_flush), so a match
+        // is an update of that message.
+        const by_id: ?*Message = if (msg_id != 0) for (self.message_state.messages.items) |*msg| {
+            if (msg.id == msg_id) break msg;
+        } else null else null;
+
+        if (self.message_state.messages.items.len > 0) {
+            const last = &self.message_state.messages.items[self.message_state.messages.items.len - 1];
+            const msg_to_replace: ?*Message = if (replace_last) by_id orelse last else if (!append) by_id else null;
 
             if (msg_to_replace) |msg| {
                 // The replacement is routed by its own kind: a search_count
@@ -3605,10 +3607,10 @@ pub const Grid = struct {
             }
         }
 
-        // If append is true, append to last message
+        // Append to the message with this id, else to the last one.
         if (append and self.message_state.messages.items.len > 0) {
-            const last_msg = &self.message_state.messages.items[self.message_state.messages.items.len - 1];
-            try setMessageContentBounded(last_msg, self.alloc, content, true);
+            const target = by_id orelse &self.message_state.messages.items[self.message_state.messages.items.len - 1];
+            try setMessageContentBounded(target, self.alloc, content, true);
             self.message_state.msg_dirty = true;
             return;
         }
@@ -4000,6 +4002,53 @@ fn checkReplaceLastTakesItsKind(alloc: std.mem.Allocator) !void {
 
 test "a replace_last message is routed by its own kind, and OOM keeps the old one" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkReplaceLastTakesItsKind, .{});
+}
+
+test "a msg_show whose id matches a visible message replaces it without replace_last" {
+    // api-ui-events msg_show: "Update (replace) any existing message matching
+    // `id`" -- unconditionally; replace_last is a separate flag.
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+
+    try grid.setMsgShow("shell_out", &.{.{ .hl_id = 0, .text = "first" }}, false, false, false, 5);
+    try grid.setMsgShow("shell_out", &.{.{ .hl_id = 0, .text = "second" }}, false, false, false, 6);
+    try grid.setMsgShow("shell_out", &.{.{ .hl_id = 0, .text = "first, updated" }}, false, false, false, 5);
+
+    const msgs = grid.message_state.messages.items;
+    try std.testing.expectEqual(@as(usize, 2), msgs.len);
+    try std.testing.expectEqualStrings("first, updated", msgs[0].content.items[0].text);
+    try std.testing.expectEqualStrings("second", msgs[1].content.items[0].text);
+}
+
+test "an appended msg_show whose id matches extends that message, not the last" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+
+    try grid.setMsgShow("shell_out", &.{.{ .hl_id = 0, .text = "a" }}, false, false, false, 5);
+    try grid.setMsgShow("shell_out", &.{.{ .hl_id = 0, .text = "b" }}, false, false, false, 6);
+    try grid.setMsgShow("shell_out", &.{.{ .hl_id = 0, .text = "+" }}, false, false, true, 5);
+
+    const msgs = grid.message_state.messages.items;
+    try std.testing.expectEqual(@as(usize, 2), msgs.len);
+    try std.testing.expectEqual(@as(usize, 2), msgs[0].content.items.len);
+    try std.testing.expectEqualStrings("+", msgs[0].content.items[1].text);
+    try std.testing.expectEqual(@as(usize, 1), msgs[1].content.items.len);
+}
+
+test "kind empty clears the visible messages" {
+    // Neovim emits msg_show("empty", [], ..., id=-1) for `:echo ""`
+    // (message.c msg_puts_display); ui2 clears the cmdline for it
+    // (ui2/messages.lua, kind == 'empty').
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+
+    try grid.setMsgShow("echo", &.{.{ .hl_id = 0, .text = "old" }}, false, false, false, 1);
+    grid.message_state.msg_dirty = false;
+    try grid.setMsgShow("empty", &.{}, false, false, false, -1);
+
+    try std.testing.expectEqual(@as(usize, 0), grid.message_state.messages.items.len);
+    try std.testing.expect(grid.message_state.msg_dirty);
+    try std.testing.expect(grid.message_state.msg_cleared_in_batch);
 }
 
 fn checkMessageEvictionAllocationFailure(alloc: std.mem.Allocator) !void {
