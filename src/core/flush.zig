@@ -14,7 +14,6 @@
 // order require updates to both consumers.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const clock = @import("clock.zig");
 const c_api = @import("c_api.zig");
 const grid_mod = @import("grid.zig");
@@ -553,7 +552,7 @@ fn finishVertexBudgetTransactionRestoring(core: *Core, mode: FlushCommitMode) vo
     core.vertex_budget_transaction_active = false;
 }
 
-/// Debug-only check, at the end of every vertex budget transaction, of the
+/// Safety-checked-build check, at the end of every vertex budget transaction, of the
 /// bookkeeping a flush leaves behind:
 ///   - vertex budget: a valid row ledger sums to its surface count, the
 ///     sub-grid total and the aggregate match the surfaces they sum;
@@ -561,7 +560,7 @@ fn finishVertexBudgetTransactionRestoring(core: *Core, mode: FlushCommitMode) vo
 ///     recorded UV row coordinate lies inside the atlas;
 ///   - atlas: the packer matches the atlas size and its own invariants.
 fn assertIntegrity(core: *const Core) void {
-    if (builtin.mode != .Debug) return;
+    if (!std.debug.runtime_safety) return;
     assertLedgerIntegrity(&core.grid.main_buf);
     var subgrid_total: usize = 0;
     var sg_it = core.grid.sub_grids.valueIterator();
@@ -11749,6 +11748,157 @@ test "an atlas reset in the external pass stops sending rows the cancelled commi
     try std.testing.expect(core.grid.sub_grids.get(2).?.dirty_all);
 }
 
+/// Captures the MAIN rows one grid is sent in a flush, for comparing what the
+/// main window and an external window are sent for the same cells.
+const SurfaceCapture = struct {
+    const ROWS = 3;
+    const COLS = 4;
+
+    alloc: std.mem.Allocator,
+    core: *Core,
+    grid_id: i64,
+    rows: [ROWS]std.ArrayListUnmanaged(c_api.Vertex) = @splat(.empty),
+    sent: [ROWS]bool = @splat(false),
+    refuse_next_end: bool = false,
+    oom: bool = false,
+
+    fn deinit(self: *SurfaceCapture) void {
+        for (&self.rows) |*r| r.deinit(self.alloc);
+    }
+
+    fn attach(self: *SurfaceCapture) void {
+        self.core.ctx = self;
+        self.core.cb.on_vertices_row = onRow;
+        self.core.cb.on_flush_begin = onBegin;
+        self.core.cb.on_flush_end = onEnd;
+        self.core.cb.on_rasterize_glyph = TxnProbe.rasterize;
+        self.core.cb.on_atlas_upload = TxnProbe.upload;
+        self.core.cb.on_atlas_create = TxnProbe.create;
+    }
+
+    fn onBegin(ctx: ?*anyopaque) callconv(.c) void {
+        const self: *SurfaceCapture = @ptrCast(@alignCast(ctx.?));
+        for (&self.rows) |*r| r.clearRetainingCapacity();
+        self.sent = @splat(false);
+    }
+
+    fn onEnd(ctx: ?*anyopaque) callconv(.c) void {
+        const self: *SurfaceCapture = @ptrCast(@alignCast(ctx.?));
+        if (!self.refuse_next_end) return;
+        self.refuse_next_end = false;
+        self.core.flush_aborted = true;
+    }
+
+    fn onRow(ctx: ?*anyopaque, grid_id: i64, row_start: u32, row_count: u32, verts: ?[*]const c_api.Vertex, vert_count: usize, flags: u32, total_rows: u32, total_cols: u32) callconv(.c) void {
+        _ = total_rows;
+        _ = total_cols;
+        const self: *SurfaceCapture = @ptrCast(@alignCast(ctx.?));
+        if (grid_id != self.grid_id or flags & c_api.VERT_UPDATE_MAIN == 0) return;
+        std.debug.assert(row_count == 1);
+        const list = &self.rows[row_start];
+        list.clearRetainingCapacity();
+        self.sent[row_start] = true;
+        if (verts) |v| list.appendSlice(self.alloc, v[0..vert_count]) catch {
+            self.oom = true;
+        };
+    }
+
+    /// A main-only core, or one whose grid 2 is an external window over a
+    /// blank main grid; `target` is the grid the cells go to.
+    fn initCore(core: *Core, external: bool) !void {
+        try core.grid.resizeGrid(1, ROWS, COLS);
+        if (external) {
+            try core.grid.resizeGrid(2, ROWS, COLS);
+            try std.testing.expect(try core.grid.setWinExternalPos(2, 42));
+        }
+        core.grid.cursor_visible = false;
+        core.drawable_w_px = COLS;
+        core.drawable_h_px = ROWS;
+        core.cell_w_px = 1;
+        core.cell_h_px = 1;
+        core.atlas_w = config.atlas_size_default;
+        core.atlas_h = config.atlas_size_default;
+        core.atlas_packer = shelf_packer.ShelfPacker.init(core.atlas_w, core.atlas_h);
+        core.atlas_initialized = true;
+    }
+
+    fn target(core: *Core, external: bool) *grid_mod.GridBuf {
+        return if (external) core.grid.sub_grids.getPtr(2).? else &core.grid.main_buf;
+    }
+};
+
+fn expectSameSurfaceSends(main: *const SurfaceCapture, ext: *const SurfaceCapture) !void {
+    try std.testing.expect(!main.oom and !ext.oom);
+    try std.testing.expectEqualSlices(bool, &main.sent, &ext.sent);
+    for (main.rows, ext.rows) |a, b| {
+        try std.testing.expectEqual(a.items.len, b.items.len);
+        for (a.items, b.items) |va, vb| {
+            try std.testing.expectEqualSlices(f32, &va.position, &vb.position);
+            try std.testing.expectEqualSlices(f32, &va.texCoord, &vb.texCoord);
+            try std.testing.expectEqualSlices(f32, &va.color, &vb.color);
+            try std.testing.expectEqual(va.deco_flags, vb.deco_flags);
+            try std.testing.expectEqual(va.deco_phase, vb.deco_phase);
+        }
+    }
+}
+
+fn expectSameOwedState(a: *const grid_mod.GridBuf, b: *const grid_mod.GridBuf) !void {
+    try std.testing.expectEqual(a.dirty, b.dirty);
+    try std.testing.expectEqual(a.dirty_all, b.dirty_all);
+    try std.testing.expectEqual(a.owed, b.owed);
+    try std.testing.expectEqual(a.owed_all, b.owed_all);
+    for (0..SurfaceCapture.ROWS) |r| {
+        if (!a.dirty_all) try std.testing.expectEqual(a.dirty_rows.isSet(r), b.dirty_rows.isSet(r));
+        if (!a.owed_all) try std.testing.expectEqual(a.owed_rows.isSet(r), b.owed_rows.isSet(r));
+    }
+    try std.testing.expectEqual(a.vertex_row_ledger_valid, b.vertex_row_ledger_valid);
+    try std.testing.expectEqual(a.surface_vertex_count, b.surface_vertex_count);
+    if (a.vertex_row_ledger_valid) try std.testing.expectEqualSlices(usize, a.vertex_row_counts, b.vertex_row_counts);
+}
+
+test "the main window and an external window are sent the same rows for the same cells" {
+    var cores: [2]Core = .{ Core.initForTest(std.testing.allocator), Core.initForTest(std.testing.allocator) };
+    defer for (&cores) |*c| c.deinitForTest();
+    var caps: [2]SurfaceCapture = undefined;
+    defer for (&caps) |*c| c.deinit();
+    var flush_ctxs: [2]FlushCtx = undefined;
+    for (0..2) |i| {
+        const external = i == 1;
+        try SurfaceCapture.initCore(&cores[i], external);
+        const gid: i64 = if (external) 2 else 1;
+        caps[i] = .{ .alloc = std.testing.allocator, .core = &cores[i], .grid_id = gid };
+        caps[i].attach();
+        flush_ctxs[i] = .{ .core = &cores[i] };
+        for (0..SurfaceCapture.ROWS) |r| cores[i].grid.putCellGrid(gid, @intCast(r), 1, 'A' + @as(u32, @intCast(r)), 0);
+    }
+
+    // First flush: every row.
+    for (&flush_ctxs) |*f| try f.onFlush(SurfaceCapture.ROWS, SurfaceCapture.COLS);
+    try std.testing.expect(caps[0].sent[0] and caps[0].rows[0].items.len != 0);
+    try expectSameSurfaceSends(&caps[0], &caps[1]);
+    try expectSameOwedState(SurfaceCapture.target(&cores[0], false), SurfaceCapture.target(&cores[1], true));
+
+    // An edit to one row: only that row.
+    for (0..2) |i| cores[i].grid.putCellGrid(caps[i].grid_id, 1, 2, 'z', 0);
+    for (&flush_ctxs) |*f| try f.onFlush(SurfaceCapture.ROWS, SurfaceCapture.COLS);
+    try std.testing.expect(caps[0].sent[1] and !caps[0].sent[0]);
+    try expectSameSurfaceSends(&caps[0], &caps[1]);
+    try expectSameOwedState(SurfaceCapture.target(&cores[0], false), SurfaceCapture.target(&cores[1], true));
+
+    // A refused flush hands the same rows back on both.
+    for (0..2) |i| {
+        cores[i].grid.putCellGrid(caps[i].grid_id, 2, 0, 'q', 0);
+        caps[i].refuse_next_end = true;
+    }
+    for (&flush_ctxs) |*f| try f.onFlush(SurfaceCapture.ROWS, SurfaceCapture.COLS);
+    try std.testing.expect(SurfaceCapture.target(&cores[0], false).dirty);
+    try expectSameOwedState(SurfaceCapture.target(&cores[0], false), SurfaceCapture.target(&cores[1], true));
+    for (&flush_ctxs) |*f| try f.onFlush(SurfaceCapture.ROWS, SurfaceCapture.COLS);
+    try std.testing.expect(caps[0].sent[2]);
+    try expectSameSurfaceSends(&caps[0], &caps[1]);
+    try expectSameOwedState(SurfaceCapture.target(&cores[0], false), SurfaceCapture.target(&cores[1], true));
+}
+
 test "atlas reset on a scroll fast path flush still resends every row" {
     const ROWS: u32 = 8;
     const COLS: u32 = 2;
@@ -18417,14 +18567,20 @@ fn runFlushModel(seed: u64, cursor_visible: bool) !void {
 
     var cmdline_open = false;
     var float_open = false;
+    var ext_open = false;
+    var split3_external = false;
+    var ext_steps: u32 = 0;
+    var split3_moved_steps: u32 = 0;
+    var split3_promoted_steps: u32 = 0;
     var step: u32 = 0;
     while (step < 120) : (step += 1) {
         const ops = rand.intRangeAtMost(u32, 1, 4);
         for (0..ops) |_| {
-            switch (rand.intRangeLessThan(u32, 0, 9)) {
+            switch (rand.intRangeLessThan(u32, 0, 11)) {
                 0, 1, 2 => {
-                    const gid: i64 = if (float_open) rand.intRangeAtMost(i64, 2, 4) else rand.intRangeAtMost(i64, 2, 3);
-                    const rows: u32 = if (gid == 4) 5 else 24;
+                    var gid: i64 = if (float_open) rand.intRangeAtMost(i64, 2, 4) else rand.intRangeAtMost(i64, 2, 3);
+                    if (ext_open and rand.uintLessThan(u32, 4) == 0) gid = 5;
+                    const rows: u32 = if (gid == 4 or gid == 5) 5 else 24;
                     core.grid.putCellGrid(gid, rand.uintLessThan(u32, rows), rand.uintLessThan(u32, 8), 'a' + rand.uintLessThan(u32, 26), 0);
                 },
                 3 => {
@@ -18456,6 +18612,26 @@ fn runFlushModel(seed: u64, cursor_visible: bool) !void {
                 },
                 6 => core.grid.putCellGrid(1, rand.uintLessThan(u32, 24), rand.uintLessThan(u32, 80), 'm', 0),
                 7 => if (float_open) try core.grid.setWinFloatPos(4, 104, rand.uintLessThan(u32, 10), rand.uintLessThan(u32, 30), 50, 0, 1, true),
+                8 => {
+                    if (ext_open) {
+                        if (rand.boolean()) try core.grid.destroyGrid(5) else try core.grid.hideWin(5);
+                    } else {
+                        try core.grid.resizeGrid(5, 5, 10);
+                        _ = try core.grid.setWinExternalPos(5, 105);
+                        for (0..5) |r| core.grid.putCellGrid(5, @intCast(r), 0, 'x', 0);
+                    }
+                    ext_open = !ext_open;
+                },
+                // A split moved into its own window and back keeps its buffer.
+                9 => {
+                    if (split3_external) {
+                        try core.grid.promoteExternalToWinPos(3, 103, 0, 40);
+                        split3_promoted_steps += 1;
+                    } else {
+                        _ = try core.grid.setWinExternalPos(3, 103);
+                    }
+                    split3_external = !split3_external;
+                },
                 else => if (cursor_visible) core.grid.setCursor(rand.intRangeAtMost(i64, 1, 3), rand.uintLessThan(u32, 24), rand.uintLessThan(u32, 40)),
             }
         }
@@ -18471,10 +18647,16 @@ fn runFlushModel(seed: u64, cursor_visible: bool) !void {
         }
         try std.testing.expect(!model.oom);
         try std.testing.expect(!model.bad_flags);
+        if (model.committed.contains(5)) ext_steps += 1;
+        if (split3_external) split3_moved_steps += 1;
         if (step % 10 == 9) model.checkAgainstFullResend(&flush_ctx, 24, 80) catch |err| {
             std.debug.print("model: seed={d} step={d}\n", .{ seed, step });
             return err;
         };
     }
     try model.checkAgainstFullResend(&flush_ctx, 24, 80);
+    // Vacuity gate: the run did hold an external window and a moved split.
+    try std.testing.expect(ext_steps != 0);
+    try std.testing.expect(split3_moved_steps != 0);
+    try std.testing.expect(split3_promoted_steps != 0);
 }

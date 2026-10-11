@@ -3367,7 +3367,7 @@ pub const Core = struct {
         self.atlas_packer = shelf_packer.ShelfPacker.init(self.atlas_w, self.atlas_h);
         self.resetGlyphCacheFlags();
         // Postcondition: no cache slot may still name a UV in the old texture.
-        if (@import("builtin").mode == .Debug) {
+        if (std.debug.runtime_safety) {
             if (self.glyph_valid_ascii) |valid| for (valid) |v| std.debug.assert(!v);
             if (self.glyph_keys_non_ascii) |keys| for (keys) |k| std.debug.assert(k == GLYPH_CACHE_INVALID_KEY);
             if (self.glyph_keys_by_id) |keys| for (keys) |k| std.debug.assert(k == GLYPH_CACHE_INVALID_KEY);

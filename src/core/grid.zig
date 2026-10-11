@@ -2769,6 +2769,8 @@ pub const Grid = struct {
         self.invalidateSubgridVertexSurface(grid_id);
         _ = self.external_grids.remove(grid_id);
         try self.setWinPos(grid_id, win_id, row, col);
+        // The external close dropped every row the frontend held for it.
+        if (self.sub_grids.getPtr(grid_id)) |sg| sg.markAllDirty();
     }
 
     /// Shift every float the surface rooted at `surface_grid` places by
