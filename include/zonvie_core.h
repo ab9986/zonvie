@@ -198,6 +198,8 @@ typedef void (*zonvie_on_vertices_row_fn)(
      Updates for different grids have no ordering guarantee. Consumers that
      merge grid cursors into one surface overlay must track its owning grid:
      clearing a different grid must not clear the current owner's cursor.
+   - A row or cursor layer may arrive more than once within one flush
+     bracket (an atlas reset restarts the emission); the last send wins.
    A MAIN callback with row_count=0, verts=NULL, and vert_count=0 publishes
    a layout-only zero-cell transition. total_rows/total_cols are authoritative,
    and at least one is zero. It clears the logical MAIN surface without
@@ -1892,16 +1894,19 @@ ZONVIE_API void zonvie_core_abort_flush(zonvie_core *core);
    retry. */
 ZONVIE_API void zonvie_core_fail_render_budget(zonvie_core *core);
 
-/* Returns true when the flush that JUST ran detected an atlas reset during
-   the deferred external-grid pass, after main vertices for this same flush
-   were already dispatched with pre-reset UVs. Call from on_flush_end,
-   BEFORE committing, while grid_mu is still held. When true, the frontend
-   must cancel this flush's commit entirely (same handling as an allocation
-   failure: cancel brackets instead of publishing) — committing would
-   present main-grid vertices sampling the wrong (freshly repacked) atlas
-   for one frame. The core has already scheduled a corrected full resend for
-   the next flush; cancelling here only prevents showing the corrupted
-   frame, no data is lost. */
+/* Returns true when the flush that JUST ran could not recover from an atlas
+   reset: rows already dispatched in this bracket carry pre-reset UVs. The
+   first reset during any grid's rows or cursor restarts the emission of
+   every grid (rows and cursor) inside the same bracket, so a row may be
+   sent more than once per bracket and the last send wins; only a second
+   reset in the same flush, or one left pending by an abort, sets this.
+   Call from on_flush_end, BEFORE committing, while grid_mu is still held.
+   When true, the frontend must cancel this flush's commit entirely (same
+   handling as an allocation failure: cancel brackets instead of
+   publishing) — committing would present vertices sampling the wrong
+   (freshly repacked) atlas for one frame. The core has already scheduled a
+   corrected full resend for the next flush; cancelling here only prevents
+   showing the corrupted frame, no data is lost. */
 ZONVIE_API bool zonvie_core_flush_had_atlas_corruption(zonvie_core *core);
 
 /* Returns true when the flush that JUST ran was aborted — either by an
