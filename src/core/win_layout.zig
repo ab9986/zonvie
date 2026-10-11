@@ -139,9 +139,14 @@ pub fn plan(op: Op, arg: i32, count: i32, source_id: i64, row_band: f64, frames:
         .exchange => {
             const order = spatialOrder(frames, row_band);
             const si = indexInOrder(order.slice(), frames, source_id) orelse return false;
-            const n: i64 = @intCast(frames.len);
-            const step: i64 = if (count == 0) 1 else count;
-            const di: usize = @intCast(@mod(@as(i64, @intCast(si)) + step, n));
+            // :help CTRL-W_x: no count is the next window, or the previous
+            // one from the last; count N is the Nth window, first is 1.
+            const di: usize = if (count == 0)
+                (if (si + 1 < frames.len) si + 1 else si - 1)
+            else if (count > 0 and count <= frames.len)
+                @intCast(count - 1)
+            else
+                return false;
             if (di == si) return false;
             swapPositions(&frames[order.items[si]], &frames[order.items[di]]);
             return true;
@@ -252,6 +257,36 @@ test "exchange swaps with the next window in reading order" {
     try std.testing.expectEqual(@as(f64, 200), frames[1].y);
     try std.testing.expectEqual(@as(f64, 200), frames[2].x);
     try std.testing.expectEqual(@as(f64, 0), frames[2].y);
+}
+
+// ext_windows hands the UI CTRL-W x's raw count (Prenum), so the exchange
+// follows :help CTRL-W_x: without a count the next window, or the previous
+// one from the last; with count N the Nth window, first is 1.
+
+test "exchange from the last window swaps with the previous one" {
+    var frames = [_]Frame{ fr(1, 0, 0, 100, 100), fr(2, 200, 0, 100, 100), fr(3, 400, 0, 100, 100) };
+    try std.testing.expect(plan(.exchange, 0, 0, 3, 20, &frames));
+    try std.testing.expectEqual(@as(f64, 0), frames[0].x);
+    try std.testing.expectEqual(@as(f64, 400), frames[1].x);
+    try std.testing.expectEqual(@as(f64, 200), frames[2].x);
+}
+
+test "exchange with a count swaps with the Nth window, first is 1" {
+    var frames = [_]Frame{ fr(1, 0, 0, 100, 100), fr(2, 200, 0, 100, 100), fr(3, 400, 0, 100, 100) };
+    try std.testing.expect(plan(.exchange, 0, 3, 1, 20, &frames));
+    try std.testing.expectEqual(@as(f64, 400), frames[0].x);
+    try std.testing.expectEqual(@as(f64, 200), frames[1].x);
+    try std.testing.expectEqual(@as(f64, 0), frames[2].x);
+}
+
+test "exchange with a count past the last window, or naming itself, changes nothing" {
+    var frames = [_]Frame{ fr(1, 0, 0, 100, 100), fr(2, 200, 0, 100, 100), fr(3, 400, 0, 100, 100) };
+    try std.testing.expect(!plan(.exchange, 0, 5, 1, 20, &frames));
+    try std.testing.expect(!plan(.exchange, 0, 2, 2, 20, &frames));
+    try std.testing.expect(!plan(.exchange, 0, -1, 1, 20, &frames));
+    try std.testing.expectEqual(@as(f64, 0), frames[0].x);
+    try std.testing.expectEqual(@as(f64, 200), frames[1].x);
+    try std.testing.expectEqual(@as(f64, 400), frames[2].x);
 }
 
 test "rotate refuses a negative count and reduces a huge one" {

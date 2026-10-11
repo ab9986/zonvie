@@ -3521,9 +3521,9 @@ pub const Grid = struct {
     ) !void {
         // `:echo ""` arrives as kind "empty" with no content and clears the
         // message line (ui2/messages.lua: "A sole empty message clears the
-        // cmdline").
+        // cmdline"), not a prompt, which ui2 keeps in its dialog.
         if (std.mem.eql(u8, kind, "empty")) {
-            self.setMsgClear();
+            self.clearShownMessages();
             return;
         }
         // Any other content-less event creates no visible display.
@@ -3664,10 +3664,14 @@ pub const Grid = struct {
 
     /// Handle msg_clear event.
     /// Per Neovim docs, msg_clear only clears msg_show content (not showmode/showcmd/ruler).
-    pub fn setMsgClear(self: *Grid) void {
+    fn clearShownMessages(self: *Grid) void {
         self.message_state.clearMessages(self.alloc);
         self.message_state.msg_dirty = true;
         self.message_state.msg_cleared_in_batch = true;
+    }
+
+    pub fn setMsgClear(self: *Grid) void {
+        self.clearShownMessages();
         if (self.message_state.confirm_msg.active) {
             self.message_state.confirm_msg.clear();
             self.message_state.confirm_dirty = true;

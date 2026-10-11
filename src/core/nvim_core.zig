@@ -1002,6 +1002,9 @@ pub const Core = struct {
     msg_total_lines: u32 = 0, // Total line count in current message content
     msg_cached_max_width: u32 = 0, // Cached max line width for grid sizing
     msg_scroll_pending: bool = false, // Pending scroll update (for throttling)
+    // The msg panel does not hold msg_scroll_offset's content whole; every
+    // flush renders it before committing, and aborts if that fails.
+    msg_scroll_render_owed: bool = false,
     msg_scroll_last_send: i128 = 0, // Last vertex send time (nanos)
     msg_scroll_retry_delay_ns: i128 = 16 * std.time.ns_per_ms, // Abort backoff
     // Allocation-free latency samples for the full message-scroll
@@ -1742,6 +1745,7 @@ pub const Core = struct {
         self.msg_total_lines = 0;
         self.msg_cached_max_width = 0;
         self.msg_scroll_pending = false;
+        self.msg_scroll_render_owed = false;
         self.msg_scroll_last_send = 0;
         self.msg_scroll_retry_delay_ns = 16 * std.time.ns_per_ms;
         // MsgCachedLine has only fixed-size buffers (no heap-owned strings).

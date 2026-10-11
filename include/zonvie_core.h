@@ -416,7 +416,8 @@ typedef void (*zonvie_on_win_move_fn)(
 );
 
 /* Called when Neovim requests exchanging a window with another.
-   count: number of positions to exchange */
+   count: CTRL-W x's count: 0 = the next window (the previous one from the
+   last), N = the Nth window, first is 1 */
 typedef void (*zonvie_on_win_exchange_fn)(
     void* ctx,
     int64_t grid_id,

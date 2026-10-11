@@ -359,7 +359,7 @@ typedef struct zonvie_win_frame {
 
 enum {
     ZONVIE_WIN_LAYOUT_MOVE = 0,         /* arg: direction 0=down 1=up 2=right 3=left */
-    ZONVIE_WIN_LAYOUT_EXCHANGE = 1,     /* count: steps in reading order, 0 = 1 */
+    ZONVIE_WIN_LAYOUT_EXCHANGE = 1,     /* count: Nth in reading order (1-based); 0 = next, or previous from the last */
     ZONVIE_WIN_LAYOUT_ROTATE = 2,       /* arg: 0 = forward; count < 0 refused, reduced mod n */
     ZONVIE_WIN_LAYOUT_RESIZE_EQUAL = 3, /* average sizes, top-left corners kept */
 };
