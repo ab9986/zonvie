@@ -992,8 +992,10 @@ pub const GridBuf = struct {
         _ = cols;
         std.debug.assert(!self.owed);
         std.debug.assert(rows != 0);
-        std.debug.assert(top < bot and bot <= self.rows);
-        std.debug.assert(left < right and right <= self.cols);
+        std.debug.assert(top < bot);
+        std.debug.assert(bot <= self.rows);
+        std.debug.assert(left < right);
+        std.debug.assert(right <= self.cols);
         std.debug.assert(self.cells.len == @as(usize, self.rows) * @as(usize, self.cols));
 
         const height: u32 = bot - top;
@@ -1905,7 +1907,8 @@ pub const Grid = struct {
 
     pub fn setGridMetricsPx(self: *Grid, grid_id: i64, cell_w_px: u32, cell_h_px: u32) !void {
         // Placement divides by the cell size; the layout path maps 0 to 1 px.
-        std.debug.assert(cell_w_px != 0 and cell_h_px != 0);
+        std.debug.assert(cell_w_px != 0);
+        std.debug.assert(cell_h_px != 0);
         try self.grid_metrics.put(self.alloc, grid_id, .{ .cell_w_px = cell_w_px, .cell_h_px = cell_h_px });
     }
 
@@ -1979,7 +1982,8 @@ pub const Grid = struct {
 
     /// Debug check of the `rows`/`cols` mirror of `main_buf`; for flush entry.
     pub fn assertMainShapeMirrored(self: *const Grid) void {
-        std.debug.assert(self.rows == self.main_buf.rows and self.cols == self.main_buf.cols);
+        std.debug.assert(self.rows == self.main_buf.rows);
+        std.debug.assert(self.cols == self.main_buf.cols);
     }
 
     pub fn resize(self: *Grid, rows: u32, cols: u32) !void {
@@ -2033,8 +2037,10 @@ pub const Grid = struct {
         _ = cols;
         std.debug.assert(!self.main_buf.owed);
         std.debug.assert(rows != 0);
-        std.debug.assert(top < bot and bot <= self.rows);
-        std.debug.assert(left < right and right <= self.cols);
+        std.debug.assert(top < bot);
+        std.debug.assert(bot <= self.rows);
+        std.debug.assert(left < right);
+        std.debug.assert(right <= self.cols);
         std.debug.assert(self.main_buf.cells.len == @as(usize, self.rows) * @as(usize, self.cols));
 
         const height: u32 = bot - top;

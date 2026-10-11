@@ -26,8 +26,10 @@ pub const max_height_px: i32 = 16384;
 /// Fold `spans` into the bands a frame redraws, written to `out`. Returns the
 /// band count. Spans are clamped to [0, surface_h_px). When `out` is too
 /// small, the last band absorbs the rest: a superset, never a lost row.
+/// Precondition: out.len >= 1; with no slot a 0 return would drop damage.
 pub fn bands(spans: []const Band, row_h_px: i32, surface_h_px: i32, out: []Band) usize {
-    if (out.len == 0 or surface_h_px <= 0) return 0;
+    std.debug.assert(out.len >= 1);
+    if (surface_h_px <= 0) return 0;
     if (surface_h_px > max_height_px or row_h_px <= 0) {
         for (spans) |s| {
             if (@min(s.bottom_px, surface_h_px) > @max(s.top_px, 0)) {
@@ -223,4 +225,45 @@ test "a band repaints the layer rows one row past its edges" {
     // Clamped to the layer's last row.
     // Widened to 100..310: row 7 (95..105) reaches into it.
     try std.testing.expectEqual([2]u32{ 7, 9 }, layerRowsForBand(.{ .top_px = 110, .bottom_px = 300 }, 25, 10, 10).?);
+}
+
+// Property, against the doc's contract: every pixel a span owes (clamped to
+// the surface) lies in some band, at any out capacity; and the band a layer
+// row belongs to is one whose repaint range includes that row.
+test "random spans never lose a damaged pixel, and a row's band repaints it" {
+    var prng = std.Random.DefaultPrng.init(0xba4d);
+    const rand = prng.random();
+    for (0..3000) |iter| {
+        const surface_h = rand.intRangeAtMost(i32, 1, 600);
+        const row_h = rand.intRangeAtMost(i32, 1, 40);
+        var spans: [6]Band = undefined;
+        const span_count = rand.uintAtMost(usize, spans.len);
+        for (spans[0..span_count]) |*s| {
+            const top = rand.intRangeAtMost(i32, -50, surface_h + 50);
+            s.* = .{ .top_px = top, .bottom_px = top + rand.intRangeAtMost(i32, -5, 120) };
+        }
+        var out: [8]Band = undefined;
+        const cap = rand.intRangeAtMost(usize, 1, out.len);
+        const n = bands(spans[0..span_count], row_h, surface_h, out[0..cap]);
+
+        errdefer std.debug.print("damage_bands: iter={d}\n", .{iter});
+        for (spans[0..span_count]) |s| {
+            var px = @max(s.top_px, 0);
+            while (px < @min(s.bottom_px, surface_h)) : (px += 1) {
+                const covered = for (out[0..n]) |b| {
+                    if (px >= b.top_px and px < b.bottom_px) break true;
+                } else false;
+                try std.testing.expect(covered);
+            }
+        }
+
+        const origin = rand.intRangeAtMost(i32, -100, surface_h);
+        const layer_rows: u32 = rand.intRangeAtMost(u32, 1, 40);
+        for (0..layer_rows) |row| {
+            const b = bandForLayerRow(out[0..n], origin, @intCast(row), row_h) orelse continue;
+            const range = layerRowsForBand(b, origin, layer_rows, row_h) orelse return error.TestUnexpectedResult;
+            try std.testing.expect(row >= range[0]);
+            try std.testing.expect(row <= range[1]);
+        }
+    }
 }

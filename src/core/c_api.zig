@@ -1026,7 +1026,10 @@ pub export fn zonvie_core_damage_bands(
     out: ?[*]damage_bands.Band,
     out_capacity: usize,
 ) callconv(.c) usize {
+    // A C caller's argument, so checked rather than asserted; the header
+    // requires out_capacity >= 1.
     const dst = out orelse return 0;
+    if (out_capacity == 0) return 0;
     const src: []const damage_bands.Band = if (spans) |s| s[0..span_count] else &.{};
     return damage_bands.bands(src, row_height_px, surface_height_px, dst[0..out_capacity]);
 }
@@ -1495,10 +1498,15 @@ pub export fn zonvie_core_set_ext_popupmenu(p: ?*zonvie_core, enabled: i32) call
 /// Set glyph cache sizes for performance tuning.
 /// ascii_size: cache size for ASCII chars (0-127) × 4 style combinations (default: 512, min: 128)
 /// non_ascii_size: hash table size for non-ASCII chars (default: 256, min: 64)
-/// Should be called before zonvie_core_start() for best results.
+/// Must be called before zonvie_core_start(). Ignored after start: resizing
+/// frees the caches a flush on the core thread may be reading.
 pub export fn zonvie_core_set_glyph_cache_size(p: ?*zonvie_core, ascii_size: u32, non_ascii_size: u32) callconv(.c) void {
     if (p == null) return;
     const box = asBox(p.?);
+    if (box.core.started) {
+        box.core.log.write("[c_api] zonvie_core_set_glyph_cache_size: ignored (already started)\n", .{});
+        return;
+    }
     box.core.setGlyphCacheSize(ascii_size, non_ascii_size);
     box.core.log.write("[c_api] zonvie_core_set_glyph_cache_size: ascii={d} non_ascii={d}\n", .{ box.core.glyph_cache_ascii_size, box.core.glyph_cache_non_ascii_size });
 }
@@ -2747,14 +2755,18 @@ pub export fn zonvie_core_load_config(
 /// The loaded config's settings the core owns: [performance] cache and atlas
 /// sizes and [input] option_as_meta.
 fn applyLoadedConfig(p: *zonvie_core, box: *CoreBox) void {
-    const new_hl_size = box.msg_config.performance.hl_cache_size;
-    if (new_hl_size != box.core.hl_cache_size) {
-        box.core.hl_cache_size = new_hl_size;
-        box.core.reinitHlCache();
-    }
-    const new_shape_size = box.msg_config.performance.shape_cache_size;
-    if (new_shape_size != box.core.shape_cache_size) {
-        box.core.setShapeCacheSize(new_shape_size);
+    // Resizing frees caches a flush on the core thread may be reading, so
+    // the sizes, like the atlas, apply only before start.
+    if (!box.core.started) {
+        const new_hl_size = box.msg_config.performance.hl_cache_size;
+        if (new_hl_size != box.core.hl_cache_size) {
+            box.core.hl_cache_size = new_hl_size;
+            box.core.reinitHlCache();
+        }
+        const new_shape_size = box.msg_config.performance.shape_cache_size;
+        if (new_shape_size != box.core.shape_cache_size) {
+            box.core.setShapeCacheSize(new_shape_size);
+        }
     }
     // The rest of [performance] and [input] option_as_meta: each frontend
     // read them back out of its own copy of this file and pushed them.
@@ -2762,6 +2774,29 @@ fn applyLoadedConfig(p: *zonvie_core, box: *CoreBox) void {
     zonvie_core_set_glyph_cache_size(p, perf.glyph_cache_ascii_size, perf.glyph_cache_non_ascii_size);
     zonvie_core_set_atlas_size(p, perf.atlas_size);
     box.core.option_as_meta.store(@intFromEnum(box.msg_config.input.option_as_meta), .release);
+}
+
+test "cache sizes are not changed once the core has started" {
+    const p = zonvie_core_create(null, 0, null) orelse return error.OutOfMemory;
+    defer zonvie_core_destroy(p);
+    const box = asBox(p);
+    const ascii_before = box.core.glyph_cache_ascii_size;
+    const non_ascii_before = box.core.glyph_cache_non_ascii_size;
+
+    // Sizes that differ from the defaults, so an applied call shows.
+    const ascii_new = config.glyph_cache_ascii_min;
+    const non_ascii_new = config.glyph_cache_non_ascii_min;
+    try std.testing.expect(ascii_new != ascii_before);
+
+    box.core.started = true;
+    defer box.core.started = false;
+    zonvie_core_set_glyph_cache_size(p, ascii_new, non_ascii_new);
+    try std.testing.expectEqual(ascii_before, box.core.glyph_cache_ascii_size);
+    try std.testing.expectEqual(non_ascii_before, box.core.glyph_cache_non_ascii_size);
+
+    box.core.started = false;
+    zonvie_core_set_glyph_cache_size(p, ascii_new, non_ascii_new);
+    try std.testing.expectEqual(ascii_new, box.core.glyph_cache_ascii_size);
 }
 
 test "a loaded config applies its cache, atlas and option_as_meta settings to the core" {
@@ -3207,7 +3242,8 @@ pub export fn zonvie_core_try_get_grid_text(
 
 // Invalidate glyph cache, shape cache, and atlas state.
 // Mirrors onGuifont invalidation sequence (flush.zig).
-// Must be called on core thread (e.g. from on_flush_begin callback).
+// Precondition: the caller holds grid_mu (a flush callback on the core thread,
+// or another thread inside zonvie_core_lock_grid).
 pub export fn zonvie_core_invalidate_glyph_cache(p: ?*zonvie_core) callconv(.c) void {
     if (p == null) return;
     const box = asBox(p.?);

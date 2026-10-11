@@ -920,6 +920,103 @@ fn runRedrawEventsLogged(grid: *Grid, hl: *Highlights, arena: std.mem.Allocator,
     );
 }
 
+/// A seeded PRNG with the subset of std.testing.Smith's interface the
+/// generators below use, so the same generator runs under `zig build test`
+/// for many inputs and under `--fuzz` with coverage guidance.
+pub const PrngSource = struct {
+    rand: std.Random,
+
+    pub fn value(self: *PrngSource, comptime T: type) T {
+        return if (T == bool) self.rand.boolean() else self.rand.int(T);
+    }
+    pub fn valueRangeAtMost(self: *PrngSource, comptime T: type, lo: T, hi: T) T {
+        return self.rand.intRangeAtMost(T, lo, hi);
+    }
+    pub fn slice(self: *PrngSource, buf: []u8) u32 {
+        const n = self.rand.uintAtMost(usize, buf.len);
+        self.rand.bytes(buf[0..n]);
+        return @intCast(n);
+    }
+    pub fn index(self: *PrngSource, n: usize) usize {
+        return self.rand.uintLessThan(usize, n);
+    }
+};
+
+/// One generated msgpack value. Integers lean on the boundaries the checked*
+/// helpers guard (negatives, i32/u32 edges, i64 extremes).
+/// Most event arguments are integers, so most values are.
+fn fuzzValue(src: anytype, arena: std.mem.Allocator, depth: u8) !mp.Value {
+    switch (src.valueRangeAtMost(u8, 0, if (depth == 0) 10 else 11)) {
+        0...6 => return .{ .int = switch (src.valueRangeAtMost(u8, 0, 9)) {
+            0 => src.value(i64),
+            1 => std.math.maxInt(i64),
+            2 => std.math.minInt(i64),
+            3 => std.math.maxInt(i32),
+            4 => @as(i64, std.math.maxInt(u32)) + 1,
+            else => src.valueRangeAtMost(i64, -3, 90),
+        } },
+        7 => {
+            var buf: [24]u8 = undefined;
+            const len = src.slice(&buf);
+            return .{ .str = try arena.dupe(u8, buf[0..len]) };
+        },
+        8 => return .{ .bool = src.value(bool) },
+        9 => return .{ .float = @bitCast(src.value(u64)) },
+        10 => return .nil,
+        else => return fuzzArray(src, arena, depth - 1),
+    }
+}
+
+fn fuzzArray(src: anytype, arena: std.mem.Allocator, depth: u8) anyerror!mp.Value {
+    const items = try arena.alloc(mp.Value, src.valueRangeAtMost(u8, 0, 8));
+    for (items) |*it| it.* = try fuzzValue(src, arena, depth);
+    return .{ .arr = items };
+}
+
+/// One batch of known event names with generated argument tuples, applied to
+/// a fresh grid. Errors are an accepted outcome; a trap or a leak is not.
+fn fuzzRedrawOnce(src: anytype) !void {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+
+    const names = comptime std.meta.fieldNames(RedrawEvent);
+    const events = try arena.alloc(mp.Value, src.valueRangeAtMost(u8, 1, 8));
+    for (events) |*ev| {
+        const items = try arena.alloc(mp.Value, 1 + @as(usize, src.valueRangeAtMost(u8, 0, 4)));
+        items[0] = .{ .str = names[src.index(names.len)] };
+        for (items[1..]) |*t| t.* = try fuzzArray(src, arena, 2);
+        ev.* = .{ .arr = items };
+    }
+    runRedrawEvents(&grid, &hl, arena, events) catch return;
+}
+
+// Redraw events come from the peer and are untrusted: any batch must apply
+// or fail with an error, never trap or leak. Explored here with fixed seeds;
+// `--fuzz` drives the same generator with coverage guidance.
+test "random redraw batches never trap or leak" {
+    for (0..4000) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        var src = PrngSource{ .rand = prng.random() };
+        fuzzRedrawOnce(&src) catch |err| {
+            std.debug.print("redraw fuzz: seed={d}\n", .{seed});
+            return err;
+        };
+    }
+}
+
+test "fuzz: handleRedraw never traps on arbitrary event arguments" {
+    try std.testing.fuzz({}, struct {
+        fn one(_: void, smith: *std.testing.Smith) anyerror!void {
+            try fuzzRedrawOnce(smith);
+        }
+    }.one, .{});
+}
+
 /// Like runRedrawEvents, but counts the flush callbacks. The parity suite
 /// deleted in "chore(core): drop the unwired streaming redraw decoder"
 /// asserted on these counts; the tests below need them to pin that a

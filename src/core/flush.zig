@@ -497,10 +497,11 @@ fn finishVertexBudgetTransaction(core: *Core, commit: bool) void {
 }
 
 /// Complete a vertex budget transaction with explicit disposition mode.
-/// Precondition: core.vertex_budget_transaction_active == true (or silently returns).
-/// Postcondition: core.vertex_budget_transaction_active = false after this function.
+/// Precondition: core.vertex_budget_transaction_active == true.
+/// Postcondition: core.vertex_budget_transaction_active = false and no surface
+/// is marked touched.
 fn finishVertexBudgetTransactionRestoring(core: *Core, mode: FlushCommitMode) void {
-    if (!core.vertex_budget_transaction_active) return;
+    std.debug.assert(core.vertex_budget_transaction_active);
     defer assertIntegrity(core);
 
     // A refusal or an abort leaves the glyph mirrors describing a frame that
@@ -520,6 +521,7 @@ fn finishVertexBudgetTransactionRestoring(core: *Core, mode: FlushCommitMode) vo
                 core.force_ext_cursor_recheck = true;
                 core.flush_vertex_count_aggregate =
                     core.grid.main_buf.surface_vertex_count + core.grid.subgrid_surface_vertex_count;
+                clearTouchedVertexBudgetSurfaces(core);
                 core.vertex_budget_transaction_active = false;
                 return;
             }
@@ -569,6 +571,11 @@ fn assertIntegrity(core: *const Core) void {
     }
     std.debug.assert(core.grid.subgrid_surface_vertex_count == subgrid_total);
     std.debug.assert(core.flush_vertex_count_aggregate == core.grid.main_buf.surface_vertex_count + subgrid_total);
+    // Touched marks live only inside a transaction.
+    if (!core.vertex_budget_transaction_active) {
+        std.debug.assert(core.vertex_budget_touched_grid_head == null);
+        std.debug.assert(!core.grid.main_buf.vertex_budget_touched);
+    }
 
     var mirror_it = core.glyph_mirror.valueIterator();
     while (mirror_it.next()) |m| {
@@ -579,7 +586,8 @@ fn assertIntegrity(core: *const Core) void {
     }
 
     if (core.atlas_packer) |*packer| {
-        std.debug.assert(packer.width == core.atlas_w and packer.height == core.atlas_h);
+        std.debug.assert(packer.width == core.atlas_w);
+        std.debug.assert(packer.height == core.atlas_h);
         packer.assertIntegrity();
     }
 }
@@ -6066,10 +6074,15 @@ fn scheduleMsgHistoryRetryDeadline(self: *Core, now: i128) i128 {
 /// Neovim is idle. The deadline still accumulates msg_show events across redraw
 /// batches (e.g. list_cmd then shell_out for "!ls") before this check can fire.
 pub fn checkMsgShowThrottleTimeout(self: *Core) void {
+    checkMsgShowThrottleTimeoutAt(self, clock.nowNs());
+}
+
+/// checkMsgShowThrottleTimeout at an explicit instant, so deadline boundaries
+/// can be tested exactly.
+fn checkMsgShowThrottleTimeoutAt(self: *Core, now: i128) void {
     if (!self.ext_messages_enabled) return;
 
     const pending_since = self.msg_show_pending_since orelse return;
-    const now = clock.nowNs();
     if (self.msg_show_retry_at) |retry_at| {
         if (now < retry_at) return;
     }
@@ -6103,8 +6116,11 @@ pub fn checkMsgShowThrottleTimeout(self: *Core) void {
 /// Called from frontend tick (same as throttle timeout).
 /// IMPORTANT: Caller must hold grid_mu (via c_api tick entry point).
 pub fn checkMsgAutoHideTimeout(self: *Core) void {
+    checkMsgAutoHideTimeoutAt(self, clock.nowNs());
+}
+
+fn checkMsgAutoHideTimeoutAt(self: *Core, now: i128) void {
     if (!self.ext_messages_enabled) return;
-    const now = clock.nowNs();
     var hid_message = false;
 
     // msg_show (grid -102) auto-hide
@@ -6180,6 +6196,12 @@ pub fn nextMsgTimeoutNs(self: *Core) ?i128 {
 /// Handle message changes - notify frontend via callbacks.
 /// Uses throttle for msg_show (like noice.nvim) to accumulate messages before deciding view.
 pub fn notifyMessageChanges(self: *Core) void {
+    notifyMessageChangesAt(self, clock.nowNs());
+}
+
+/// notifyMessageChanges at an explicit instant: every deadline it reads or
+/// arms in one cycle is measured against the same `now`.
+fn notifyMessageChangesAt(self: *Core, now: i128) void {
     if (!self.ext_messages_enabled) return;
 
     const msg_dirty = self.grid.message_state.msg_dirty;
@@ -6260,7 +6282,7 @@ pub fn notifyMessageChanges(self: *Core) void {
             if (has_shell_cmd and !has_return_prompt) {
                 // Shell command without return_prompt yet: use throttle to accumulate output
                 if (self.msg_show_pending_since == null) {
-                    self.msg_show_pending_since = clock.nowNs();
+                    self.msg_show_pending_since = now;
                     self.msg_show_retry_at = null;
                     self.msg_show_retry_delay_ns = 16 * std.time.ns_per_ms;
                 }
@@ -6272,7 +6294,6 @@ pub fn notifyMessageChanges(self: *Core) void {
                 // regardless, so a permanently-failing dispatch retried at
                 // the flush rate while the delay it inflated was read by
                 // nobody.
-                const now = clock.nowNs();
                 const retry_due = if (self.msg_show_retry_at) |at| now >= at else true;
                 if (!retry_due) {
                     msg_retry_needed = true;
@@ -6311,7 +6332,6 @@ pub fn notifyMessageChanges(self: *Core) void {
 
     // Handle msg_history_show
     if (history_dirty) {
-        const now = clock.nowNs();
         if (self.msg_history_retry_at == null or now >= self.msg_history_retry_at.?) {
             if (sendMsgHistoryShow(self)) {
                 self.grid.clearMsgHistoryDirty();
@@ -7568,6 +7588,9 @@ fn ensureCachedPhase2Glyph(
         @as(u32, @intFromBool(style_flags & c_api.STYLE_BOLD != 0)) |
         (@as(u32, @intFromBool(style_flags & c_api.STYLE_ITALIC != 0)) << 1);
     const extras = overflow orelse &.{};
+    // Both cluster buffers below hold the scalar plus every extra.
+    comptime std.debug.assert(@typeInfo(@FieldType(Core, "emoji_cluster_buf")).array.len >= 1 + @typeInfo(@FieldType(grid_mod.OverflowExtras, "buf")).array.len);
+    std.debug.assert(extras.len <= @typeInfo(@FieldType(grid_mod.OverflowExtras, "buf")).array.len);
     var ascii_insert: ?usize = null;
     var non_ascii_insert: ?usize = null;
     var non_ascii_key: u64 = 0;
@@ -13289,6 +13312,44 @@ test "a msg_clear batch whose content goes to a split sends one on_msg_clear" {
     try std.testing.expectEqual(@as(usize, 2), clear_calls);
 }
 
+test "message deadlines fire exactly at their instant, not a nanosecond before" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.ext_messages_enabled = true;
+    var mini_routes = [_]config.MsgRoute{
+        .{ .filter = .{ .event = .msg_show }, .view = .mini },
+    };
+    core.msg_config.messages.routes = &mini_routes;
+    const t: i128 = 1_000_000_000;
+
+    // Retry gate: due at t.
+    try appendTestMessage(&core, 1, "echo", "retry");
+    core.msg_show_pending_since = t - 100;
+    core.msg_show_retry_at = t;
+    notifyMessageChangesAt(&core, t - 1);
+    try std.testing.expect(core.grid.message_state.msg_dirty);
+    try std.testing.expectEqual(@as(?i128, t), core.msg_show_retry_at);
+    notifyMessageChangesAt(&core, t);
+    try std.testing.expect(!core.grid.message_state.msg_dirty);
+    try std.testing.expect(core.msg_show_retry_at == null);
+
+    // Throttle: processed once pending_since + throttle is reached.
+    try appendTestMessage(&core, 2, "shell_out", "out");
+    core.grid.message_state.msg_dirty = false;
+    core.msg_show_pending_since = t;
+    checkMsgShowThrottleTimeoutAt(&core, t + core.msg_show_throttle_ns - 1);
+    try std.testing.expect(core.msg_show_pending_since != null);
+    checkMsgShowThrottleTimeoutAt(&core, t + core.msg_show_throttle_ns);
+    try std.testing.expect(core.msg_show_pending_since == null);
+
+    // Auto-hide: hidden at hide_at.
+    core.msg_show_auto_hide_at = t;
+    checkMsgAutoHideTimeoutAt(&core, t - 1);
+    try std.testing.expectEqual(@as(?i128, t), core.msg_show_auto_hide_at);
+    checkMsgAutoHideTimeoutAt(&core, t);
+    try std.testing.expect(core.msg_show_auto_hide_at == null);
+}
+
 test "a pending retry deadline suppresses the next immediate attempt" {
     // The deadline is only worth arming if something honours it: without the
     // gate a permanently-failing dispatch re-attempts on every flush while
@@ -17570,6 +17631,7 @@ const TxnProbe = struct {
     grids: usize = 0,
     layout_calls: u32 = 0,
     shift_calls: u32 = 0,
+    cursor_sends: u32 = 0,
 
     fn rowsFor(self: *const TxnProbe, grid_id: i64) u32 {
         for (self.grid_ids[0..self.grids], self.grid_rows[0..self.grids]) |id, n| {
@@ -17588,6 +17650,7 @@ const TxnProbe = struct {
         self.grids = 0;
         self.layout_calls = 0;
         self.shift_calls = 0;
+        self.cursor_sends = 0;
     }
 
     fn attach(self: *TxnProbe) void {
@@ -17607,8 +17670,9 @@ const TxnProbe = struct {
         _ = vert_count;
         _ = total_rows;
         _ = total_cols;
-        if (flags & c_api.VERT_UPDATE_MAIN == 0) return;
         const self: *TxnProbe = @ptrCast(@alignCast(ctx.?));
+        if (flags & c_api.VERT_UPDATE_CURSOR != 0) self.cursor_sends += 1;
+        if (flags & c_api.VERT_UPDATE_MAIN == 0) return;
         for (self.grid_ids[0..self.grids], 0..) |id, i| {
             if (id == grid_id) {
                 self.grid_rows[i] += row_count;
@@ -17858,6 +17922,39 @@ test "a grid resized in the batch it scrolls gets no row shift" {
     try std.testing.expectEqual(@as(u32, 30), probe.rowsFor(2));
 }
 
+// CLAUDE.md: a cursor-only callback must not replace row contents. A flush
+// whose only change is the cursor owes no MAIN row, on grid 1 or on a split
+// laid out on the main surface.
+test "a cursor-only flush sends no MAIN row on grid 1 or a split" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try initTxnCore(&core);
+    core.grid.cursor_visible = true;
+    core.grid.putCellGrid(1, 0, 0, 'm', 0);
+    var probe = TxnProbe{ .core = &core };
+    probe.attach();
+    var flush_ctx = FlushCtx{ .core = &core };
+    core.grid.setCursor(1, 0, 0);
+    try flush_ctx.onFlush(24, 80);
+
+    const moves = [_]struct { grid: i64, row: u32, col: u32 }{
+        .{ .grid = 1, .row = 5, .col = 7 },
+        .{ .grid = 1, .row = 6, .col = 7 },
+        .{ .grid = 2, .row = 3, .col = 1 },
+        .{ .grid = 2, .row = 10, .col = 2 },
+        .{ .grid = 3, .row = 10, .col = 2 },
+        .{ .grid = 1, .row = 0, .col = 0 },
+    };
+    for (moves) |m| {
+        core.grid.setCursor(m.grid, m.row, m.col);
+        probe.reset();
+        try flush_ctx.onFlush(24, 80);
+        // Non-vacuous: the move did reach the frontend, as a cursor send.
+        try std.testing.expect(probe.cursor_sends > 0);
+        try std.testing.expectEqual(@as(u32, 0), probe.totalRows());
+    }
+}
+
 /// Forwards to `backing` and counts every call that can obtain heap memory.
 const CountingAllocator = struct {
     backing: std.mem.Allocator,
@@ -17971,6 +18068,7 @@ const ModelFrontend = struct {
         self.core.cb.on_vertices_row = onRow;
         self.core.cb.on_grid_row_scroll = onRowScroll;
         self.core.cb.on_grid_destroy = onDestroy;
+        self.core.cb.on_external_window_close = onExternalClose;
         self.core.cb.on_flush_begin = onBegin;
         self.core.cb.on_flush_end = onEnd;
         self.core.cb.on_rasterize_glyph = TxnProbe.rasterize;
@@ -18025,6 +18123,15 @@ const ModelFrontend = struct {
     fn onDestroy(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
         const self: *ModelFrontend = @ptrCast(@alignCast(ctx.?));
         self.stage(.{ .destroy = grid_id });
+    }
+
+    /// IMMEDIATE (zonvie_core.h): the window stops displaying at once, even
+    /// in a refused flush. Its buffers survive, but nothing shows them.
+    fn onExternalClose(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
+        const self: *ModelFrontend = @ptrCast(@alignCast(ctx.?));
+        applyOp(self.alloc, &self.committed, .{ .destroy = grid_id }) catch {
+            self.oom = true;
+        };
     }
 
     fn onEnd(ctx: ?*anyopaque) callconv(.c) void {
@@ -18116,6 +18223,15 @@ const ModelFrontend = struct {
                     std.debug.print("model: grid {d} row {d} differs\n", .{ e.key_ptr.*, row });
                     return error.TestUnexpectedResult;
                 }
+            }
+        }
+        // And the frontend holds no grid the core no longer draws: a missed
+        // on_grid_destroy leaves a stale surface on screen.
+        var bit = before.keyIterator();
+        while (bit.next()) |id| {
+            if (!oracle.contains(id.*)) {
+                std.debug.print("model: grid {d} kept on the frontend but not drawn by the core\n", .{id.*});
+                return error.TestUnexpectedResult;
             }
         }
     }

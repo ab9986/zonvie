@@ -104,7 +104,9 @@ pub const GlyphSpanY = struct { y0: f32, y1: f32, v0: f32, v1: f32 };
 /// below). A row redrawn under its own scissor loses that ink while a full
 /// redraw kept it, so the join blended twice depending on which path drew
 /// last; trimming the quad makes every path draw the same pixels.
+/// Precondition: top <= bottom (a cell's own rows).
 pub fn trimBoxDrawingSpanY(scalar: u32, span: GlyphSpanY, top: f32, bottom: f32) GlyphSpanY {
+    std.debug.assert(top <= bottom);
     if (scalar < 0x2500 or scalar > 0x257F) return span;
     const height = span.y1 - span.y0;
     if (height <= 0) return span;

@@ -728,3 +728,40 @@ test "mergeStaged decides what stageSurfaceRowScroll decided, over the whole spa
     try testing.expect(displaced > 0);
     try testing.expect(kept > 0);
 }
+
+// Property, against what a plan promises: after the blit, every row of the
+// region the caller does not redraw already shows the content Neovim's
+// grid_scroll moved there (rows_delta > 0: row r shows old row r + delta).
+// Simulated per pixel row over random geometry.
+test "rows outside a plan's dirty range show the scrolled content after the blit" {
+    var prng = std.Random.DefaultPrng.init(0x5c011);
+    const rand = prng.random();
+    var tex: [400]i32 = undefined;
+    for (0..20_000) |iter| {
+        const rh = rand.intRangeAtMost(i32, 1, 20);
+        const oy = rand.intRangeAtMost(i32, 0, 60);
+        const th = rand.intRangeAtMost(i32, 1, tex.len);
+        const start = rand.uintAtMost(u32, 10);
+        const end = start + rand.uintAtMost(u32, 30);
+        const delta = rand.intRangeAtMost(i32, -12, 12);
+        const p = make(start, end, delta, 0, oy, 8, 8, th, rh) orelse continue;
+
+        errdefer std.debug.print("row_scroll: iter={d}\n", .{iter});
+        for (tex[0..@intCast(th)], 0..) |*px, y| px.* = @intCast(y);
+        const old = tex;
+        for (0..@intCast(p.copy_h_px)) |i| {
+            tex[@as(usize, @intCast(p.dst_y_px)) + i] = old[@as(usize, @intCast(p.src_y_px)) + i];
+        }
+        var y = p.clear_top_px;
+        while (y < p.clear_bottom_px) : (y += 1) tex[@intCast(y)] = -1;
+
+        var r: u32 = start;
+        while (r < p.clamped_row_end) : (r += 1) {
+            if (r >= p.dirty_row_start and r < p.dirty_row_end) continue;
+            var py = oy + @as(i32, @intCast(r)) * rh;
+            while (py < oy + @as(i32, @intCast(r + 1)) * rh) : (py += 1) {
+                try std.testing.expectEqual(py + delta * rh, tex[@intCast(py)]);
+            }
+        }
+    }
+}

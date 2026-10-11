@@ -314,3 +314,58 @@ test "calt_eq_eq_eq: === suppresses placeholders, 1 visible quad" {
     // glyph 2 (gid=1388, 47px, extends backward >= 2 cellW).
     try std.testing.expectEqual(@as(usize, 1), visible);
 }
+
+/// Horizontal extent [x0, x1) of each visible glyph quad, in emission order.
+fn visibleGlyphQuadSpans(verts: []const c_api.Vertex, out: [][2]f32) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i + 5 < verts.len) : (i += 6) {
+        if (verts[i].texCoord[0] < 0) continue;
+        var x0: f32 = verts[i].position[0];
+        var x1: f32 = x0;
+        var has_area = false;
+        for (verts[i .. i + 6]) |v| {
+            x0 = @min(x0, v.position[0]);
+            x1 = @max(x1, v.position[0]);
+            if (v.position[0] != 0 or v.position[1] != 0) has_area = true;
+        }
+        if (!has_area) continue;
+        out[n] = .{ x0, x1 };
+        n += 1;
+    }
+    return n;
+}
+
+// Positions, not just counts: a glyph's quad starts at its pen position (column
+// times cell width) plus the bitmap's bearing_x, and spans the bitmap width.
+// The values are the mock's, so a quad drawn at the wrong column fails.
+test "ligature quads sit at pen position plus bearing, spanning the bitmap" {
+    const alloc = std.testing.allocator;
+    const Case = struct { pattern: MockCtx.ShapePattern, cols: u32, want: []const [2]f32 };
+    const cell: f32 = 17;
+    const cases = [_]Case{
+        // Each '=' at its own column: bearing +3, 12px wide.
+        .{ .pattern = .one_to_one, .cols = 3, .want = &.{ .{ 3, 15 }, .{ cell + 3, cell + 15 }, .{ 2 * cell + 3, 2 * cell + 15 } } },
+        // The == glyph from column 1: bearing -15, 30px.
+        .{ .pattern = .calt_eq_eq, .cols = 2, .want = &.{.{ cell - 15, cell + 15 }} },
+        // The === glyph from column 2: bearing -32, 47px.
+        .{ .pattern = .calt_eq_eq_eq, .cols = 3, .want = &.{.{ 2 * cell - 32, 2 * cell + 15 }} },
+    };
+    for (cases) |cs| {
+        var mctx = MockCtx{ .pattern = cs.pattern };
+        var core = setupCore(alloc, &mctx);
+        defer core.deinitForTest();
+        try fillRow(&core, cs.cols, &[_]u32{ '=', '=', '=' });
+        var out: std.ArrayListUnmanaged(c_api.Vertex) = .empty;
+        defer out.deinit(alloc);
+        _ = try flush_mod.generateRowVertices(&core, genParams(cs.cols, cell), &out);
+
+        var spans: [8][2]f32 = undefined;
+        const n = visibleGlyphQuadSpans(out.items, &spans);
+        try std.testing.expectEqual(cs.want.len, n);
+        for (cs.want, spans[0..n]) |w, got| {
+            try std.testing.expectApproxEqAbs(w[0], got[0], 0.5);
+            try std.testing.expectApproxEqAbs(w[1], got[1], 0.5);
+        }
+    }
+}

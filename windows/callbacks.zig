@@ -1067,11 +1067,10 @@ pub fn onVerticesRow(
         // row_start while other rows show stale content.
         // Instead, keep existing row vertices intact and request a full re-seed.
         //
-        // Unreachable with the current core, which sends row_count 0 or 1
-        // (src/core/flush.zig). The ABI allows more but gives no per-row vertex
-        // boundaries, and need_full_seed only makes WM_PAINT resend the layout
-        // and repaint: nothing asks the core to resend these rows. A core that
-        // sends row_count>1 needs the ABI extended first.
+        // A contract violation: zonvie_core.h fixes row_count at 0 or 1. Kept
+        // as a logged fallback rather than an assert; need_full_seed only
+        // makes WM_PAINT resend the layout and repaint, so these rows stay
+        // stale until the core resends them.
         if (log_verbose) applog.appLog(
             "[win] on_vertices_row row_count>1 ({d}) row_start={d} -> requesting re-seed\n",
             .{ row_count, row_start },

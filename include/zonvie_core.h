@@ -58,7 +58,11 @@ typedef int (*zonvie_rasterize_glyph_fn)(
 
 /* Phase 2: Upload a glyph bitmap to the atlas texture at specified coordinates.
    The bitmap pointer is the same one returned by the most recent on_rasterize_glyph.
-   Frontend must upload the glyph pixels at (dest_x, dest_y) with size (width x height). */
+   Frontend must upload the glyph pixels at (dest_x, dest_y) with size (width x height).
+   An upload that does not land must be reported by calling
+   zonvie_core_abort_flush from inside this callback; the core then does not
+   cache the glyph and the flush is retried. Returning normally means the
+   pixels are in the atlas. */
 typedef void (*zonvie_atlas_upload_fn)(
     void* ctx,
     uint32_t dest_x,
@@ -1041,7 +1045,8 @@ ZONVIE_API void zonvie_core_set_background_opacity(zonvie_core *core, float opac
 /* Set glyph cache sizes for performance tuning.
  * ascii_size: cache size for ASCII chars (0-127) × 4 style combinations (default: 512, min: 128)
  * non_ascii_size: hash table size for non-ASCII chars (default: 256, min: 64)
- * Should be called before zonvie_core_start() for best results. */
+ * Must be called before zonvie_core_start(). Ignored after start: resizing
+ * frees caches the core thread reads during a flush. */
 ZONVIE_API void zonvie_core_set_glyph_cache_size(zonvie_core *core, unsigned ascii_size, unsigned non_ascii_size);
 
 /* Set glyph atlas texture size (square, both width and height).
@@ -1712,7 +1717,7 @@ typedef struct {
 } zonvie_route_result;
 
 // Load config from file path, and apply what the core owns: [performance]
-// cache and atlas sizes (the atlas only before zonvie_core_start) and
+// cache and atlas sizes (only before zonvie_core_start; ignored after) and
 // [input] option_as_meta.
 // Returns 1 on success, 0 on failure.
 ZONVIE_API int zonvie_core_load_config(
@@ -1852,13 +1857,19 @@ ZONVIE_API intptr_t zonvie_core_try_get_grid_text(
 
 /* Invalidate glyph cache, shape cache, and atlas state.
    Call when frontend font/scale parameters change outside of guifont flow.
-   Must be called on core thread (e.g. from on_flush_begin callback).
+   Precondition: the caller holds the core's grid lock -- either on the core
+   thread inside a flush callback (e.g. on_flush_begin, on_atlas_upload), or
+   on another thread holding it via zonvie_core_lock_grid. Mutates the atlas
+   packer, the glyph caches and grid dirty state.
    Triggers on_atlas_create callback to recreate atlas texture. */
 ZONVIE_API void zonvie_core_invalidate_glyph_cache(zonvie_core *core);
 
 /* Abort the current flush cycle.
    Call from on_flush_begin or on_flush_end when the frontend cannot accept
-   this flush (e.g. no free buffer set, or a late buffer commit failed).
+   this flush (e.g. no free buffer set, or a late buffer commit failed), or
+   from any callback invoked within the flush (on_atlas_create,
+   on_atlas_upload, on_rasterize_glyph*, on_shape_text_run) when it failed to
+   do its work. Always on the core thread, during a flush.
    Sets an internal flag that causes the flush pipeline to skip vertex generation,
    atlas operations, and vertex submission when called before those stages.
    on_flush_end is still called (via defer) so the frontend can clean up.

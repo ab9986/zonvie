@@ -32,6 +32,42 @@ const SliceReader = struct {
     }
 };
 
+// Bytes from the Neovim pipe are untrusted: any input must decode or fail with
+// an error, never trap. `zig build test` runs this once; `--fuzz` explores.
+fn decodeOnce(bytes: []const u8) void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var reader = SliceReader{ .data = bytes };
+    _ = mp.decodeWithLimits(arena.allocator(), &reader, .{
+        .max_alloc_bytes = 1 << 20,
+        .max_blob_bytes = 1 << 16,
+        .max_container_items = 1 << 12,
+        .max_values = 1 << 14,
+    }) catch return;
+}
+
+test "fuzz: decode never traps on arbitrary bytes" {
+    try std.testing.fuzz({}, struct {
+        fn one(_: void, smith: *std.testing.Smith) anyerror!void {
+            var buf: [512]u8 = undefined;
+            decodeOnce(buf[0..smith.slice(&buf)]);
+        }
+    }.one, .{});
+}
+
+test "random byte strings decode or fail without trapping" {
+    // Valid type tags are dense in the byte space, so random bytes reach
+    // every decoder branch, including nested containers and length headers.
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const rand = prng.random();
+    var buf: [512]u8 = undefined;
+    for (0..20_000) |_| {
+        const len = rand.uintAtMost(usize, buf.len);
+        rand.bytes(buf[0..len]);
+        decodeOnce(buf[0..len]);
+    }
+}
+
 test "decode rejects oversized string header before allocation" {
     const data = [_]u8{ 0xdb, 0x00, 0x00, 0x10, 0x00 };
     var reader = SliceReader{ .data = &data };

@@ -1651,7 +1651,8 @@ pub fn checkShift(row_start: u32, row_end: u32, rows_delta: i32, len: usize) Shi
 /// own way and keeps whatever it owns. A shift covering the region vacates
 /// all of it and moves nothing.
 pub fn rotateRegion(comptime T: type, items: []T, row_start: usize, row_end: usize, rows_delta: i32) RowBand {
-    std.debug.assert(row_start <= row_end and row_end <= items.len);
+    std.debug.assert(row_start <= row_end);
+    std.debug.assert(row_end <= items.len);
     const region = items[row_start..row_end];
     const shift: usize = @abs(rows_delta);
     if (shift >= region.len) return .{ .start = row_start, .end = row_end };

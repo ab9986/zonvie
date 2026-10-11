@@ -72,6 +72,7 @@ pub const STYLE_UNDERDASHED: u8 = 1 << 7;
 
 fn blendRgb(base: u32, top: u32, transparency: u8) u32 {
     // transparency: 0 => opaque(top), 100 => fully transparent(use base)
+    std.debug.assert(transparency <= 100);
     const t: u32 = @as(u32, transparency);
     const inv: u32 = 100 - t;
 
@@ -258,6 +259,8 @@ pub const Highlights = struct {
         styles: Styles,
         has_url: bool,
     ) !void {
+        // blendRgb reads blend as a percentage; the parser clamps it.
+        std.debug.assert(blend <= 100);
         const a: Attr = .{
             .fg = fg,
             .bg = bg,

@@ -931,3 +931,71 @@ test "undoing a reclaimed-shelf allocation leaves the packer where it was" {
     try std.testing.expectEqual(before_h, p.shelves[0].h);
     try std.testing.expectEqual(before_free, p.freeAreaPx());
 }
+
+// Property: under any sequence of allocations, undos, reclamation and merging,
+// the rects still holding glyphs never overlap and their written regions stay
+// inside the atlas. A rect stops holding a glyph only when reclamation empties
+// its shelf. Seeds are printed on failure.
+test "random packer operations never overlap live rects" {
+    const Live = struct { r: Rect };
+    const seeds = [_]u64{ 1, 2, 3, 7, 42, 99, 1234, 9001 };
+    for (seeds) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rand = prng.random();
+        var p = ShelfPacker.init(256, 256);
+        var live: std.ArrayListUnmanaged(Live) = .empty;
+        defer live.deinit(std.testing.allocator);
+        var just_allocated = false;
+
+        var step: u32 = 0;
+        while (step < 3000) : (step += 1) {
+            var allocated_now = false;
+            switch (rand.uintLessThan(u32, 10)) {
+                0...5 => {
+                    const w = rand.intRangeAtMost(u32, 1, 40);
+                    const h = rand.intRangeAtMost(u32, 1, 24);
+                    if (p.alloc(w, h)) |r| {
+                        try live.append(std.testing.allocator, .{ .r = r });
+                        allocated_now = true;
+                    }
+                },
+                6 => if (just_allocated) {
+                    p.undoLastAlloc();
+                    _ = live.pop();
+                },
+                7 => p.beginEpoch(),
+                8 => {
+                    var liveness: [max_shelves]bool = undefined;
+                    for (liveness[0..p.shelf_count]) |*l| l.* = rand.boolean();
+                    var order: [max_shelves]u16 = undefined;
+                    const n = p.buildYOrder(&order);
+                    // Shelf of each rect before the call; indices are stable
+                    // across recycleDeadShelves.
+                    var shelf_of: std.ArrayListUnmanaged(?u32) = .empty;
+                    defer shelf_of.deinit(std.testing.allocator);
+                    for (live.items) |l| try shelf_of.append(std.testing.allocator, p.shelfIndexForYOrdered(order[0..n], l.r.y));
+                    _ = p.recycleDeadShelves(liveness[0..p.shelf_count]);
+                    var i: usize = live.items.len;
+                    while (i > 0) {
+                        i -= 1;
+                        const s = shelf_of.items[i] orelse continue;
+                        if (!liveness[s] and p.shelves[s].recycled and p.shelves[s].x == 1) _ = live.swapRemove(i);
+                    }
+                },
+                else => p.mergeAdjacentRecycled(),
+            }
+            just_allocated = allocated_now;
+
+            for (live.items, 0..) |a, i| {
+                errdefer std.debug.print("packer: seed={d} step={d}\n", .{ seed, step });
+                try std.testing.expect(a.r.x + a.r.w - p.padding <= p.width);
+                try std.testing.expect(a.r.y + a.r.h <= p.height);
+                for (live.items[i + 1 ..]) |b| {
+                    const apart = a.r.x + a.r.w <= b.r.x or b.r.x + b.r.w <= a.r.x or
+                        a.r.y + a.r.h <= b.r.y or b.r.y + b.r.h <= a.r.y;
+                    try std.testing.expect(apart);
+                }
+            }
+        }
+    }
+}

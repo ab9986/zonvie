@@ -91,7 +91,8 @@ fn createTextFormat(factory: *c.IDWriteFactory, name_w: [*:0]const u16, bold: bo
 /// Design advances of `gids` at `em_size_px`, as 26.6 pixels. False when the
 /// face has no usable metrics; the caller then uses the cell width.
 fn designAdvances26_6(face: *c.IDWriteFontFace, em_size_px: f32, gids: []const c.UINT16, out_adv: []i32) bool {
-    std.debug.assert(gids.len <= 128 and out_adv.len >= gids.len);
+    std.debug.assert(gids.len <= 128);
+    std.debug.assert(out_adv.len >= gids.len);
     const fvtbl = face.lpVtbl.*;
     const get_fm_fn = fvtbl.GetMetrics orelse return false;
     const get_gm_fn = fvtbl.GetDesignGlyphMetrics orelse return false;
@@ -1916,7 +1917,8 @@ pub const Renderer = struct {
         out_y_offset: [*]i32,
         out_cap: usize,
     ) usize {
-        std.debug.assert(scalar_count > 0 and scalar_count <= SHAPE_MAX_SCALARS);
+        std.debug.assert(scalar_count > 0);
+        std.debug.assert(scalar_count <= SHAPE_MAX_SCALARS);
         const analyzer = self.ensureTextAnalyzerLocked() orelse return 0;
 
         // --- 1) Convert UTF-32 scalars → UTF-16 ---

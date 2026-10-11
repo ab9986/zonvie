@@ -101,7 +101,9 @@ typedef struct zonvie_damage_band {
    row boundary. Bands span the whole surface width, so a lower layer's repaint
    needs no separate propagation to the layers over it. Bands closer than
    three rows are joined, so no layer row reaches two of them. When
-   `out_capacity` is too small the last band absorbs the rest. */
+   `out_capacity` is too small the last band absorbs the rest. `out` must be
+   non-NULL with `out_capacity` >= 1: otherwise 0 is returned, which reads as
+   "nothing damaged". */
 ZONVIE_API size_t zonvie_core_damage_bands(
     const zonvie_damage_band *spans,
     size_t span_count,
