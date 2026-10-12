@@ -17109,6 +17109,145 @@ test "an overflowing same-region accumulation fails closed instead of shifting" 
     try std.testing.expectEqual(@as(u32, 10), state.rows_emitted);
 }
 
+test "a grid 1 scroll sends no shift and resends every row of the region" {
+    const State = struct {
+        scroll_calls: u32 = 0,
+        rows_emitted: u32 = 0,
+        rows_seen: [10]bool = .{false} ** 10,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = row_count;
+            _ = verts;
+            _ = vert_count;
+            _ = total_rows;
+            _ = total_cols;
+            if (grid_id != 1 or flags & c_api.VERT_UPDATE_MAIN == 0) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.rows_emitted += 1;
+            if (row_start < 10) self.rows_seen[row_start] = true;
+        }
+
+        fn onRowScroll(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_end: u32,
+            col_start: u32,
+            col_end: u32,
+            rows_delta: i32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = grid_id;
+            _ = row_start;
+            _ = row_end;
+            _ = col_start;
+            _ = col_end;
+            _ = rows_delta;
+            _ = total_rows;
+            _ = total_cols;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.scroll_calls += 1;
+        }
+    };
+    var state = State{};
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    core.drawable_w_px = 20;
+    core.drawable_h_px = 10;
+    try core.grid.resize(10, 20);
+    core.grid.cursor_visible = false;
+    for (0..10) |r| core.grid.putCell(@intCast(r), 0, 'A' + @as(u32, @intCast(r)), 0);
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+    core.cb.on_grid_row_scroll = State.onRowScroll;
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(10, 20);
+    state = .{};
+
+    // A one-row scroll of rows [2,8) would qualify for a sub-grid's shift;
+    // grid 1 has no shift path, so every row of the region is resent.
+    core.grid.scrollGrid(1, 2, 8, 0, 20, 1, 0);
+    try flush_ctx.onFlush(10, 20);
+    try std.testing.expectEqual(@as(u32, 0), state.scroll_calls);
+    try std.testing.expectEqual(@as(u32, 6), state.rows_emitted);
+    for (0..10) |r| try std.testing.expectEqual(r >= 2 and r < 8, state.rows_seen[r]);
+}
+
+test "routeGridCursor truth table" {
+    // zonvie_core.h on_vertices_row: a CURSOR set is the complete cursor layer
+    // of one grid, an empty one clears it, and a consumer merging grids must
+    // know the owner. So on a cursor change the grid that draws it and the
+    // grid that drew it last each get a set, nobody else does; under
+    // force_recheck every grid does. A grid whose cursor moved to a grid no
+    // surface places regenerates its rows only if it is an external root.
+    const Row = struct {
+        grid_id: i64,
+        cursor_grid: i64,
+        cursor_rev: u64,
+        owner: CursorOwnership,
+        here: bool = false,
+        closed: bool = false,
+        owner_ext: bool = false,
+        affected: bool,
+        moved_within: bool = false,
+        force_redraw: bool = false,
+    };
+    const owner2 = CursorOwnership{ .grid = 2, .rev = 5 };
+    const rows = [_]Row{
+        // Nothing moved.
+        .{ .grid_id = 2, .cursor_grid = 2, .cursor_rev = 5, .owner = owner2, .here = true, .affected = false },
+        // Moved within the owner.
+        .{ .grid_id = 2, .cursor_grid = 2, .cursor_rev = 6, .owner = owner2, .here = true, .affected = true, .moved_within = true },
+        // Arrived on a new grid; the old owner clears; a bystander idles.
+        .{ .grid_id = 3, .cursor_grid = 3, .cursor_rev = 6, .owner = owner2, .here = true, .affected = true },
+        .{ .grid_id = 2, .cursor_grid = 3, .cursor_rev = 6, .owner = owner2, .affected = true },
+        .{ .grid_id = 4, .cursor_grid = 3, .cursor_rev = 6, .owner = owner2, .affected = false },
+        // Hidden on the owner (busy_start): still the owner's set to clear.
+        .{ .grid_id = 2, .cursor_grid = 2, .cursor_rev = 6, .owner = owner2, .affected = true },
+        // Grid 1 owns by the same rule.
+        .{ .grid_id = 1, .cursor_grid = 3, .cursor_rev = 6, .owner = .{ .grid = 1, .rev = 5 }, .affected = true },
+        .{ .grid_id = 1, .cursor_grid = 1, .cursor_rev = 6, .owner = .{ .grid = 3, .rev = 5 }, .here = true, .affected = true },
+        // force_recheck reaches a bystander with nothing changed.
+        .{ .grid_id = 4, .cursor_grid = 3, .cursor_rev = 5, .owner = .{ .grid = 2, .rev = 5, .force_recheck = true }, .affected = true },
+        // The cursor's grid is closed: only an external-root owner regenerates.
+        .{ .grid_id = 2, .cursor_grid = 7, .cursor_rev = 6, .owner = owner2, .closed = true, .owner_ext = true, .affected = true, .force_redraw = true },
+        .{ .grid_id = 2, .cursor_grid = 7, .cursor_rev = 6, .owner = owner2, .closed = true, .affected = true },
+        .{ .grid_id = 4, .cursor_grid = 7, .cursor_rev = 6, .owner = owner2, .closed = true, .owner_ext = true, .affected = false },
+        .{ .grid_id = 2, .cursor_grid = 7, .cursor_rev = 5, .owner = owner2, .closed = true, .owner_ext = true, .affected = false, .force_redraw = true },
+    };
+    for (rows, 0..) |row, i| {
+        errdefer std.debug.print("row {d}\n", .{i});
+        const r = routeGridCursor(.{
+            .grid_id = row.grid_id,
+            .cursor_grid = row.cursor_grid,
+            .cursor_rev = row.cursor_rev,
+            .owner = row.owner,
+            .cursor_here = row.here,
+            .cursor_grid_closed = row.closed,
+            .owner_is_external_root = row.owner_ext,
+        });
+        try std.testing.expectEqual(row.cursor_rev != row.owner.rev, r.changed);
+        try std.testing.expectEqual(row.cursor_grid != row.owner.grid, r.grid_changed);
+        try std.testing.expectEqual(row.owner.grid == row.grid_id, r.was_here);
+        try std.testing.expectEqual(row.affected, r.affected);
+        try std.testing.expectEqual(row.moved_within, r.moved_within);
+        try std.testing.expectEqual(row.force_redraw, r.force_redraw);
+    }
+}
+
 test "busy_start clears the cursor on the grid that owns it" {
     // busy_start hides the cursor without moving it. The grid that owns the
     // cursor has to receive the empty CURSOR set: a frontend merging grid

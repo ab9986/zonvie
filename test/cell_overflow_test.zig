@@ -295,7 +295,7 @@ test "global grid scroll with shift >= height clears overflow" {
     try std.testing.expectEqual(@as(u32, 70), countOverflowForGrid(&g, 1));
 
     // Scroll up by 50 in region [0, 50) — shift >= height → early return path
-    g.scroll(0, 50, 0, 80, 50, 0);
+    g.scrollGrid(1, 0, 50, 0, 80, 50, 0);
 
     try std.testing.expectEqual(@as(u32, 0), countOverflowForGrid(&g, 1));
 }

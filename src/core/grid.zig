@@ -496,12 +496,7 @@ pub const StatusChannel = enum(u2) {
 /// `cells` is row-major with stride `stride`; the rectangle is rows
 /// `[top, bot)` by columns `[left, right)`. Positive `rows` moves content up,
 /// negative moves it down, and a shift at or past the region height blanks the
-/// whole rectangle. Callers pre-clamp the bounds.
-///
-/// Dirty marking stays with each caller: dispatchGridRowScroll skips grid 1, so
-/// the main grid repaints the whole region, while a sub-grid gets the
-/// frontend's row-slot remap, repaints only the vacated band, and shifts its
-/// own vertex-row ledger.
+/// whole rectangle. Callers pre-clamp the bounds and mark dirty rows.
 fn scrollCells(
     cells: []Cell,
     stride: u32,
@@ -976,7 +971,13 @@ pub const GridBuf = struct {
         return self.cells[idx];
     }
 
-    /// Implements the "grid_scroll" UI event for a sub-grid.
+    /// Which rows a scroll leaves dirty. `vacated_band`: the frontend's row
+    /// slot remap moves the surviving rows, so only the rows the shift blanked
+    /// are regenerated. `whole_region`: no shift is sent, every row of the
+    /// region is regenerated, and the shifted ledger is rewritten with it.
+    pub const ScrollDirty = enum { vacated_band, whole_region };
+
+    /// Implements the "grid_scroll" UI event on this buffer's cells.
     /// Note: 'cols' is reserved (currently always 0 in Nvim) and is ignored.
     /// Precondition: the region and delta are normalised (scrollGrid), and no
     /// flush bracket is open, so `owed_rows` need not move with the cells.
@@ -988,6 +989,7 @@ pub const GridBuf = struct {
         right: u32,
         rows: i32,
         cols: i32,
+        dirty: ScrollDirty,
     ) void {
         _ = cols;
         std.debug.assert(!self.owed);
@@ -1076,12 +1078,13 @@ pub const GridBuf = struct {
             }
         }
 
-        // Only the vacated band: the frontend's row-slot remap moves the rest,
-        // and grid_line marks whatever really changed.
-        if (rows > 0) {
-            self.markDirtyRect(bot - shift, bot);
-        } else {
-            self.markDirtyRect(top, top + shift);
+        switch (dirty) {
+            .whole_region => self.markDirtyRect(top, bot),
+            .vacated_band => if (rows > 0) {
+                self.markDirtyRect(bot - shift, bot);
+            } else {
+                self.markDirtyRect(top, top + shift);
+            },
         }
         self.dirty = true;
     }
@@ -2021,53 +2024,6 @@ pub const Grid = struct {
         self.putCellBuf(&self.main_buf, 1, row, col, cp, hl);
     }
 
-    /// Implements the "grid_scroll" UI event by copying a rectangular region.
-    /// Note: 'cols' is reserved (currently always 0 in Nvim); checked for no-op detection but not used in scroll logic.
-    /// Precondition: the region and delta are normalised (scrollGrid), and no
-    /// flush bracket is open, so `owed_rows` need not move with the cells.
-    pub fn scroll(
-        self: *Grid,
-        top: u32,
-        bot: u32,
-        left: u32,
-        right: u32,
-        rows: i32,
-        cols: i32,
-    ) void {
-        _ = cols;
-        std.debug.assert(!self.main_buf.owed);
-        std.debug.assert(rows != 0);
-        std.debug.assert(top < bot);
-        std.debug.assert(bot <= self.rows);
-        std.debug.assert(left < right);
-        std.debug.assert(right <= self.cols);
-        std.debug.assert(self.main_buf.cells.len == @as(usize, self.rows) * @as(usize, self.cols));
-
-        const height: u32 = bot - top;
-
-        const shift: u32 = scrollShift(rows, height);
-
-        // If the shift exceeds region height, everything is scrolled out.
-        if (shift >= height) {
-            scrollCells(self.main_buf.cells, self.cols, top, bot, left, right, rows, .{ .cp = ' ', .hl = 0 });
-            // Clear overflow for the entire scrolled-out region
-            self.clearOverflowRect(1, top, bot, left, right);
-            // The row-mode flush skips any row whose dirty_rows bit isn't set, and gridScrollFastPathRegion
-            // already rejects this case (abs_rows > region_height/2), so there
-            // is no full-region regen to fall back on. Without this the cleared
-            // cells never get resent and the pre-scroll glyphs stay on screen.
-            self.markDirtyRect(top, bot);
-            return;
-        }
-
-        scrollCells(self.main_buf.cells, self.cols, top, bot, left, right, rows, .{ .cp = ' ', .hl = 0 });
-
-        self.markDirtyRect(top, bot);
-
-        // Move overflow entries with the scrolled cells
-        self.scrollOverflow(1, top, bot, left, right, rows);
-    }
-
     pub fn resizeGrid(self: *Grid, grid_id: i64, rows: u32, cols: u32) !void {
         // Validate before creating the sub-grid so an invalid request cannot
         // leave a phantom empty sub-grid behind.
@@ -2413,17 +2369,18 @@ pub const Grid = struct {
             self.cursor_rev +%= 1;
         }
 
+        // Grid 1 has no row-shift fast path: the whole region is regenerated.
+        const buf = self.bufFor(grid_id).?;
+        const old_surface_vertex_count = buf.surface_vertex_count;
+        buf.scroll(top, bot, left, right, rows, cols, if (grid_id == 1) .whole_region else .vacated_band);
+        self.scrollOverflow(grid_id, top, bot, left, right, rows);
         if (grid_id == 1) {
-            self.scroll(top, bot, left, right, rows, cols);
             self.recordScrolledGrid(grid_id, rows);
             return;
         }
         if (self.sub_grids.getPtr(grid_id)) |sg| {
-            const old_surface_vertex_count = sg.surface_vertex_count;
-            sg.scroll(top, bot, left, right, rows, cols);
             self.subgrid_surface_vertex_count -|=
                 old_surface_vertex_count -| sg.surface_vertex_count;
-            self.scrollOverflow(grid_id, top, bot, left, right, rows);
             // A second scroll of the SAME region in one batch accumulates: the
             // frontend shifts once by the total. Only a different region
             // blocks, since one shift cannot describe two. Composition used to
@@ -4388,11 +4345,11 @@ test "subgrid scroll keeps submitted vertex counts aligned with row slots" {
     @memcpy(grid_buf.vertex_row_counts, &[_]usize{ 10, 20, 30, 40 });
     grid_buf.surface_vertex_count = 100;
 
-    grid_buf.scroll(0, 4, 0, 1, 1, 0);
+    grid_buf.scroll(0, 4, 0, 1, 1, 0, .vacated_band);
     try std.testing.expectEqualSlices(usize, &.{ 20, 30, 40, 0 }, grid_buf.vertex_row_counts);
     try std.testing.expectEqual(@as(usize, 90), grid_buf.surface_vertex_count);
 
-    grid_buf.scroll(0, 4, 0, 1, -1, 0);
+    grid_buf.scroll(0, 4, 0, 1, -1, 0, .vacated_band);
     try std.testing.expectEqualSlices(usize, &.{ 0, 20, 30, 40 }, grid_buf.vertex_row_counts);
     try std.testing.expectEqual(@as(usize, 90), grid_buf.surface_vertex_count);
 }
@@ -4407,7 +4364,7 @@ test "partial-width subgrid scroll shifts the ledger with the core's cells" {
     @memcpy(grid_buf.vertex_row_counts, &[_]usize{ 10, 20, 30, 40 });
     grid_buf.surface_vertex_count = 100;
 
-    grid_buf.scroll(0, 4, 1, 3, 1, 0);
+    grid_buf.scroll(0, 4, 1, 3, 1, 0, .vacated_band);
     try std.testing.expectEqualSlices(usize, &.{ 20, 30, 40, 0 }, grid_buf.vertex_row_counts);
     try std.testing.expectEqual(@as(usize, 90), grid_buf.surface_vertex_count);
 }
@@ -5345,6 +5302,77 @@ test "grid 1 and a sub-grid take the same cell-write path" {
     try Expect.run(&grid, 1, true);
     try Expect.run(&grid, 2, true);
     try Expect.run(&grid, 3, false);
+}
+
+test "grid 1 and a sub-grid scroll identically when no row shift is sent" {
+    // ui.txt grid_scroll: cells in [top,bot) x [left,right) move by `rows`
+    // (positive up), the rows they vacate turn blank, and columns outside
+    // [left,right) are untouched. With no frontend shift the whole region is
+    // regenerated, so the ledger and dirty marks may move with the cells.
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resize(6, 4);
+    try grid.resizeGrid(2, 6, 4);
+    try grid.setWinPos(2, 100, 0, 0);
+
+    for (0..6) |r| for (0..4) |c| {
+        const cp: u32 = 'a' + @as(u32, @intCast(r * 4 + c));
+        grid.putCellGrid(1, @intCast(r), @intCast(c), cp, @intCast(r));
+        grid.putCellGrid(2, @intCast(r), @intCast(c), cp, @intCast(r));
+    };
+    try grid.putCellGridCluster(1, 3, 1, 'x', 3, &.{0x0301});
+    try grid.putCellGridCluster(2, 3, 1, 'x', 3, &.{0x0301});
+    const main = &grid.main_buf;
+    const sub = grid.sub_grids.getPtr(2).?;
+    main.clearDirtyContent();
+    sub.clearDirtyContent();
+    @memcpy(main.vertex_row_counts, &[_]usize{ 1, 2, 3, 4, 5, 6 });
+    @memcpy(sub.vertex_row_counts, &[_]usize{ 1, 2, 3, 4, 5, 6 });
+    main.surface_vertex_count = 21;
+    sub.surface_vertex_count = 21;
+
+    // Two up within rows [1,5) and columns [1,3), then one down.
+    grid.scrollGrid(1, 1, 5, 1, 3, 2, 0);
+    sub.scroll(1, 5, 1, 3, 2, 0, .whole_region);
+    grid.scrollOverflow(2, 1, 5, 1, 3, 2);
+    grid.scrollGrid(1, 1, 5, 1, 3, -1, 0);
+    sub.scroll(1, 5, 1, 3, -1, 0, .whole_region);
+    grid.scrollOverflow(2, 1, 5, 1, 3, -1);
+
+    // Spec first. Up by two: rows 1,2 take rows 3,4 and rows 3,4 go blank.
+    // Down by one: rows 2..4 take rows 1..3 and row 1 goes blank.
+    try std.testing.expectEqual(Cell{ .cp = ' ', .hl = 0 }, grid.getCellGrid(1, 1, 1));
+    try std.testing.expectEqual(Cell{ .cp = ' ', .hl = 0 }, grid.getCellGrid(1, 1, 2));
+    try std.testing.expectEqual(Cell{ .cp = 'x', .hl = 3 }, grid.getCellGrid(1, 2, 1));
+    try std.testing.expectEqual(Cell{ .cp = 'o', .hl = 3 }, grid.getCellGrid(1, 2, 2));
+    try std.testing.expectEqual(Cell{ .cp = 'r', .hl = 4 }, grid.getCellGrid(1, 3, 1));
+    try std.testing.expectEqual(Cell{ .cp = ' ', .hl = 0 }, grid.getCellGrid(1, 4, 2));
+    try std.testing.expectEqual(Cell{ .cp = 'e', .hl = 1 }, grid.getCellGrid(1, 1, 0));
+    try std.testing.expectEqual(Cell{ .cp = 'h', .hl = 1 }, grid.getCellGrid(1, 1, 3));
+    try std.testing.expectEqual(Cell{ .cp = 'a', .hl = 0 }, grid.getCellGrid(1, 0, 0));
+    try std.testing.expectEqualSlices(u32, &.{0x0301}, grid.getOverflow(1, 2, 1).?);
+    try std.testing.expect(grid.getOverflow(1, 1, 1) == null);
+    try std.testing.expect(grid.getOverflow(1, 3, 1) == null);
+
+    // Then grid 1 against the sub-grid: cells, overflow, dirty marks, ledger.
+    try std.testing.expectEqualSlices(Cell, main.cells, sub.cells);
+    for (0..6) |r| for (0..4) |c| {
+        const ov1 = grid.getOverflow(1, @intCast(r), @intCast(c));
+        const ov2 = grid.getOverflow(2, @intCast(r), @intCast(c));
+        try std.testing.expectEqual(ov1 == null, ov2 == null);
+        if (ov1 != null) try std.testing.expectEqualSlices(u32, ov1.?, ov2.?);
+    };
+    try std.testing.expectEqual(main.dirty, sub.dirty);
+    try std.testing.expectEqual(main.dirty_all, sub.dirty_all);
+    for (0..6) |r| try std.testing.expectEqual(main.isRowDirty(@intCast(r)), sub.isRowDirty(@intCast(r)));
+    try std.testing.expect(!main.isRowDirty(0));
+    try std.testing.expect(main.isRowDirty(1));
+    try std.testing.expect(main.isRowDirty(4));
+    try std.testing.expect(!main.isRowDirty(5));
+    try std.testing.expectEqualSlices(usize, main.vertex_row_counts, sub.vertex_row_counts);
+    try std.testing.expectEqual(main.surface_vertex_count, sub.surface_vertex_count);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 0, 4, 5, 0, 6 }, main.vertex_row_counts);
+    try std.testing.expectEqual(@as(usize, 16), main.surface_vertex_count);
 }
 
 test "a float follows the scroll only once Neovim says it is placed at a buffer position" {
