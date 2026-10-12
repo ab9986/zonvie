@@ -3691,6 +3691,7 @@ pub const FlushCtx = struct {
         // grid already sent with stale UVs, so the whole emission restarts
         // once against the fresh atlas; a second reset cancels the bracket.
         var atlas_retried = false;
+        var main_perf_logged = false;
         var surfaces_notified = false;
         var cursor_grid_notified = false;
         var cursor_sync: ExtCursorSync = .{};
@@ -3708,6 +3709,7 @@ pub const FlushCtx = struct {
                 .scrolled_count = scrolled_count,
                 .t_pre_row_start = t_pre_row_start,
                 .retry = atlas_retried,
+                .perf_logged = &main_perf_logged,
             });
             if (!atlas_reset and !ctx.core.flush_aborted and !ctx.core.flush_atlas_corrupted) {
                 if (!surfaces_notified) {
@@ -3720,9 +3722,10 @@ pub const FlushCtx = struct {
                 }
                 const t_ext: i128 = if (perf_enabled) clock.nowNs() else 0;
                 if (!ctx.core.flush_aborted and !ctx.core.flush_atlas_corrupted) {
-                    atlas_reset = sendExternalGridVertices(ctx.core, &cursor_grid_notified, &cursor_sync);
+                    atlas_reset = sendExternalGridVertices(ctx.core, &cursor_grid_notified, &cursor_sync, glow_enabled, glow_all, glow_hl_ids);
                 }
-                if (perf_enabled) {
+                // Only the attempt that completed is logged.
+                if (perf_enabled and !atlas_reset) {
                     const ext_us: i64 = @intCast(@divTrunc(@max(0, clock.nowNs() - t_ext), 1000));
                     ctx.core.log.write("[perf] send_external_grids us={d} known={d}\n", .{ ext_us, ctx.core.known_external_grids.count() });
                 }
@@ -3764,6 +3767,9 @@ pub const FlushCtx = struct {
         t_pre_row_start: i128,
         /// The emission is being restarted after an atlas reset.
         retry: bool,
+        /// Set once grid 1's pass logged its perf lines this flush; a pass
+        /// re-run after another grid's atlas reset logs nothing.
+        perf_logged: *bool,
     };
 
     /// Emit grid 1's owed rows. Returns true when a row reset the atlas: the
@@ -3820,9 +3826,11 @@ pub const FlushCtx = struct {
 
         if (ctx.core.cb.on_vertices_row != null) {
 
-            // Grid 1 owes rows exactly when a row is dirty, the rule every
-            // other grid's pass uses (sg.dirty). Grid 1's cursor is not this pass's: sendExternalGridVertices
-            // emits every grid's, grid 1's included, by one rule.
+            // Grid 1 owes rows exactly when a row is dirty. Sub-grids gate on
+            // sg.dirty, a superset that also admits a zero-row shape; grid 1
+            // handles that shape in the n_cells == 0 branch above. Grid 1's
+            // cursor is not this pass's: sendExternalGridVertices emits every
+            // grid's, grid 1's included, by one rule.
             const need_main: bool = ctx.core.grid.main_buf.anyDirty();
 
             // If nothing changed, avoid doing any work.
@@ -3956,7 +3964,8 @@ pub const FlushCtx = struct {
                             ctx.core.log.write("[scroll_debug] markAllDirty: glyph_miss=true scrolled={d}\n", .{scrolled_count});
                         }
                     }
-                    if (log_enabled) {
+                    if (log_enabled and !p.perf_logged.*) {
+                        p.perf_logged.* = true;
                         const t_rows_done_ns: i128 = clock.nowNs();
                         const dur_us: i64 = @intCast(@divTrunc(@max(0, t_rows_done_ns - t_rows_start_ns), 1000));
                         ctx.core.log.write(
@@ -4890,13 +4899,16 @@ const ExtCursorSync = struct {
 /// consumed is reported in `sync` for the caller to apply once the emission
 /// completes; `cursor_grid_notified` keeps a restart from repeating
 /// on_cursor_grid_changed.
-fn sendExternalGridVertices(self: *Core, cursor_grid_notified: *bool, sync: *ExtCursorSync) bool {
+fn sendExternalGridVertices(
+    self: *Core,
+    cursor_grid_notified: *bool,
+    sync: *ExtCursorSync,
+    // The flush's one glow snapshot, shared with grid 1's pass.
+    ext_glow_enabled: bool,
+    ext_glow_all: bool,
+    ext_glow_hl_ids: ?*std.AutoHashMap(u32, void),
+) bool {
     self.log.write("[sendExternalGridVertices] called, known_external_grids.count={d}\n", .{self.known_external_grids.count()});
-
-    // Cache glow state once — doesn't change while grid_mu is held.
-    const ext_glow_enabled = self.glow_enabled.load(.acquire);
-    const ext_glow_all = self.glow_all;
-    const ext_glow_hl_ids = if (self.glow_hl_ids) |*m| m else null;
 
     // Check if cursor changed (position or grid) - do this first, before early returns
     const cursor_grid = self.grid.cursor_grid;
@@ -11722,7 +11734,7 @@ test "a row-mode atlas reset the retry survives leaves the root clean" {
 test "a second atlas reset in the external pass cancels without sending the row that reset it" {
     const State = struct {
         core: *Core,
-        ext_rows: u32 = 0,
+        sent_reset_row: bool = false,
         ext_empty_rows: u32 = 0,
         upload_calls: u32 = 0,
 
@@ -11737,14 +11749,13 @@ test "a second atlas reset in the external pass cancels without sending the row 
             total_rows: u32,
             total_cols: u32,
         ) callconv(.c) void {
-            _ = row_start;
-            _ = row_count;
             _ = verts;
             _ = total_rows;
             _ = total_cols;
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             if (grid_id != 2 or flags & c_api.VERT_UPDATE_MAIN == 0) return;
-            self.ext_rows += 1;
+            // Row 1 is the row whose glyph triggers the second reset.
+            if (row_start <= 1 and 1 < row_start + row_count) self.sent_reset_row = true;
             if (vert_count == 0) self.ext_empty_rows += 1;
         }
 
@@ -11812,10 +11823,11 @@ test "a second atlas reset in the external pass cancels without sending the row 
 
     // The first reset (row 0) restarts the emission; row 0's glyph is cached
     // in the fresh atlas, so the retry resends it, and row 1 resets again,
-    // which cancels before that row is sent. No row is cleared to empty.
+    // which cancels before that row is sent: the frontend keeps row 1's
+    // previous contents. No row is cleared to empty.
     try std.testing.expect(core.flush_atlas_corrupted);
     try std.testing.expectEqual(@as(u32, 0), state.ext_empty_rows);
-    try std.testing.expectEqual(@as(u32, 1), state.ext_rows);
+    try std.testing.expect(!state.sent_reset_row);
     try std.testing.expect(core.grid.sub_grids.get(2).?.dirty_all);
 }
 
