@@ -2859,6 +2859,9 @@ pub const Grid = struct {
         _ = self.win_layer.remove(grid_id);
         self.invalidateSubgridVertexSurface(grid_id);
         _ = self.external_grids.remove(grid_id);
+        // The gate entry belongs to the hidden placement; a re-show that needs
+        // the initial size gets a new entry from its win_resize.
+        _ = self.pending_ext_window_grids.remove(grid_id);
         if (self.cursor_grid == grid_id) {
             self.cursor_valid = false;
             self.cursor_rev +%= 1;
@@ -5485,4 +5488,24 @@ test "a float anchored in an external window is clamped again when the window re
     try grid.setWinFloatPos(3, 1003, 25, 3, 50, 0, 2, true);
     try grid.resizeGrid(2, 18, 40);
     try std.testing.expectEqual(@as(u32, 25), grid.win_pos.get(3).?.row);
+}
+
+test "a grid 1 scroll is notified once with its summed rows and never takes the row-shift path" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resize(10, 8);
+    grid.clearDirty();
+
+    // Two different regions.
+    grid.scrollGrid(1, 2, 6, 0, 8, 1, 0);
+    grid.scrollGrid(1, 0, 10, 0, 8, -2, 0);
+
+    const buf = &grid.main_buf;
+    try std.testing.expect(buf.scroll_notify_pending);
+    try std.testing.expectEqual(@as(i32, -1), buf.scroll_notify_rows);
+    try std.testing.expectEqual(@as(u8, 1), grid.scrolled_grid_count);
+    try std.testing.expectEqual(@as(i64, 1), grid.scrolled_grid_ids[0]);
+    // Grid 1 has no on_grid_row_scroll: the whole region is regenerated.
+    try std.testing.expect(!buf.row_scroll_notify_pending);
+    for (0..10) |r| try std.testing.expect(grid.isRowDirty(@intCast(r)));
 }

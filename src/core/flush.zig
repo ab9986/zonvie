@@ -3692,6 +3692,7 @@ pub const FlushCtx = struct {
         // once against the fresh atlas; a second reset cancels the bracket.
         var atlas_retried = false;
         var main_perf_logged = false;
+        var pre_row_logged = false;
         var surfaces_notified = false;
         var cursor_grid_notified = false;
         var cursor_sync: ExtCursorSync = .{};
@@ -3708,7 +3709,7 @@ pub const FlushCtx = struct {
                 .glow_hl_ids = glow_hl_ids,
                 .scrolled_count = scrolled_count,
                 .t_pre_row_start = t_pre_row_start,
-                .retry = atlas_retried,
+                .pre_row_logged = &pre_row_logged,
                 .perf_logged = &main_perf_logged,
             });
             if (!atlas_reset and !ctx.core.flush_aborted and !ctx.core.flush_atlas_corrupted) {
@@ -3724,8 +3725,10 @@ pub const FlushCtx = struct {
                 if (!ctx.core.flush_aborted and !ctx.core.flush_atlas_corrupted) {
                     atlas_reset = sendExternalGridVertices(ctx.core, &cursor_grid_notified, &cursor_sync, glow_enabled, glow_all, glow_hl_ids);
                 }
-                // Only the attempt that completed is logged.
-                if (perf_enabled and !atlas_reset) {
+                // At most once per flush, by the last attempt that reaches the
+                // external pass.
+                const last_attempt = !atlas_reset or atlas_retried or ctx.core.flush_aborted;
+                if (perf_enabled and last_attempt) {
                     const ext_us: i64 = @intCast(@divTrunc(@max(0, clock.nowNs() - t_ext), 1000));
                     ctx.core.log.write("[perf] send_external_grids us={d} known={d}\n", .{ ext_us, ctx.core.known_external_grids.count() });
                 }
@@ -3765,8 +3768,8 @@ pub const FlushCtx = struct {
         glow_hl_ids: ?*std.AutoHashMap(u32, void),
         scrolled_count: usize,
         t_pre_row_start: i128,
-        /// The emission is being restarted after an atlas reset.
-        retry: bool,
+        /// Set by the first attempt that reaches grid 1's rows this flush.
+        pre_row_logged: *bool,
         /// Set once grid 1's pass logged its perf lines this flush; a pass
         /// re-run after another grid's atlas reset logs nothing.
         perf_logged: *bool,
@@ -3861,7 +3864,8 @@ pub const FlushCtx = struct {
                         }
                         t_rows_start_ns = clock.nowNs();
                         // Close pre_row "blackhole" bracket (started after cb_flush_begin).
-                        if (!p.retry) {
+                        if (!p.pre_row_logged.*) {
+                            p.pre_row_logged.* = true;
                             const pre_row_us: i64 = @intCast(@divTrunc(@max(0, t_rows_start_ns - p.t_pre_row_start), 1000));
                             ctx.core.log.write("[perf] pre_row us={d} dirty_rows={d}\n", .{ pre_row_us, log_dirty_rows });
                         }
@@ -12013,6 +12017,56 @@ test "one atlas reset during an external window's rows is retried in the same fl
     try expectSameOwedState(SurfaceCapture.target(&cores[0], false), SurfaceCapture.target(&cores[1], true));
 }
 
+test "the cursor's grid closing regenerates only the external root that drew it" {
+    const Capture = struct {
+        main_rows: [8]u32 = @splat(0),
+
+        fn onRow(ctx: ?*anyopaque, grid_id: i64, row_start: u32, row_count: u32, verts: ?[*]const c_api.Vertex, vert_count: usize, flags: u32, total_rows: u32, total_cols: u32) callconv(.c) void {
+            _ = .{ row_start, verts, vert_count, total_rows, total_cols };
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (flags & c_api.VERT_UPDATE_MAIN != 0) self.main_rows[@intCast(grid_id)] += row_count;
+        }
+    };
+    // owner 2: external root; owner 4: composited layer on the main window.
+    for ([_]i64{ 2, 4 }) |owner| {
+        var core = Core.initForTest(std.testing.allocator);
+        defer core.deinitForTest();
+        try SurfaceCapture.initCore(&core, true);
+        try core.grid.resizeGrid(3, SurfaceCapture.ROWS, SurfaceCapture.COLS);
+        try std.testing.expect(try core.grid.setWinExternalPos(3, 43));
+        try core.known_external_grids.put(core.alloc, 2, .{ .win = 42, .start_row = 0, .start_col = 0, .rows = SurfaceCapture.ROWS, .cols = SurfaceCapture.COLS });
+        try core.known_external_grids.put(core.alloc, 3, .{ .win = 43, .start_row = 0, .start_col = 0, .rows = SurfaceCapture.ROWS, .cols = SurfaceCapture.COLS });
+        try core.grid.resizeGrid(4, 2, 2);
+        try core.grid.setWinPos(4, 104, 0, 0);
+        for ([_]i64{ 2, 3, 4 }) |gid| core.grid.putCellGrid(gid, 0, 0, 'A', 0);
+        core.grid.cursor_visible = true;
+        core.grid.setCursor(owner, 0, 0);
+
+        var cap = Capture{};
+        core.ctx = &cap;
+        core.cb.on_vertices_row = Capture.onRow;
+        core.cb.on_rasterize_glyph = TxnProbe.rasterize;
+        core.cb.on_atlas_upload = TxnProbe.upload;
+        core.cb.on_atlas_create = TxnProbe.create;
+        var flush_ctx = FlushCtx{ .core = &core };
+        try flush_ctx.onFlush(SurfaceCapture.ROWS, SurfaceCapture.COLS);
+        try std.testing.expectEqual(owner, core.cursor_owner.grid);
+
+        // One batch: the cursor moves to a grid that is then destroyed.
+        try core.grid.resizeGrid(5, 2, 2);
+        core.grid.setCursor(5, 0, 0);
+        try core.grid.destroyGrid(5);
+        cap = .{};
+        try flush_ctx.onFlush(SurfaceCapture.ROWS, SurfaceCapture.COLS);
+
+        const owner_rows: u32 = if (owner == 2) SurfaceCapture.ROWS else 0;
+        try std.testing.expectEqual(owner_rows, cap.main_rows[@intCast(owner)]);
+        for ([_]i64{ 2, 3, 4 }) |gid| {
+            if (gid != owner) try std.testing.expectEqual(@as(u32, 0), cap.main_rows[@intCast(gid)]);
+        }
+    }
+}
+
 test "atlas reset on a scroll fast path flush still resends every row" {
     const ROWS: u32 = 8;
     const COLS: u32 = 2;
@@ -15643,6 +15697,42 @@ test "a surface layout waits for the external window that receives it" {
     try std.testing.expectEqual(@as(u32, 1), state.opens);
     notifySurfaceLayouts(&core);
     try std.testing.expect(state.saw_layout_for_2);
+}
+
+test "hiding an external grid drops its initial-size gate entry" {
+    const State = struct {
+        opens: u32 = 0,
+        fn onOpen(ctx: ?*anyopaque, grid_id: i64, win: i64, rows: u32, cols: u32, start_row: i32, start_col: i32) callconv(.c) void {
+            _ = grid_id;
+            _ = win;
+            _ = rows;
+            _ = cols;
+            _ = start_row;
+            _ = start_col;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.opens += 1;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(4, 8);
+
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_external_window = State.onOpen;
+
+    try core.grid.resizeGrid(2, 1, 6);
+    try std.testing.expect(try core.grid.setWinExternalPos(2, 42));
+    try core.grid.pending_ext_window_grids.put(core.alloc, 2, .{ .grid_id = 2, .width = 6, .height = 4 });
+    try core.grid.hideWin(2);
+
+    // A re-show opens at the grid's current size; Neovim's grid_resize for the
+    // earlier request reaches it as a resize of the open window.
+    try std.testing.expect(!core.grid.pending_ext_window_grids.contains(2));
+    try std.testing.expect(try core.grid.setWinExternalPos(2, 42));
+    notifyExternalWindowChanges(&core);
+    try std.testing.expectEqual(@as(u32, 1), state.opens);
 }
 
 test "an external row rejection owes the main grid only the rows it consumed" {
