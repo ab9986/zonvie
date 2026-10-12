@@ -6,8 +6,9 @@ env:
   ZIG_VERSION: "0.16.0"
   # One pinned Neovim release for the e2e and GUI jobs, so an upstream
   # release cannot change test results between runs. Stock Neovim: the
-  # ext_windows attach option (unmerged upstream PR) is not available, and
-  # no CI scenario enables it; external floats use ext_multigrid.
+  # ext_windows attach option (unmerged upstream PR) is not available, so
+  # ext_windows scenarios skip here (ZONVIE_REQUIRE_EXT_WINDOWS makes them
+  # fail instead); external floats use ext_multigrid.
   NVIM_VERSION: "v0.12.5"
 
 jobs:

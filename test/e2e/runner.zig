@@ -90,6 +90,11 @@ test "e2e:external_window_cursor" {
     try @import("scenarios/external_window_cursor.zig").run(testing.allocator);
 }
 
+test "e2e:ext_windows_resize_first_window" {
+    try requireNvim();
+    try @import("scenarios/ext_windows_resize_first_window.zig").run(testing.allocator);
+}
+
 test "e2e:float_move_recompose" {
     try requireNvim();
     try @import("scenarios/float_move_recompose.zig").run(testing.allocator);

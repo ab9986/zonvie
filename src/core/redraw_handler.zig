@@ -817,6 +817,64 @@ test "grid_line repeat clamp handles untrusted u32 bounds" {
     try std.testing.expectEqual(@as(u32, 0), clampGridLineRepeat(std.math.maxInt(u32), 4, std.math.maxInt(u32)));
 }
 
+const ExtWindowEvent = enum { win_split, win_resize, win_pos };
+const ExtWindowSurfaceAction = enum { track_and_register, register_at, update_pos, composite, keep };
+
+/// Which surface an ext_windows grid belongs to. `tracked`: named as win2 by a
+/// win_split (kept across win_hide). `registered`: currently in external_grids.
+/// win_resize never decides: window.c sends it for any non-floating window.
+fn reconcileExtWindowSurface(ev: ExtWindowEvent, tracked: bool, registered: bool) ExtWindowSurfaceAction {
+    return switch (ev) {
+        .win_split => .track_and_register,
+        .win_resize => .keep,
+        .win_pos => if (!tracked) .composite else if (registered) .update_pos else .register_at,
+    };
+}
+
+fn applyExtWindowSurface(grid: *Grid, log: *Logger, comptime ev: ExtWindowEvent, grid_id: i64, win: i64, row: u32, col: u32) !void {
+    switch (reconcileExtWindowSurface(ev, grid.ext_windows_grids.contains(grid_id), grid.external_grids.contains(grid_id))) {
+        .keep => {},
+        .update_pos => grid.updateExternalGridPos(grid_id, row, col),
+        .track_and_register => {
+            _ = grid.setWinExternalPos(grid_id, win) catch |err| return logRejected(log, ev, grid_id, err);
+            try grid.ext_windows_grids.put(grid.alloc, grid_id, win);
+        },
+        .register_at => _ = grid.setWinExternalPosAt(grid_id, win, row, col) catch |err| return logRejected(log, ev, grid_id, err),
+        .composite => grid.setWinPos(grid_id, win, row, col) catch |err| return logRejected(log, ev, grid_id, err),
+    }
+}
+
+fn logRejected(log: *Logger, comptime ev: ExtWindowEvent, grid_id: i64, err: anytype) @TypeOf(err) {
+    if (err == error.TooManyWindowPlacements) {
+        log.write("[" ++ @tagName(ev) ++ "] rejected grid={d}: TooManyWindowPlacements\n", .{grid_id});
+    }
+    return err;
+}
+
+test "reconcileExtWindowSurface: every ext_windows event x grid state" {
+    const Row = struct { ev: ExtWindowEvent, tracked: bool, registered: bool, want: ExtWindowSurfaceAction };
+    const rows = [_]Row{
+        .{ .ev = .win_split, .tracked = false, .registered = false, .want = .track_and_register },
+        .{ .ev = .win_split, .tracked = false, .registered = true, .want = .track_and_register },
+        .{ .ev = .win_split, .tracked = true, .registered = false, .want = .track_and_register },
+        .{ .ev = .win_split, .tracked = true, .registered = true, .want = .track_and_register },
+        // `:resize` on the first window names a grid no win_split named.
+        .{ .ev = .win_resize, .tracked = false, .registered = false, .want = .keep },
+        .{ .ev = .win_resize, .tracked = false, .registered = true, .want = .keep },
+        .{ .ev = .win_resize, .tracked = true, .registered = false, .want = .keep },
+        .{ .ev = .win_resize, .tracked = true, .registered = true, .want = .keep },
+        .{ .ev = .win_pos, .tracked = false, .registered = false, .want = .composite },
+        // A win_external_pos grid: setWinPos keeps it external.
+        .{ .ev = .win_pos, .tracked = false, .registered = true, .want = .composite },
+        // Tab re-entry: win_hide dropped the surface, win_pos brings it back.
+        .{ .ev = .win_pos, .tracked = true, .registered = false, .want = .register_at },
+        .{ .ev = .win_pos, .tracked = true, .registered = true, .want = .update_pos },
+    };
+    for (rows) |r| {
+        try std.testing.expectEqual(r.want, reconcileExtWindowSurface(r.ev, r.tracked, r.registered));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // grid_line semantics
 //
@@ -1772,21 +1830,9 @@ pub fn handleRedraw(
                     const flags = t[4].int;
                     log.write("[win_split] win1={d} grid1={d} win2={d} grid2={d} flags={d}\n", .{ win1, grid1, win2, grid2, flags });
 
-                    // Only register the NEW window (grid2/win2) as external.
-                    // The source window (grid1/win1) stays where it is (global grid or already external).
-                    _ = grid.setWinExternalPos(grid2, win2) catch |err| switch (err) {
-                        error.TooManyWindowPlacements => {
-                            log.write("[win_split] rejected grid2={d}: TooManyWindowPlacements\n", .{grid2});
-                            return error.TooManyWindowPlacements;
-                        },
-                        else => return err,
-                    };
-
-                    // Persistently track only the NEW window as an ext_windows grid.
-                    // This survives win_hide (tab switch) so win_pos can re-register it.
-                    // Do NOT track grid1 (source) - it may be the main editor grid (grid 2)
-                    // which should remain composited in the main window.
-                    try grid.ext_windows_grids.put(grid.alloc, grid2, win2);
+                    // Only the new window (grid2) becomes external; grid1 may be
+                    // the main editor grid, which stays composited.
+                    try applyExtWindowSurface(grid, log, .win_split, grid2, win2, 0, 0);
                 }
             },
             .win_resize => {
@@ -1803,18 +1849,7 @@ pub fn handleRedraw(
                     const height = checkedU32(t[3].int) orelse continue;
                     log.write("[win_resize] win={d} grid={d} width={d} height={d}\n", .{ win_id, grid_id, width, height });
 
-                    // Re-register grid as external if it was removed (e.g. tab switch).
-                    // When switching back to a tab, Neovim sends win_resize (not win_split)
-                    // for windows that already exist in its model.
-                    if (!grid.external_grids.contains(grid_id)) {
-                        _ = grid.setWinExternalPos(grid_id, win_id) catch |err| switch (err) {
-                            error.TooManyWindowPlacements => {
-                                log.write("[win_resize] rejected grid={d}: TooManyWindowPlacements\n", .{grid_id});
-                                return error.TooManyWindowPlacements;
-                            },
-                            else => return err,
-                        };
-                    }
+                    try applyExtWindowSurface(grid, log, .win_resize, grid_id, win_id, 0, 0);
 
                     // Queue a grid resize request for core to send after redraw
                     try grid.pending_grid_resizes.append(grid.alloc, .{
@@ -1872,35 +1907,7 @@ pub fn handleRedraw(
                     log.write("[win_pos] grid_id={d} win={d} startrow={d} startcol={d}\n", .{ grid_id, win_id, startrow, startcol });
                     if (log.cb != null and grid.bufForConst(grid_id) == null) log.write("[win_pos] grid {d} before its grid_resize\n", .{grid_id});
 
-                    // If this grid is tracked as an ext_windows grid (created by win_split),
-                    // re-register it as external instead of compositing. This happens when
-                    // switching back to a tab - Neovim sends win_pos for all windows but
-                    // may not send win_resize/win_split for all of them.
-                    if (grid.ext_windows_grids.contains(grid_id)) {
-                        if (!grid.external_grids.contains(grid_id)) {
-                            _ = grid.setWinExternalPosAt(grid_id, win_id, startrow, startcol) catch |err| switch (err) {
-                                error.TooManyWindowPlacements => {
-                                    log.write("[win_pos] rejected ext_windows grid={d}: TooManyWindowPlacements\n", .{grid_id});
-                                    return error.TooManyWindowPlacements;
-                                },
-                                else => return err,
-                            };
-                            log.write("[win_pos] re-registered ext_windows grid={d} as external at ({d},{d})\n", .{ grid_id, startrow, startcol });
-                        } else {
-                            // Already external (e.g. win_pos after win_split in same
-                            // redraw batch): update position directly.
-                            grid.updateExternalGridPos(grid_id, startrow, startcol);
-                            log.write("[win_pos] updated ext_windows grid={d} position to ({d},{d})\n", .{ grid_id, startrow, startcol });
-                        }
-                    } else {
-                        grid.setWinPos(grid_id, win_id, startrow, startcol) catch |err| switch (err) {
-                            error.TooManyWindowPlacements => {
-                                log.write("[win_pos] rejected grid={d}: TooManyWindowPlacements\n", .{grid_id});
-                                return error.TooManyWindowPlacements;
-                            },
-                            else => return err,
-                        };
-                    }
+                    try applyExtWindowSurface(grid, log, .win_pos, grid_id, win_id, startrow, startcol);
                 }
             },
             .win_hide, .win_close => {
@@ -4287,4 +4294,60 @@ test "an out-of-range coordinate in grid_cursor_goto, win_pos or grid_scroll is 
     // Control: a well-formed scroll logs no drop.
     try runRedrawEventsLogged(&grid, &hl, arena, try testGridScrollEvent(arena, 0, 4, 0, 4, 1, 0), &log);
     try std.testing.expectEqual(@as(u32, 3), count.n);
+}
+
+fn testIntEvent(arena: std.mem.Allocator, name: []const u8, args: []const i64) ![]mp.Value {
+    const t = try arena.alloc(mp.Value, args.len);
+    for (args, t) |a, *v| v.* = .{ .int = a };
+    return testEvent(arena, name, t);
+}
+
+// window.c win_setheight_win/win_setwidth_win send win_resize for any
+// non-floating window under ext_windows, including the first window, which
+// no win_split ever named (`:resize`, CTRL-W _, 'winheight' on win_enter).
+test "win_resize on a window no win_split named leaves it composited" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(20, 10);
+
+    try runRedrawEvents(&grid, &hl, arena, try testIntEvent(arena, "grid_resize", &.{ 2, 20, 10 }));
+    try runRedrawEvents(&grid, &hl, arena, try testIntEvent(arena, "win_pos", &.{ 2, 1000, 0, 0, 20, 10 }));
+    try runRedrawEvents(&grid, &hl, arena, try testIntEvent(arena, "win_resize", &.{ 1000, 2, 20, 5 }));
+
+    try std.testing.expect(!grid.isExternalGrid(2));
+    try std.testing.expect(grid.win_pos.contains(2));
+    try std.testing.expect(!grid.ext_windows_grids.contains(2));
+    // The resize request reaches nvim_ui_try_resize_grid regardless.
+    try std.testing.expectEqual(@as(usize, 1), grid.pending_grid_resizes.items.len);
+}
+
+// Tab re-entry: window.c sends win_hide for the leaving tab's windows and
+// win_pos (ui_ext_win_position) for the entered tab's; no win_split repeats.
+test "a split window hidden by a tab switch is external again on its next win_pos" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(20, 10);
+
+    try runRedrawEvents(&grid, &hl, arena, try testIntEvent(arena, "grid_resize", &.{ 3, 20, 5 }));
+    try runRedrawEvents(&grid, &hl, arena, try testIntEvent(arena, "win_split", &.{ 1000, 2, 1001, 3, 0 }));
+    try std.testing.expect(grid.isExternalGrid(3));
+    try std.testing.expect(!grid.isExternalGrid(2));
+
+    try runRedrawEvents(&grid, &hl, arena, try testIntEvent(arena, "win_hide", &.{3}));
+    try std.testing.expect(!grid.isExternalGrid(3));
+
+    try runRedrawEvents(&grid, &hl, arena, try testIntEvent(arena, "win_pos", &.{ 3, 1001, 4, 2, 20, 5 }));
+    try std.testing.expect(grid.isExternalGrid(3));
+    try std.testing.expect(!grid.win_pos.contains(3));
+    try std.testing.expectEqual(@as(i32, 4), grid.external_grids.get(3).?.start_row);
 }

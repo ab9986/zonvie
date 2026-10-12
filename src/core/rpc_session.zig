@@ -1755,7 +1755,10 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
                 // win_resize is Neovim's request to the UI. The UI decides the actual
                 // size and responds with try_resize_grid. Neovim then confirms with grid_resize.
                 for (self.grid.pending_grid_resizes.items) |resize| {
-                    if (!self.known_external_grids.contains(resize.grid_id)) {
+                    // win_resize also names composited windows (window.c sends it
+                    // for any non-floating window); only an external grid with no
+                    // frontend window yet takes the initial-size path.
+                    if (self.grid.isExternalGrid(resize.grid_id) and !self.known_external_grids.contains(resize.grid_id)) {
                         // NEW grid: Use a reasonable initial size for new external windows.
                         // Neovim's proposed size is based on terminal layout (e.g. height=2)
                         // which is too small for an OS window. Use half the main window.
