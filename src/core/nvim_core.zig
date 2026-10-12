@@ -577,21 +577,12 @@ pub const Core = struct {
     cb: Callbacks,
     ctx: ?*anyopaque,
 
-    last_ext_cursor_grid: i64 = 1, // Track which grid had cursor for external grid updates
+    /// Which grid the frontend last received the cursor on, grid 1 included.
+    /// grid_mu.
+    cursor_owner: flush.CursorOwnership = .{},
     /// The main window's scrollbar grid while the cursor is elsewhere (see
     /// tryScrollbarGridForSurface). grid_mu.
     main_scrollbar_grid: i64 = 1,
-    last_ext_cursor_rev: u64 = 0, // Track cursor revision for external grid updates
-    // Set by force resend (c_api.zig zonvie_core_force_resend/_locked): forces
-    // sendExternalGridVertices to treat EVERY external grid as
-    // cursor_affected for one flush, regardless of last_ext_cursor_grid.
-    // A failed flush can leave last_ext_cursor_grid pointing at the NEW
-    // cursor grid even though the frontend never actually committed an empty
-    // cursor for the OLD one (the two are tracked independently — see
-    // sendExternalGridVertices' abort-skip defer) — force resend
-    // cannot know which specific grid that was, so instead of relying on
-    // last_ext_cursor_grid it just re-checks every external grid once.
-    force_ext_cursor_recheck: bool = false,
     pre_cmdline_cursor_grid: i64 = 1, // Cursor grid before cmdline was shown (for restoring after cmdline closes)
     pre_cmdline_cursor_row: u32 = 0,
     pre_cmdline_cursor_col: u32 = 0,
@@ -1717,9 +1708,9 @@ pub const Core = struct {
         // These fields are consulted from the flush path which already
         // runs under grid_mu (see handleRedraw); resetting them inside
         // this critical section keeps the flush invariants consistent.
-        self.last_ext_cursor_grid = 1;
+        self.cursor_owner.grid = 1;
         self.main_scrollbar_grid = 1;
-        self.last_ext_cursor_rev = 0;
+        self.cursor_owner.rev = 0;
         self.pre_cmdline_cursor_grid = 1;
         self.pre_cmdline_cursor_row = 0;
         self.pre_cmdline_cursor_col = 0;

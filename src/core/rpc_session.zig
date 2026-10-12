@@ -743,7 +743,7 @@ fn forceGlowFlush(self: *Core) void {
     self.lockGridAsRedrawOwner();
     defer self.unlockGridAsRedrawOwner();
     self.grid.markEverySurfaceDirty();
-    self.force_ext_cursor_recheck = true;
+    self.cursor_owner.force_recheck = true;
     var fctx = flush.FlushCtx{ .core = self };
     flush.FlushCtx.onFlush(&fctx, self.grid.rows, self.grid.cols) catch |reason| {
         if (Core.isHardRenderFailure(reason)) self.failHardRender(reason);
@@ -1574,7 +1574,7 @@ fn prepareRenderStateForFlush(ctx: *flush.FlushCtx) !void {
         self.resolveGlowGroups();
         if (self.glow_enabled.load(.acquire)) {
             self.grid.markEverySurfaceDirty();
-            self.force_ext_cursor_recheck = true;
+            self.cursor_owner.force_recheck = true;
         }
     }
 

@@ -790,9 +790,13 @@ typedef struct zonvie_callbacks {
 
     /* Called when cursor moves to a different grid.
        grid_id: the grid where cursor now resides (1 = global grid).
-       Frontend should activate the corresponding window. May repeat the
-       same grid_id (while its window is not created yet, and after an
-       aborted flush); frontends compare against the last one they saw. */
+       Frontend should activate the corresponding window. Fires only while
+       at least one external window exists (its purpose is window
+       activation): a cursor moving between grids of the main surface alone
+       is not reported. At most once per flush bracket, even when an atlas
+       reset restarts the emission. May repeat the same grid_id (while its
+       window is not created yet, and after an aborted flush); frontends
+       compare against the last one they saw. */
     void (*on_cursor_grid_changed)(void* ctx, int64_t grid_id);
 
     /* ext_cmdline callbacks */

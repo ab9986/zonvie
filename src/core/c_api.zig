@@ -3304,11 +3304,11 @@ fn forceResendAll(cp: *core.Core) void {
     cp.grid.cursor_rev +%= 1;
     // A prior failed flush may have moved the cursor between external
     // grids without the old grid ever actually receiving its empty-cursor
-    // update (see force_ext_cursor_recheck's doc comment) — force every
+    // update (see cursor_owner.force_recheck's doc comment) — force every
     // external grid to re-check its cursor state once rather than relying
-    // on last_ext_cursor_grid, which cannot be trusted to still name the
+    // on cursor_owner.grid, which cannot be trusted to still name the
     // right stale grid in that scenario.
-    cp.force_ext_cursor_recheck = true;
+    cp.cursor_owner.force_recheck = true;
 }
 
 // Force every grid to be treated as dirty on the next flush attempt.

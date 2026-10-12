@@ -517,7 +517,7 @@ fn finishVertexBudgetTransactionRestoring(core: *Core, mode: FlushCommitMode) vo
                 // was only ever mirrored for the main grid — and under ext_multigrid
                 // that is the container, not the content, so one routine backpressure
                 // refusal reshaped every split and float.
-                core.force_ext_cursor_recheck = true;
+                core.cursor_owner.force_recheck = true;
                 core.flush_vertex_count_aggregate =
                     core.grid.main_buf.surface_vertex_count + core.grid.subgrid_surface_vertex_count;
                 clearTouchedVertexBudgetSurfaces(core);
@@ -541,7 +541,7 @@ fn finishVertexBudgetTransactionRestoring(core: *Core, mode: FlushCommitMode) vo
             }
             core.grid.markAllDirty();
             core.grid.subgrid_surface_vertex_count = 0;
-            core.force_ext_cursor_recheck = true;
+            core.cursor_owner.force_recheck = true;
             core.flush_vertex_count_aggregate = 0;
             core.display_mirror_stale = true;
         },
@@ -3481,7 +3481,7 @@ pub const FlushCtx = struct {
                     // what changed after it was sent; the frontend kept its
                     // committed frame, so nothing else is.
                     ctx.core.grid.returnOwed();
-                    ctx.core.force_ext_cursor_recheck = true;
+                    ctx.core.cursor_owner.force_recheck = true;
                     discardStagedSurfaceLayouts(ctx.core);
                 }
                 // A due maintenance reprobe may already have invalidated its
@@ -3732,7 +3732,7 @@ pub const FlushCtx = struct {
                 atlas_retried = true;
                 ctx.core.grid.markEverySurfaceDirty();
                 // Cursor sets sent before the reset carry stale UVs too.
-                ctx.core.force_ext_cursor_recheck = true;
+                ctx.core.cursor_owner.force_recheck = true;
                 continue;
             }
             cancelFlushForAtlasReset(ctx.core);
@@ -3741,9 +3741,9 @@ pub const FlushCtx = struct {
         // Once, for the attempt that completed: a sync after a restarted
         // attempt would hide the cursor change from the retry.
         if (cursor_sync.valid and !ctx.core.flush_aborted and !ctx.core.flush_atlas_corrupted) {
-            if (cursor_sync.set_grid) ctx.core.last_ext_cursor_grid = cursor_sync.grid;
-            ctx.core.last_ext_cursor_rev = cursor_sync.rev;
-            ctx.core.force_ext_cursor_recheck = false;
+            if (cursor_sync.set_grid) ctx.core.cursor_owner.grid = cursor_sync.grid;
+            ctx.core.cursor_owner.rev = cursor_sync.rev;
+            ctx.core.cursor_owner.force_recheck = false;
         }
         // Validate the completed main+external state only after every row was
         // generated, so moving vertices between rows cannot fail on a mixed
@@ -4798,10 +4798,10 @@ fn sendGridCursor(
             traceRender(self, "event=cursor_send grid={d} row=0 vertices=0\n", .{grid_id});
             sendRowUpdate(self, row_cb, grid_id, 0, 1, null, 0, .cursor, buf.rows, buf.cols);
         }
-    } else if (cursor_was_on_this_grid or self.force_ext_cursor_recheck) {
+    } else if (cursor_was_on_this_grid or self.cursor_owner.force_recheck) {
         // Cursor left this grid, or was hidden on it: send an empty cursor to
-        // clear the previous one. Under force_ext_cursor_recheck,
-        // last_ext_cursor_grid cannot be trusted after a prior failed flush,
+        // clear the previous one. Under cursor_owner.force_recheck,
+        // cursor_owner.grid cannot be trusted after a prior failed flush,
         // so clearing every OTHER grid is a harmless no-op for clean grids and
         // closes the gap for the misnamed one.
         traceRender(self, "event=cursor_send grid={d} row=0 vertices=0\n", .{grid_id});
@@ -4809,6 +4809,64 @@ fn sendGridCursor(
         self.log.write("[ext_cursor_layer] grid_id={d} cursor_left, clearing cursor\n", .{grid_id});
     }
     return true;
+}
+
+/// Where the frontend last received the cursor, grid 1 included. Synced once
+/// per completed flush, so after a failed one `grid` may name a grid that
+/// never got its CURSOR set: `force_recheck` makes every grid decide its
+/// cursor set once more instead of trusting `grid`.
+pub const CursorOwnership = struct {
+    grid: i64 = 1,
+    rev: u64 = 0,
+    force_recheck: bool = false,
+};
+
+/// One grid's cursor routing for one flush.
+pub const CursorRoute = struct {
+    /// cursor_rev moved since the owner was synced.
+    changed: bool,
+    /// The cursor's grid is not the owner.
+    grid_changed: bool,
+    /// The owner is this grid.
+    was_here: bool,
+    /// This grid gets a CURSOR set: the cursor where it is, or an empty one.
+    affected: bool,
+    /// The cursor moved without leaving this grid.
+    moved_within: bool,
+    /// This grid drew the cursor and the grid it moved to has no surface:
+    /// every row is regenerated.
+    force_redraw: bool,
+};
+
+pub const CursorRouteInput = struct {
+    grid_id: i64,
+    cursor_grid: i64,
+    cursor_rev: u64,
+    owner: CursorOwnership,
+    /// The cursor is visible on grid_id.
+    cursor_here: bool,
+    /// cursor_grid is not grid 1 and no surface places it.
+    cursor_grid_closed: bool,
+    /// owner.grid is an external root with a host window.
+    owner_is_external_root: bool,
+};
+
+/// Pure: the header's CURSOR layer contract for one grid. A grid that draws
+/// the cursor or drew it last gets a set whenever the cursor changed; under
+/// force_recheck every grid does, an empty set being a no-op for a grid that
+/// never drew one.
+pub fn routeGridCursor(in: CursorRouteInput) CursorRoute {
+    const changed = in.cursor_rev != in.owner.rev;
+    const grid_changed = in.cursor_grid != in.owner.grid;
+    const was_here = in.owner.grid == in.grid_id;
+    return .{
+        .changed = changed,
+        .grid_changed = grid_changed,
+        .was_here = was_here,
+        .affected = (changed and (in.cursor_here or was_here)) or in.owner.force_recheck,
+        .moved_within = changed and in.cursor_here and !grid_changed,
+        .force_redraw = in.cursor_grid_closed and in.owner_is_external_root and was_here,
+    };
 }
 
 const ExtCursorSync = struct {
@@ -4843,12 +4901,34 @@ fn sendExternalGridVertices(self: *Core, cursor_grid_notified: *bool, sync: *Ext
     // Check if cursor changed (position or grid) - do this first, before early returns
     const cursor_grid = self.grid.cursor_grid;
     const cursor_rev = self.grid.cursor_rev;
-    const cursor_changed = (cursor_rev != self.last_ext_cursor_rev);
-    const cursor_grid_changed = (cursor_grid != self.last_ext_cursor_grid);
+    // Cursor on a CLOSED grid (e.g. the cmdline going away): force-redraw
+    // whichever grid previously held it. "Closed" means no surface places the
+    // grid any more; a grid the cursor merely left is cleared by the empty
+    // cursor set the loop below sends it.
+    const cursor_on_closed_grid = cursor_grid != 1 and
+        placedSurfaceForGrid(&self.grid, cursor_grid) == null;
+    const owner_is_external_root = self.known_external_grids.contains(self.cursor_owner.grid);
+    const routeFor = struct {
+        fn f(core: *const Core, grid_id: i64, cursor_here: bool, closed: bool, owner_ext: bool) CursorRoute {
+            return routeGridCursor(.{
+                .grid_id = grid_id,
+                .cursor_grid = core.grid.cursor_grid,
+                .cursor_rev = core.grid.cursor_rev,
+                .owner = core.cursor_owner,
+                .cursor_here = cursor_here,
+                .cursor_grid_closed = closed,
+                .owner_is_external_root = owner_ext,
+            });
+        }
+    }.f;
+    const cursor_on_root = externalCursorVisibleOnGrid(&self.grid, 1);
+    const root_route = routeFor(self, 1, cursor_on_root, cursor_on_closed_grid, owner_is_external_root);
+    const cursor_changed = root_route.changed;
+    const cursor_grid_changed = root_route.grid_changed;
     var ext_cursor_retry_required = false;
 
     self.log.write("[sendExternalGridVertices] cursor_grid={d} cursor_rev={d} last_grid={d} last_rev={d} changed={} grid_changed={}\n", .{
-        cursor_grid, cursor_rev, self.last_ext_cursor_grid, self.last_ext_cursor_rev, cursor_changed, cursor_grid_changed,
+        cursor_grid, cursor_rev, self.cursor_owner.grid, self.cursor_owner.rev, cursor_changed, cursor_grid_changed,
     });
 
     // Only update last cursor grid if we have external grids to process.
@@ -4856,7 +4936,7 @@ fn sendExternalGridVertices(self: *Core, cursor_grid_notified: *bool, sync: *Ext
     // Always update cursor rev to prevent stale changed=true accumulation.
     const has_external_grids = self.known_external_grids.count() > 0;
     // A grid composited as a LAYER has no host window, so external windows are
-    // the wrong thing to wait for: with none of them, last_ext_cursor_grid
+    // the wrong thing to wait for: with none of them, cursor_owner.grid
     // stayed 1 while a float owned the cursor, and the owning grid never got
     // the empty CURSOR set that hiding the cursor (busy_start) needs. Its
     // vertices come from emit_grid_ids below, which is built from sub_grids,
@@ -4884,27 +4964,12 @@ fn sendExternalGridVertices(self: *Core, cursor_grid_notified: *bool, sync: *Ext
         };
     }
 
-    // Cursor on a CLOSED grid (e.g. the cmdline going away): force-redraw
-    // whichever grid previously held it.
-    //
-    // "Closed" has to mean no surface places the grid any more. The test used
-    // to be `not an external root`, which is also true of every split the main
-    // window places and of every float this very window hosts — so an ordinary
-    // cursor move out of an external window regenerated that window's every
-    // row. The grid the cursor left is already told to clear by the empty
-    // cursor set the loop below sends it, so nothing but a genuinely departed
-    // grid needs more than that.
-    const cursor_on_closed_grid = cursor_grid != 1 and
-        placedSurfaceForGrid(&self.grid, cursor_grid) == null;
-    const need_force_redraw_last = cursor_on_closed_grid and
-        self.known_external_grids.contains(self.last_ext_cursor_grid);
-
-    if (need_force_redraw_last) {
-        self.log.write("[sendExternalGridVertices] cursor on closed grid, forcing redraw of last_grid={d}\n", .{self.last_ext_cursor_grid});
+    if (cursor_on_closed_grid and owner_is_external_root) {
+        self.log.write("[sendExternalGridVertices] cursor on closed grid, forcing redraw of last_grid={d}\n", .{self.cursor_owner.grid});
     }
 
     // Window activation only matters for external grid windows, and without
-    // them cursor_grid_changed compares against a stale last_ext_cursor_grid
+    // them cursor_grid_changed compares against a stale cursor_owner.grid
     // and produces false positives.
     if (cursor_grid_changed and has_external_grids and !cursor_grid_notified.*) {
         if (self.cb.on_cursor_grid_changed) |cursor_cb| {
@@ -4916,7 +4981,7 @@ fn sendExternalGridVertices(self: *Core, cursor_grid_notified: *bool, sync: *Ext
     const row_cb = self.cb.on_vertices_row orelse return false;
     // The collector keeps the glyph of the cursor being drawn; whichever grid
     // draws it now refills this below.
-    if (cursor_changed or self.force_ext_cursor_recheck) self.cursor_verts.clearRetainingCapacity();
+    if (cursor_changed or self.cursor_owner.force_recheck) self.cursor_verts.clearRetainingCapacity();
     // Called only inside onFlush's bracket, which settles the budget.
     std.debug.assert(self.vertex_budget_transaction_active);
 
@@ -4948,12 +5013,8 @@ fn sendExternalGridVertices(self: *Core, cursor_grid_notified: *bool, sync: *Ext
     //
     // Grid 1's rows are the main pass's; its cursor is decided here, by the
     // rule every other grid's is.
-    {
-        const on = externalCursorVisibleOnGrid(&self.grid, 1);
-        const was = self.last_ext_cursor_grid == 1;
-        if ((cursor_changed and (on or was)) or self.force_ext_cursor_recheck) {
-            if (!sendGridCursor(self, row_cb, 1, &self.grid.main_buf, on, was, &ext_cursor_retry_required, &ext_saw_atlas_reset_any)) return false;
-        }
+    if (root_route.affected) {
+        if (!sendGridCursor(self, row_cb, 1, &self.grid.main_buf, cursor_on_root, root_route.was_here, &ext_cursor_retry_required, &ext_saw_atlas_reset_any)) return false;
     }
     collectEmitGrids(self);
     for (self.emit_grid_ids.items) |grid_id_value| {
@@ -4968,20 +5029,15 @@ fn sendExternalGridVertices(self: *Core, cursor_grid_notified: *bool, sync: *Ext
         const sg = self.grid.sub_grids.getPtr(grid_id) orelse continue;
 
         const cursor_on_this_grid = externalCursorVisibleOnGrid(&self.grid, grid_id);
-        const cursor_was_on_this_grid = (self.last_ext_cursor_grid == grid_id);
-        // force_ext_cursor_recheck re-checks EVERY external grid's cursor state
-        // once, since a prior failed flush may have left last_ext_cursor_grid
-        // naming the wrong (or right, but unconfirmed) grid.
-        const cursor_affected = (cursor_changed and (cursor_on_this_grid or cursor_was_on_this_grid)) or
-            self.force_ext_cursor_recheck;
-        const cursor_moved_within = cursor_changed and cursor_on_this_grid and !cursor_grid_changed;
-
-        // Check if this grid needs forced redraw because cursor left closed cmdline
-        const force_redraw_this = need_force_redraw_last and (grid_id == self.last_ext_cursor_grid);
+        const route = routeFor(self, grid_id, cursor_on_this_grid, cursor_on_closed_grid, owner_is_external_root);
+        const cursor_was_on_this_grid = route.was_here;
+        const cursor_affected = route.affected;
+        const cursor_moved_within = route.moved_within;
+        const force_redraw_this = route.force_redraw;
 
         self.log.write("[ext_cursor_check] grid_id={d} dirty={} cursor_on={} cursor_was={} affected={} moved_within={} force_closed={} cursor_grid={d} last_grid={d} rev={d} last_rev={d}\n", .{
             grid_id,     sg.dirty,                  cursor_on_this_grid, cursor_was_on_this_grid,  cursor_affected, cursor_moved_within, force_redraw_this,
-            cursor_grid, self.last_ext_cursor_grid, cursor_rev,          self.last_ext_cursor_rev,
+            cursor_grid, self.cursor_owner.grid, cursor_rev,          self.cursor_owner.rev,
         });
 
         // cursor_moved_within is a subset of cursor_affected.
@@ -8736,7 +8792,7 @@ test "zero-sized main still commits external grid transaction" {
     try std.testing.expectEqual(@as(usize, 12), core.grid.main_buf.surface_vertex_count);
     try std.testing.expectEqual(12 + core.grid.subgrid_surface_vertex_count, core.flush_vertex_count_aggregate);
     try std.testing.expect(core.display_mirror_stale);
-    try std.testing.expect(core.force_ext_cursor_recheck);
+    try std.testing.expect(core.cursor_owner.force_recheck);
 
     state.abort_main_layout = false;
     try flush_ctx.onFlush(2, 0);
@@ -11387,7 +11443,7 @@ test "a cursor atlas reset restarts every grid's emission in the same flush" {
     core.cell_w_px = 1;
     core.cell_h_px = 1;
     core.grid.clearDirty();
-    core.last_ext_cursor_rev = core.grid.cursor_rev -% 1;
+    core.cursor_owner.rev = core.grid.cursor_rev -% 1;
     core.atlas_w = config.atlas_size_max;
     core.atlas_h = config.atlas_size_max;
     core.atlas_packer = shelf_packer.ShelfPacker.init(core.atlas_w, core.atlas_h);
@@ -11407,7 +11463,7 @@ test "a cursor atlas reset restarts every grid's emission in the same flush" {
     try std.testing.expect(!core.flush_atlas_corrupted);
     try std.testing.expect(!core.grid.main_buf.dirty);
     try std.testing.expectEqual(@as(u32, 2), state.partial_calls);
-    try std.testing.expectEqual(core.grid.cursor_rev, core.last_ext_cursor_rev);
+    try std.testing.expectEqual(core.grid.cursor_rev, core.cursor_owner.rev);
 }
 
 test "second row-mode atlas reset cancels instead of committing empty rows" {
