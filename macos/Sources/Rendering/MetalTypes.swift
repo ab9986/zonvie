@@ -942,22 +942,6 @@ func makeSurfaceClearColor(
     )
 }
 
-func resolveSurfaceColorLoadAction(
-    blurEnabled: Bool,
-    hasPresentedOnce: Bool,
-    drawableSizeChanged: Bool,
-    shouldReusePreviousContents: Bool,
-    forceReusePreviousContents: Bool = false
-) -> MTLLoadAction {
-    if hasPresentedOnce && !drawableSizeChanged && forceReusePreviousContents {
-        return .load
-    }
-    if !blurEnabled && hasPresentedOnce && !drawableSizeChanged && shouldReusePreviousContents {
-        return .load
-    }
-    return .clear
-}
-
 /// Canonicalize a persistent dirty-row scratch after contiguous fallback
 /// ranges were appended. Sorting is in-place and the compaction only shortens
 /// the array, so capacity is retained and the hot path performs no heap work.

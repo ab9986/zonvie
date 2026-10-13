@@ -144,8 +144,8 @@ struct SurfaceIdleTerms {
 /// Whether a surface's render pass may `.load` the back texture it drew last
 /// frame, or has to `.clear` and draw it all again.
 ///
-/// `resolveSurfaceColorLoadAction` — the final mapping onto `MTLLoadAction` —
-/// was already shared. What was not shared is the predicate that feeds it, and
+/// `SurfaceFrameDecision.loadsPreviousContents` — the final mapping onto the
+/// load action — was already shared. What was not shared is the predicate that feeds it, and
 /// that is where the two surfaces had drifted furthest: main computes one
 /// expression, external computes four (`cursorOnlyFrame`, `reuseHostedContents`,
 /// `reuseRootContents`, `partialHostedContents`) and then a fifth over them.
@@ -258,7 +258,7 @@ struct SurfaceLoadActionTerms {
     }
 
     /// `shouldReusePreviousContents`: reuse is permitted if blur does not
-    /// intervene. `resolveSurfaceColorLoadAction` applies that last condition.
+    /// intervene. `SurfaceFrameDecision` applies that last condition.
     var reusesPreviousContents: Bool {
         guardsAllow
             && (!layersOutsideDirtySet || reuseHostedContents || partialHostedContents)
@@ -387,7 +387,7 @@ struct SurfaceRowPassTerms {
     /// Only external tested this alongside `canDirtyOnlyWithBlur`. Main did
     /// not have to: its `canDirtyOnlyWithBlur` forces reuse, and itself
     /// requires `hasPresentedOnce && !drawableSizeChanged`, which is exactly
-    /// what `resolveSurfaceColorLoadAction` needs to answer `.load`. So the
+    /// what `SurfaceFrameDecision` needs to answer `.load`. So the
     /// conjunct is a no-op on main rather than a new condition.
     var loadedPreviousContents = false
 

@@ -2321,7 +2321,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
 
     // --- Blur transparency support ---
     private let blurEnabled: Bool
-    private var backgroundAlpha: Float = 1
 
     // --- Post-process bloom (neon glow, Dual Kawase) ---
     // Pipelines and sampler are internal so ExternalGridView can share them.
@@ -2440,12 +2439,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // when multiple instances start simultaneously
         self.viewForPipeline = view
         shared.buildSampler()
-
-        backgroundAlpha = resolveSurfaceBackgroundAlpha(
-            blurEnabled: blurEnabled,
-            decoratedSurface: false
-        )
-        ZonvieCore.appLog("[Renderer] backgroundAlpha=\(backgroundAlpha)")
 
         if collectsGpuPerfSamples { gpuSampler.setUp(device: shared.device) }
     }
@@ -3733,27 +3726,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 )
             }
 
-            // Skip the main render pass for a frame that changes no backTex
-            // pixel — blink-only or noop. The cursor lives on the drawable, not
-            // backTex, so the copy + cursor passes alone reproduce the right
-            // pixel. Avoids the ~5.7ms .clear cost (alpha=0.8 backgrounds
-            // disable Apple's fast-clear path). Glow is excluded: bloom samples
-            // backTex through its own intermediate pass.
-            // `cursorOnlyCommitSnapshot` joins `!hasNewCommit` rather than
-            // replacing it: a commit that moved only the cursor changes no
-            // backTex pixel either, which is why `ExternalGridView` reuses its
-            // surface for one. Without it the main surface needs a dirty row to
-            // keep the frame alive, and that row drags a background band and
-            // every layer under it into the redraw.
-            let noMainWorkFrame = (!hasNewCommit || cursorOnlyCommitSnapshot)
-                && dirtyRows.isEmpty
-                && !anyLayerWork
-                && dirtyRectPxOpt == nil
-                && !smoothScrolling
-                && !drawableSizeChanged
-                && hasPresentedOnceSnapshot
-            let skipMainPass = noMainWorkFrame && !glowEnabled
-
             // Bail path for acquisition failures below (drawable exhaustion,
             // command-buffer failure). Dirty rows/rect, the scroll accumulator
             // and the skip-gate state were consumed under the lock above, so
@@ -4008,7 +3980,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     // frame has not chosen yet: accepting a plan sets
                     // `useGpuScrollCopy` → `forceReusePreviousContents`, and with
                     // the rungs above already passed
-                    // resolveSurfaceColorLoadAction returns .load.
+                    // SurfaceFrameDecision answers .load.
                     if layerNeedsAllRows(
                         state: state,
                         rowCount: layerResolvableRowCount(li, layer),
@@ -4124,50 +4096,48 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             rpd.colorAttachments[0].texture = backTex
             rpd.colorAttachments[0].storeAction = .store
 
-            // For partial redraw, preserve back buffer contents; clear once after
-            // a resize. Under blur, .load blends semi-transparent backgrounds
-            // with the previous frame (ghosting, opacity buildup) unless the
-            // 2-pass background pass overwrites them — see canDirtyOnlyWithBlur.
-            // A layer that owes rows counts as dirty here: its rows are not in
-            // the surface's own dirty set, and a layer-only frame must not clear.
-            let hasAnyDirtyInRowMode = rowMode && (!dirtyRows.isEmpty || anyLayerWork)
-
-            // Glow forces .clear: additive bloom would accumulate brightness.
-            // Blur can still redraw dirty-only with .load because the 2-pass
-            // background pass overwrites, so alpha does not accumulate — that
-            // avoids a full clear between scroll flushes (e.g. statusline).
-            let canDirtyOnlyWithBlur = SurfaceLoadActionTerms.dirtyOnlyWithBlur(
+            // Shared with ExternalGridView: every per-frame decision below —
+            // skip, load action, row-pass plan, background alpha — comes from
+            // one term set. This surface has no font gate, no layout-damage
+            // flag, no staged root scroll and is never decorated, so those
+            // stay at defaults. `rowModeSatisfied` is true because the
+            // whole-grid gate above already returned when there was nothing
+            // to draw. `hostsLayersOutsideDirtySet` stays false on purpose:
+            // the layers this surface hosts are drawn from this same pass and
+            // travel in `hasLayerWork`. `rootScrollBlitVacatedBand` is false
+            // because its root is the ext_multigrid container, which never
+            // scrolls; the blit above was a LAYER's, so it only keeps the back
+            // texture loaded.
+            //
+            // `commitChangesNoPixels`: a commit that moved only the cursor
+            // changes no backTex pixel either; without it this surface would
+            // need a dirty row to keep the frame alive, and that row drags a
+            // background band and every layer under it into the redraw.
+            let frameDecision = SurfaceFrameDecision.make(terms: SurfaceFrameTerms(
                 rowMode: rowMode,
-                useTwoPass: use2Pass,
-                hasDirtyRowsInRowMode: hasAnyDirtyInRowMode,
                 hasPresentedOnce: hasPresentedOnceSnapshot,
+                drawableSizeChanged: drawableSizeChanged,
                 isSmoothScrolling: smoothScrolling,
-                drawableSizeChanged: drawableSizeChanged,
-                glowEnabled: glowEnabled
-            )
-            // Shared with ExternalGridView: SurfaceLoadActionTerms holds every
-            // guard and arm either surface has. This surface has no font gate,
-            // no separate layout-damage flag and is never decorated, so those
-            // stay at defaults. `layersOutsideDirtySet` stays false on purpose
-            // — the layers this surface hosts are already inside
-            // `hasAnyDirtyInRowMode`, via `anyLayerWork`.
-            let loadTerms = SurfaceLoadActionTerms(
-                glowEnabled: glowEnabled,
-                useGpuScrollCopy: useGpuScrollCopy,
-                canDirtyOnlyWithBlur: canDirtyOnlyWithBlur,
-                hasDirtyRect: dirtyRectPxOpt != nil,
-                hasDirtyRowsInRowMode: hasAnyDirtyInRowMode,
-                isSmoothScrolling: smoothScrolling
-            )
-            let shouldReusePreviousContents = loadTerms.reusesPreviousContents
-            ZonvieCore.drawTrace(loadTerms.traceLine(surface: 1))
-            rpd.colorAttachments[0].loadAction = resolveSurfaceColorLoadAction(
                 blurEnabled: blurEnabled,
-                hasPresentedOnce: hasPresentedOnceSnapshot,
-                drawableSizeChanged: drawableSizeChanged,
-                shouldReusePreviousContents: shouldReusePreviousContents,
-                forceReusePreviousContents: loadTerms.forcesReusePreviousContents
-            )
+                useTwoPass: use2Pass,
+                glowEnabled: glowEnabled,
+                configuredBlurAlpha: ZonvieConfig.shared.backgroundAlpha,
+                hasDirtyRect: dirtyRectPxOpt != nil,
+                hasDirtyRows: !dirtyRows.isEmpty,
+                hasLayerWork: anyLayerWork,
+                commitChangesNoPixels: !hasNewCommit || cursorOnlyCommitSnapshot,
+                scrollBlitKeptBackTexture: useGpuScrollCopy
+            ))
+            let backgroundAlpha = frameDecision.backgroundAlpha
+            // Skip the main render pass for a frame that changes no backTex
+            // pixel — blink-only or noop. The cursor lives on the drawable, not
+            // backTex, so the copy + cursor passes alone reproduce the right
+            // pixel. Avoids the ~5.7ms .clear cost (alpha=0.8 backgrounds
+            // disable Apple's fast-clear path). Glow is excluded: bloom samples
+            // backTex through its own intermediate pass.
+            let skipMainPass = frameDecision.skipsSurfacePass
+            ZonvieCore.drawTrace(frameDecision.traceLine(surface: 1))
+            rpd.colorAttachments[0].loadAction = frameDecision.loadsPreviousContents ? .load : .clear
 
             if rpd.colorAttachments[0].loadAction == .load {
                 if useGpuScrollCopy {
@@ -4257,21 +4227,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // Shared with ExternalGridView: WHICH rows this pass draws is
             // one decision now; `use2Pass` still says HOW, which is why three
             // cases below still split on it.
-            //
-            // `rootScrollBlitVacatedBand` is false here on purpose — this
-            // surface blits for its LAYERS, whose own pass repaints them, and
-            // its root is the ext_multigrid container, which never scrolls.
-            // `hasDirtyRows` carries `anyLayerWork` because those layers are
-            // drawn from this same pass.
-            let rowPassPlan = SurfaceRowPassTerms(
-                useTwoPass: use2Pass,
-                isSmoothScrolling: smoothScrolling,
-                canDirtyOnlyWithBlur: canDirtyOnlyWithBlur,
-                loadedPreviousContents: rpd.colorAttachments[0].loadAction == .load,
-                hasDirtyRows: !dirtyRows.isEmpty || anyLayerWork,
-                glowEnabled: glowEnabled,
-                drawableSizeChanged: drawableSizeChanged
-            ).plan
+            let rowPassPlan = frameDecision.rowPassPlan
 
             if rowMode {
                 // `.dirtyRowsAfterScrollBlit` is unreachable here: this surface

@@ -896,21 +896,17 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             && shared.customShaderPostProcess == .afterBloom
     }
 
+    /// The shader chain is not loaded yet when this view is built, so the
+    /// alpha convention its back texture needs is settled per draw, from the
+    /// same decision as the rest of the frame; this is the init-time log's
+    /// view of it.
     private func surfaceBackgroundAlpha() -> Float {
-        // Popupmenu has per-row bg colors (Pmenu vs PmenuSel) that the user
-        // must be able to tell apart. The decorated-surface alpha override
-        // forces the shader to multiply every bg color by 0 so the
-        // cmdline-style "show blur through cells" trick works for the
-        // single-color cmdline / msg surfaces, but it collapses the popupmenu
-        // into a uniform transparent block and hides the selection. Use 1.0
-        // instead so each cell renders with its own opaque bg; the popupmenu's
-        // surrounding blur is still preserved by the container view's
-        // transparent layer around the Metal viewport.
-        if gridId == ZonvieCore.popupmenuGridId { return 1.0 }
-        return resolveSurfaceBackgroundAlpha(
+        SurfaceFrameDecision.backgroundAlpha(
             blurEnabled: blurEnabled,
-            decoratedSurface: isDecoratedSurface,
-            shaderChainConsumesSurface: shaderChainConsumesSurface
+            isDecoratedSurface: isDecoratedSurface,
+            shaderChainConsumesSurface: shaderChainConsumesSurface,
+            isPopupmenu: gridId == ZonvieCore.popupmenuGridId,
+            configuredBlurAlpha: ZonvieConfig.shared.backgroundAlpha
         )
     }
 
@@ -2565,11 +2561,6 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                 layerOriginPx: rootLayerOrigin
             )
 
-            // The shader chain is not loaded yet when this view is built, so
-            // the alpha convention its back texture needs can only be settled
-            // here, per draw.
-            let backgroundAlpha = surfaceBackgroundAlpha()
-
             // The union this surface's scrolled content must not bleed over.
             // Same rule the main renderer applies to its own layers, and it is
             // only meaningful while a scroll is easing — with no offset there is
@@ -2803,88 +2794,52 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             rpd.colorAttachments[0].texture = backTex
             rpd.colorAttachments[0].storeAction = .store
 
-            // loadAction logic — match GridSurfaceRenderer. A cursor-only frame
-            // keeps the back buffer through reuseRootContents/reuseHostedContents,
-            // which, like the main surface's skipMainPass, refuse while an ease
-            // holds an offset.
-            let hasAnyDirtyInRowMode = rowMode && !dirtyRows.isEmpty
-            // The cursor is composited after the retained texture. A pure
-            // blink needs no root or hosted-row draw, including under blur.
-            // An animating shader is no reason to redraw either: its chain
-            // only reads the retained texture, which is what the main surface
-            // hands it on a frame with no main work.
-            let reuseHostedContents = rowMode && !layerSnapshot.isEmpty
-                && committedFontIsCurrent && hasPresentedOnce
-                && !layoutDamageSnapshot && !hasDirtyContent
-                && !hasPendingScroll && !drawableSizeChanged && !scrollOffsetChanged
-                && !smoothScrolling && !glowEnabled
-                && !isDecoratedSurface
-            // Same deal without hosted layers: the cursor lives on the
-            // drawable, not the back texture, so a frame with no root row to
-            // draw — a cursor move, a blink toggle, an animating shader's
-            // next frame — keeps every row. Without this the branch ladder
-            // below falls through to the full-redraw arm, where the main
-            // surface skips its whole pass (GridSurfaceRenderer's
-            // noMainWorkFrame asks the same question).
-            let reuseRootContents = rowMode && layerSnapshot.isEmpty
-                && dirtyRows.isEmpty && committedFontIsCurrent && hasPresentedOnce
-                && !layoutDamageSnapshot && !hasDirtyContent && !hasPendingScroll
-                && !drawableSizeChanged && !scrollOffsetChanged
-                && !smoothScrolling && !glowEnabled
-                && !isDecoratedSurface
-            let partialHostedContents = rowMode && !layerSnapshot.isEmpty
-                && !dirtyRows.isEmpty && committedFontIsCurrent && hasPresentedOnce
-                && !layoutDamageSnapshot && !hasPendingScroll && !drawableSizeChanged
-                && !scrollOffsetChanged && !smoothScrolling
-                && !glowEnabled && !isDecoratedSurface
-                // Under blur the recompose is only safe as the two passes the
-                // root uses: the background pass overwrites, so a band redrawn
-                // over `.load` cannot accumulate alpha. Fail closed to a full
-                // redraw if those pipelines could not be created.
-                && (!blurEnabled || use2Pass)
+            // Shared with GridSurfaceRenderer: every per-frame decision below
+            // — reuse arms, load action, row-pass plan, background alpha —
+            // comes from one term set. This surface has no dirty-rect state
+            // and no per-layer work term: its hosted layers are outside its
+            // dirty-row set, so they travel in `hostsLayersOutsideDirtySet`.
+            // `commitChangesNoPixels` stays true because every pixel-changing
+            // commit here raises dirty rows, a staged scroll or layout damage.
+            // The root's own rows were shifted by the blit above, so it is
+            // both the band to repaint and the reason to load.
+            //
+            // The cursor is composited after the retained texture, so a frame
+            // with no root row to draw — a cursor move, a blink toggle, an
+            // animating shader's next frame — keeps every row through
+            // `reusesRootContents`/`reusesHostedContents`, which, like the
+            // main surface's skipMainPass, refuse while an ease holds an offset.
+            let frameDecision = SurfaceFrameDecision.make(terms: SurfaceFrameTerms(
+                rowMode: rowMode,
+                rowModeSatisfied: rowMode,
+                hasPresentedOnce: hasPresentedOnce,
+                drawableSizeChanged: drawableSizeChanged,
+                isSmoothScrolling: smoothScrolling,
+                blurEnabled: blurEnabled,
+                useTwoPass: use2Pass,
+                glowEnabled: glowEnabled,
+                isDecoratedSurface: isDecoratedSurface,
+                isPopupmenu: gridId == ZonvieCore.popupmenuGridId,
+                shaderChainConsumesSurface: shaderChainConsumesSurface,
+                configuredBlurAlpha: ZonvieConfig.shared.backgroundAlpha,
+                fontIsCurrent: committedFontIsCurrent,
+                hasLayoutDamage: layoutDamageSnapshot,
+                hasDirtyRows: !dirtyRows.isEmpty,
+                hasStagedScroll: hasPendingScroll,
+                scrollOffsetChanged: scrollOffsetChanged,
+                hostsLayersOutsideDirtySet: !layerSnapshot.isEmpty,
+                scrollBlitKeptBackTexture: useGpuScrollCopy,
+                rootScrollBlitVacatedBand: useGpuScrollCopy
+            ))
+            let backgroundAlpha = frameDecision.backgroundAlpha
+            let reuseHostedContents = frameDecision.reusesHostedContents
+            let reuseRootContents = frameDecision.reusesRootContents
+            let partialHostedContents = frameDecision.partialHostedContents
             if partialHostedContents {
                 ZonvieCore.renderTrace("event=hosted_partial surface=\(gridId) dirty_rows=\(dirtyRows.count)")
             }
-            // Blur can still redraw dirty-only with .load because the 2-pass
-            // background pass overwrites, so alpha does not accumulate — that
-            // avoids a full redraw on every content update under blur.
-            let canDirtyOnlyWithBlur = SurfaceLoadActionTerms.dirtyOnlyWithBlur(
-                rowMode: rowMode,
-                useTwoPass: use2Pass,
-                hasDirtyRowsInRowMode: hasAnyDirtyInRowMode,
-                hasPresentedOnce: hasPresentedOnce,
-                isSmoothScrolling: smoothScrolling,
-                drawableSizeChanged: drawableSizeChanged,
-                glowEnabled: glowEnabled
-            )
-            // Decorated surfaces (ext-cmdline) always clear: their viewport origin offset
-            // means scissor rects for partial redraw don't align correctly.
-            // Shared with GridSurfaceRenderer: SurfaceLoadActionTerms holds
-            // every guard and arm either surface has. This surface has no
-            // dirty-rect state, so that term stays at its default.
-            let loadTerms = SurfaceLoadActionTerms(
-                glowEnabled: glowEnabled,
-                fontIsCurrent: committedFontIsCurrent,
-                hasLayoutDamage: layoutDamageSnapshot,
-                isDecoratedSurface: isDecoratedSurface,
-                layersOutsideDirtySet: !layerSnapshot.isEmpty,
-                useGpuScrollCopy: useGpuScrollCopy,
-                canDirtyOnlyWithBlur: canDirtyOnlyWithBlur,
-                reuseHostedContents: reuseHostedContents,
-                reuseRootContents: reuseRootContents,
-                partialHostedContents: partialHostedContents,
-                hasDirtyRowsInRowMode: hasAnyDirtyInRowMode,
-                isSmoothScrolling: smoothScrolling
-            )
-            let shouldReusePreviousContents = loadTerms.reusesPreviousContents
-            ZonvieCore.drawTrace(loadTerms.traceLine(surface: gridId))
-            rpd.colorAttachments[0].loadAction = resolveSurfaceColorLoadAction(
-                blurEnabled: blurEnabled,
-                hasPresentedOnce: hasPresentedOnce,
-                drawableSizeChanged: drawableSizeChanged,
-                shouldReusePreviousContents: shouldReusePreviousContents,
-                forceReusePreviousContents: loadTerms.forcesReusePreviousContents
-            )
+            ZonvieCore.drawTrace(frameDecision.traceLine(surface: gridId))
+            rpd.colorAttachments[0].loadAction = frameDecision.loadsPreviousContents ? .load : .clear
             rpd.colorAttachments[0].clearColor = makeSurfaceClearColor(
                 bgRGB: surfaceBgRGB,
                 clearAlpha: surfaceClearAlpha
@@ -3031,7 +2986,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             // has always done. The cursor is composited onto the drawable in
             // its own pass below, and the atlas read is released by the command
             // buffer's completion handler either way.
-            let skipSurfacePass = rowMode && (reuseRootContents || reuseHostedContents)
+            let skipSurfacePass = frameDecision.skipsSurfacePass
             if !skipSurfacePass {
                 guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else {
                     // Encoder creation failed (rare). Commit the empty cmd anyway so
@@ -3094,17 +3049,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
 
                     // Shared with GridSurfaceRenderer: WHICH rows this pass
                     // draws is one decision; `use2Pass` says HOW.
-                    let rowPassPlan = SurfaceRowPassTerms(
-                        useTwoPass: use2Pass,
-                        rootScrollBlitVacatedBand: useGpuScrollCopy,
-                        isSmoothScrolling: smoothScrolling,
-                        canDirtyOnlyWithBlur: canDirtyOnlyWithBlur,
-                        loadedPreviousContents: rpd.colorAttachments[0].loadAction == .load,
-                        hasDirtyRows: !dirtyRows.isEmpty,
-                        glowEnabled: glowEnabled,
-                        isDecoratedSurface: isDecoratedSurface,
-                        drawableSizeChanged: drawableSizeChanged
-                    ).plan
+                    let rowPassPlan = frameDecision.rowPassPlan
 
                     encodeSurfaceRootRowPass(
                         encoder: enc,
