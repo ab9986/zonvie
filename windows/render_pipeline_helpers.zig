@@ -365,31 +365,21 @@ pub const MainRowInputs = struct {
     total_cols: u32,
 };
 
-pub const MainRowDisposition = enum {
-    /// MAIN clear: existing row contents are retained.
-    retain_rows,
-    /// The zero-cell transition: no row content survives.
-    layout_only,
-    /// A row the authoritative total_rows does not contain.
-    out_of_range,
-    single_row,
-    /// No per-row vertex boundaries: keep rows and re-seed.
-    multi_row,
-    /// No row payload; only the layout is applied.
-    no_row,
-};
+/// The core's rule (frontend_rules.rootRowDisposition), shared with macOS
+/// through zonvie_core_root_row_disposition.
+pub const MainRowDisposition = core.frontend_rules.RootRowDisposition;
 
 /// Disposition of a grid-1 on_vertices_row callback (after the cursor-only
 /// route), from the zonvie_core.h on_vertices_row contract.
 pub fn mainRowDisposition(in: MainRowInputs) MainRowDisposition {
-    if (!in.main) return .retain_rows;
-    if (in.row_count == 0 and in.vert_count == 0 and (in.total_rows == 0 or in.total_cols == 0)) return .layout_only;
-    if (in.total_rows != 0 and in.row_start >= in.total_rows) return .out_of_range;
-    return switch (in.row_count) {
-        0 => .no_row,
-        1 => .single_row,
-        else => .multi_row,
-    };
+    return core.frontend_rules.rootRowDisposition(
+        if (in.main) .main else .none,
+        in.row_start,
+        in.row_count,
+        in.vert_count,
+        in.total_rows,
+        in.total_cols,
+    );
 }
 
 /// Damage not yet copied from a persistent back buffer into each rotating
@@ -1106,19 +1096,34 @@ pub fn cursorVertsForFrame(comptime V: type, cursor: []const V, blink_visible: b
     return if (blink_visible) cursor else &.{};
 }
 
+/// The core's per-frame surface decision (frontend_rules.surfaceFrameDecision,
+/// shared with macOS) in this driver's terms: translucency is blur with no
+/// two-pass path, a seed or cursor-grid change refuses every reuse arm, and
+/// the rows this paint draws are its dirty rows.
 pub fn paintPolicy(in: PaintPolicyInputs) PaintPolicy {
-    const force_full_rows =
-        in.force_full or
-        in.cursor_grid_changed or
-        in.glow_enabled or
-        (in.opacity < 1.0);
+    const d = core.frontend_rules.surfaceFrameDecision(.{
+        .has_presented_once = in.back_tex_valid,
+        .blur_enabled = in.opacity < 1.0,
+        .glow_enabled = in.glow_enabled,
+        .has_dirty_rows = true,
+        .refuses_reuse = in.force_full or in.cursor_grid_changed,
+    });
     return .{
-        .force_full_rows = force_full_rows,
+        .force_full_rows = d.redraws_everything,
         // Keeping the previous frame is only safe when nothing forces a full
-        // redraw AND that frame is still there. A frame this returns false for
-        // redraws every row anyway, so clearing costs nothing it needs.
-        .preserve_back = !force_full_rows and in.back_tex_valid,
+        // redraw AND that frame is still there.
+        .preserve_back = d.loads_previous_contents,
     };
+}
+
+/// Present rects one paint can add, reserved before the row pass so no driver
+/// allocates in its paint path: one span per row of the FINAL redraw set,
+/// one rect per layer, and the driver's fixed rects. The redraw set starts
+/// with rows below `max_valid_row`, and the row pass only ever adds rows
+/// below `total_rows` (scroll shift, layer reach), so it never holds more
+/// rows than the larger of the two.
+pub fn presentRectCapacity(max_valid_row: u32, total_rows: u32, layers: usize, fixed_rects: usize) usize {
+    return @as(usize, @max(max_valid_row, total_rows)) + layers + fixed_rects;
 }
 
 /// The main driver's seed state. Only the main surface has one (the core seeds

@@ -676,11 +676,10 @@ final class MetalTerminalView: GridInputView {
         renderer.submitVerticesRowRaw(rowStart: rowStart, rowCount: rowCount, ptr: ptr, count: count, flags: flags, totalRows: totalRows, totalCols: totalCols)
 
         let update = VertexRowUpdate(flags: flags)
-        let isZeroCellLayout =
-            rowCount == 0
-            && count == 0
-            && update == .main
-            && (totalRows == 0 || totalCols == 0)
+        // The core's rule for a root's row callback, shared with Windows.
+        let isZeroCellLayout = zonvie_core_root_row_disposition(
+            flags, UInt32(rowStart), UInt32(rowCount), count, UInt32(totalRows), UInt32(totalCols)
+        ) == UInt8(ZONVIE_ROOT_ROW_LAYOUT_ONLY)
         if isZeroCellLayout {
             let fullDrawableRectPx = NSRect(
                 x: 0,

@@ -572,6 +572,88 @@ ZONVIE_API bool zonvie_core_press_claim_press(zonvie_press_claim *claim, uint8_t
    ENDS when no button is held after it. */
 ZONVIE_API uint8_t zonvie_core_press_claim_release(zonvie_press_claim *claim, uint8_t button);
 
+/* Which layer one on_vertices_row callback updates (the zonvie_core.h
+   contract): MAIN replaces the row, CURSOR_ONLY leaves it, NONE leaves both
+   layers. Both bits set never occurs; it decodes as MAIN.
+
+   Pure — no core pointer, no lock. */
+#define ZONVIE_ROW_UPDATE_NONE 0u
+#define ZONVIE_ROW_UPDATE_MAIN 1u
+#define ZONVIE_ROW_UPDATE_CURSOR_ONLY 2u
+ZONVIE_API uint8_t zonvie_core_row_update(uint32_t flags);
+
+/* What a surface root's on_vertices_row callback means for its stored rows:
+   RETAIN_ROWS when MAIN is not set; LAYOUT_ONLY for the zero-cell transition
+   (row_count 0, no vertices, a zero dimension); OUT_OF_RANGE for a row at or
+   past the authoritative total_rows; else by row_count: NO_ROW (0),
+   SINGLE_ROW (1), MULTI_ROW (more, which the core never sends).
+
+   Pure — no core pointer, no lock. */
+#define ZONVIE_ROOT_ROW_RETAIN_ROWS 0u
+#define ZONVIE_ROOT_ROW_LAYOUT_ONLY 1u
+#define ZONVIE_ROOT_ROW_OUT_OF_RANGE 2u
+#define ZONVIE_ROOT_ROW_SINGLE_ROW 3u
+#define ZONVIE_ROOT_ROW_MULTI_ROW 4u
+#define ZONVIE_ROOT_ROW_NO_ROW 5u
+ZONVIE_API uint8_t zonvie_core_root_row_disposition(
+    uint32_t flags, uint32_t row_start, uint32_t row_count, size_t vert_count,
+    uint32_t total_rows, uint32_t total_cols);
+
+/* What a surface knows about one frame, after its scroll blit ran and before
+   its render pass is described. Every draw/paint driver decides from these
+   whether the frame keeps the previous back buffer, which rows it draws and
+   what alpha backgrounds take. A surface without a concept leaves the term at
+   the value that cannot change its own answer (the defaults noted). */
+typedef struct zonvie_surface_frame_terms {
+    bool row_mode;                       /* default true */
+    bool row_mode_satisfied;             /* default true */
+    bool has_presented_once;             /* previous pixels exist (back_tex valid) */
+    bool drawable_size_changed;
+    bool is_smooth_scrolling;
+    bool blur_enabled;                   /* translucent compositing (opacity < 1) */
+    bool use_two_pass;                   /* blur's overwrite path exists */
+    bool glow_enabled;
+    bool is_decorated_surface;
+    bool is_popupmenu;
+    bool shader_chain_consumes_surface;
+    bool font_is_current;                /* default true */
+    bool has_layout_damage;
+    bool has_dirty_rect;
+    bool has_dirty_rows;
+    bool has_layer_work;
+    bool commit_changes_no_pixels;       /* default true */
+    bool has_staged_scroll;
+    bool scroll_offset_changed;
+    bool hosts_layers_outside_dirty_set;
+    bool scroll_blit_kept_back_texture;
+    bool root_scroll_blit_vacated_band;
+    bool refuses_reuse;                  /* the driver's own repaint-everything */
+    float configured_blur_alpha;         /* default 1 */
+} zonvie_surface_frame_terms;
+
+#define ZONVIE_ROW_PASS_DIRTY_ROWS_ONLY 0u
+#define ZONVIE_ROW_PASS_DIRTY_ROWS_AFTER_SCROLL_BLIT 1u
+#define ZONVIE_ROW_PASS_ALL_ROWS_WITH_RETAINED 2u
+#define ZONVIE_ROW_PASS_ALL_ROWS 3u
+
+typedef struct zonvie_surface_frame_decision {
+    bool reuses_root_contents;
+    bool reuses_hosted_contents;
+    bool partial_hosted_contents;
+    bool skips_surface_pass;
+    bool can_dirty_only_with_blur;
+    /* The pass loads (keeps) the previous back buffer instead of clearing it. */
+    bool loads_previous_contents;
+    /* No reuse arm is open at all: every row is redrawn. */
+    bool redraws_everything;
+    uint8_t row_pass_plan;               /* ZONVIE_ROW_PASS_* */
+    float background_alpha;
+} zonvie_surface_frame_decision;
+
+/* Pure — no core pointer, no lock. */
+ZONVIE_API void zonvie_core_surface_frame_decision(
+    const zonvie_surface_frame_terms *terms, zonvie_surface_frame_decision *out);
+
 /* Mini window content as shown: a trailing newline dropped, and past ten
    lines the first nine plus a "…(N more lines)" line. Written to `out`
    (UTF-8, not NUL-terminated), cut at a UTF-8 boundary with '…' when it does

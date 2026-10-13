@@ -74,6 +74,447 @@ test "externalizing selects the tab by its 1-based number" {
 }
 
 // ---------------------------------------------------------------------------
+// on_vertices_row
+
+/// Which layer one on_vertices_row callback updates (zonvie_core.h): MAIN
+/// replaces the row, CURSOR without MAIN is cursor-only and leaves the row,
+/// neither leaves both layers as they were. Both set never occurs; the core
+/// sets the flags from an enum, and a consumer that sees it keeps MAIN.
+pub const RowUpdate = enum(u8) { none = 0, main = 1, cursor_only = 2 };
+
+/// The on_vertices_row flag bits (ZONVIE_VERT_UPDATE_*); c_api re-exports them.
+pub const VERT_UPDATE_MAIN: u32 = 1 << 0;
+pub const VERT_UPDATE_CURSOR: u32 = 1 << 1;
+
+pub fn rowUpdate(flags: u32) RowUpdate {
+    if (flags & VERT_UPDATE_MAIN != 0) return .main;
+    if (flags & VERT_UPDATE_CURSOR != 0) return .cursor_only;
+    return .none;
+}
+
+/// What a MAIN callback for a surface root means for the stored rows.
+pub const RootRowDisposition = enum(u8) {
+    /// MAIN not set: existing row contents are retained.
+    retain_rows = 0,
+    /// The zero-cell transition: no row content survives, only the layout.
+    layout_only = 1,
+    /// A row the authoritative total_rows does not contain.
+    out_of_range = 2,
+    single_row = 3,
+    /// Never sent by the core (row_count is 0 or 1); a consumer keeps its
+    /// rows and re-seeds.
+    multi_row = 4,
+    /// No row payload with a non-zero shape; only the layout is applied.
+    no_row = 5,
+};
+
+/// From the zonvie_core.h on_vertices_row contract: the layout-only shape is
+/// row_count 0, no vertices and a zero dimension; total_rows is authoritative
+/// so a row at or past it is not row content; otherwise the row count says.
+pub fn rootRowDisposition(update: RowUpdate, row_start: u32, row_count: u32, vert_count: usize, total_rows: u32, total_cols: u32) RootRowDisposition {
+    if (update != .main) return .retain_rows;
+    if (row_count == 0 and vert_count == 0 and (total_rows == 0 or total_cols == 0)) return .layout_only;
+    if (total_rows != 0 and row_start >= total_rows) return .out_of_range;
+    return switch (row_count) {
+        0 => .no_row,
+        1 => .single_row,
+        else => .multi_row,
+    };
+}
+
+test "a row update is MAIN, cursor-only, or neither; MAIN wins the never-sent both" {
+    try std.testing.expectEqual(RowUpdate.none, rowUpdate(0));
+    try std.testing.expectEqual(RowUpdate.main, rowUpdate(VERT_UPDATE_MAIN));
+    try std.testing.expectEqual(RowUpdate.cursor_only, rowUpdate(VERT_UPDATE_CURSOR));
+    try std.testing.expectEqual(RowUpdate.main, rowUpdate(VERT_UPDATE_MAIN | VERT_UPDATE_CURSOR));
+    // Foreign bits never promote a send.
+    const foreign: u32 = ~(VERT_UPDATE_MAIN | VERT_UPDATE_CURSOR);
+    try std.testing.expectEqual(RowUpdate.none, rowUpdate(foreign));
+    try std.testing.expectEqual(RowUpdate.cursor_only, rowUpdate(foreign | VERT_UPDATE_CURSOR));
+}
+
+test "root row disposition follows the on_vertices_row contract" {
+    const D = RootRowDisposition;
+    const Case = struct { update: RowUpdate, row_start: u32, row_count: u32, vert_count: usize, rows: u32, cols: u32, want: D };
+    const cases = [_]Case{
+        // "When MAIN is not set, existing row contents must be retained."
+        .{ .update = .cursor_only, .row_start = 0, .row_count = 1, .vert_count = 6, .rows = 4, .cols = 10, .want = .retain_rows },
+        .{ .update = .none, .row_start = 0, .row_count = 0, .vert_count = 0, .rows = 0, .cols = 0, .want = .retain_rows },
+        // Layout-only zero-cell transition: row_count 0, no verts, a zero dimension.
+        .{ .update = .main, .row_start = 0, .row_count = 0, .vert_count = 0, .rows = 0, .cols = 10, .want = .layout_only },
+        .{ .update = .main, .row_start = 0, .row_count = 0, .vert_count = 0, .rows = 4, .cols = 0, .want = .layout_only },
+        .{ .update = .main, .row_start = 0, .row_count = 0, .vert_count = 0, .rows = 0, .cols = 0, .want = .layout_only },
+        // Both dimensions non-zero: not a zero-cell layout.
+        .{ .update = .main, .row_start = 0, .row_count = 0, .vert_count = 0, .rows = 4, .cols = 10, .want = .no_row },
+        // total_rows is authoritative: a row outside it is not row content.
+        .{ .update = .main, .row_start = 4, .row_count = 1, .vert_count = 6, .rows = 4, .cols = 10, .want = .out_of_range },
+        .{ .update = .main, .row_start = 9, .row_count = 0, .vert_count = 0, .rows = 4, .cols = 10, .want = .out_of_range },
+        // No row count yet (first seed): a row payload is still row content.
+        .{ .update = .main, .row_start = 0, .row_count = 1, .vert_count = 6, .rows = 0, .cols = 10, .want = .single_row },
+        .{ .update = .main, .row_start = 3, .row_count = 1, .vert_count = 6, .rows = 4, .cols = 10, .want = .single_row },
+        // An empty row is still a row: it replaces the old contents.
+        .{ .update = .main, .row_start = 0, .row_count = 1, .vert_count = 0, .rows = 4, .cols = 10, .want = .single_row },
+        .{ .update = .main, .row_start = 0, .row_count = 2, .vert_count = 12, .rows = 4, .cols = 10, .want = .multi_row },
+    };
+    for (cases) |cs| {
+        try std.testing.expectEqual(cs.want, rootRowDisposition(cs.update, cs.row_start, cs.row_count, cs.vert_count, cs.rows, cs.cols));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Surface frame decision
+
+/// What a surface knows about one frame, after its scroll blit ran and before
+/// its render pass is described. Both macOS draw drivers and both Windows
+/// paint drivers decided from these facts whether the frame may keep the
+/// previous back buffer, which rows it draws and what alpha backgrounds take.
+/// A surface that lacks a concept leaves the term at the value that cannot
+/// change its own answer. Plain bools and one float, laid out for the C ABI.
+pub const SurfaceFrameTerms = extern struct {
+    /// Row vertices are in use, so dirty rows describe the frame.
+    row_mode: bool = true,
+    /// Row mode is a precondition of skipping the pass. A surface whose
+    /// whole-grid gate already returned passes true regardless of row_mode.
+    row_mode_satisfied: bool = true,
+    /// Pixels at these coordinates exist from a previous frame (macOS: has
+    /// presented once; Windows: back_tex is valid).
+    has_presented_once: bool = false,
+    drawable_size_changed: bool = false,
+    is_smooth_scrolling: bool = false,
+    /// The surface composites translucently, so blending a partial redraw over
+    /// the previous frame accumulates alpha (macOS blur; Windows opacity < 1).
+    blur_enabled: bool = false,
+    /// Blur's two-pass background/glyph pipelines exist, so a dirty-only
+    /// redraw overwrites instead of blending. Windows has none.
+    use_two_pass: bool = false,
+    glow_enabled: bool = false,
+    /// ext-cmdline and friends: a viewport origin offset means partial scissor
+    /// rects do not line up, so they never reuse the back texture.
+    is_decorated_surface: bool = false,
+    /// The popupmenu keeps every cell's own opaque background.
+    is_popupmenu: bool = false,
+    /// The back texture goes through the decorated custom-shader chain, which
+    /// discards alpha.
+    shader_chain_consumes_surface: bool = false,
+    /// The committed rows were generated with the font metrics in force now.
+    font_is_current: bool = true,
+    /// The layout moved under this surface.
+    has_layout_damage: bool = false,
+    /// A damaged pixel rectangle no row expresses.
+    has_dirty_rect: bool = false,
+    /// The pass has rows to draw this frame.
+    has_dirty_rows: bool = false,
+    /// A layer drawn from this surface's own pass owes work.
+    has_layer_work: bool = false,
+    /// The commit this frame draws changed no back-texture pixel.
+    commit_changes_no_pixels: bool = true,
+    has_staged_scroll: bool = false,
+    scroll_offset_changed: bool = false,
+    /// This surface hosts layers whose contents are not in its dirty-row set.
+    hosts_layers_outside_dirty_set: bool = false,
+    /// A GPU scroll blit shifted pixels in the back texture this frame.
+    scroll_blit_kept_back_texture: bool = false,
+    /// The blit shifted the root pass's own rows.
+    root_scroll_blit_vacated_band: bool = false,
+    /// The driver's own "repaint everything" request (a seed, a resize, the
+    /// cursor moving to another grid). Refuses every reuse arm.
+    refuses_reuse: bool = false,
+    /// The configured background alpha for a blurred, undecorated surface.
+    configured_blur_alpha: f32 = 1,
+};
+
+/// Which rows a surface's own pass draws (zonvie_frontend.h ZONVIE_ROW_PASS_*).
+pub const RowPassPlan = enum(u8) {
+    dirty_rows_only = 0,
+    dirty_rows_after_scroll_blit = 1,
+    all_rows_with_retained = 2,
+    all_rows = 3,
+};
+
+pub const SurfaceFrameDecision = extern struct {
+    /// Nothing draws into the back texture and no hosted layer is outside the
+    /// dirty set: the whole pass is skipped.
+    reuses_root_contents: bool,
+    /// Nothing draws and the hosted layers outside the dirty set are unchanged.
+    reuses_hosted_contents: bool,
+    /// Hosted layers unchanged but some rows dirty: recompose those bands.
+    partial_hosted_contents: bool,
+    skips_surface_pass: bool,
+    /// Under blur, a dirty-only redraw is still safe (two-pass overwrites).
+    can_dirty_only_with_blur: bool,
+    /// The render pass loads (keeps) the previous back buffer instead of
+    /// clearing it. Windows: preserve_back.
+    loads_previous_contents: bool,
+    /// No reuse arm is open to this frame at all: a guard refused, or the
+    /// surface blends and has no two-pass path. Every row is redrawn.
+    /// Windows: force_full_rows. On macOS the same fact reaches the plan.
+    redraws_everything: bool,
+    row_pass_plan: RowPassPlan,
+    /// The alpha the row shader multiplies background colours by.
+    background_alpha: f32,
+};
+
+fn dirtyOnlyWithBlur(t: SurfaceFrameTerms, has_any_dirty_in_row_mode: bool) bool {
+    return t.row_mode and t.use_two_pass and has_any_dirty_in_row_mode and
+        t.has_presented_once and !t.is_smooth_scrolling and !t.drawable_size_changed and !t.glow_enabled;
+}
+
+pub fn surfaceBackgroundAlpha(blur_enabled: bool, is_decorated_surface: bool, shader_chain_consumes_surface: bool, is_popupmenu: bool, configured_blur_alpha: f32) f32 {
+    if (is_popupmenu) return 1.0;
+    if (is_decorated_surface) {
+        if (shader_chain_consumes_surface) return 1.0;
+        return if (blur_enabled) 0.0 else 1.0;
+    }
+    return if (blur_enabled) configured_blur_alpha else 1.0;
+}
+
+pub fn surfaceFrameDecision(t: SurfaceFrameTerms) SurfaceFrameDecision {
+    // Guards: any one refuses reuse outright.
+    const guards_allow = !t.glow_enabled and t.font_is_current and !t.has_layout_damage and
+        !t.is_decorated_surface and !t.refuses_reuse;
+    const reuse_guards = guards_allow and t.row_mode_satisfied and t.has_presented_once and
+        !t.has_staged_scroll and !t.drawable_size_changed and !t.scroll_offset_changed and
+        !t.is_smooth_scrolling;
+    const no_surface_work = reuse_guards and t.commit_changes_no_pixels and
+        !t.has_dirty_rows and !t.has_layer_work and !t.has_dirty_rect;
+    const reuses_root = no_surface_work and !t.hosts_layers_outside_dirty_set;
+    const reuses_hosted = no_surface_work and t.hosts_layers_outside_dirty_set;
+    // Under blur the recompose is only safe as the two passes; fail closed.
+    const partial_hosted = reuse_guards and t.hosts_layers_outside_dirty_set and t.has_dirty_rows and
+        (!t.blur_enabled or t.use_two_pass);
+
+    const has_any_dirty_in_row_mode = t.row_mode and (t.has_dirty_rows or t.has_layer_work);
+    const dirty_blur = dirtyOnlyWithBlur(t, has_any_dirty_in_row_mode);
+
+    // Arms: any one permits reuse. A forced arm holds even under blur.
+    const layers_ok = !t.hosts_layers_outside_dirty_set or reuses_hosted or partial_hosted;
+    const reuses = guards_allow and layers_ok and
+        (t.scroll_blit_kept_back_texture or dirty_blur or reuses_hosted or reuses_root or partial_hosted or
+            (!t.is_smooth_scrolling and (t.has_dirty_rect or has_any_dirty_in_row_mode)));
+    const forces = guards_allow and
+        (t.scroll_blit_kept_back_texture or dirty_blur or reuses_hosted or reuses_root);
+    const frame_present = t.has_presented_once and !t.drawable_size_changed;
+    const loads = frame_present and (forces or (!t.blur_enabled and reuses));
+
+    const plan: RowPassPlan = blk: {
+        const has_dirty = t.has_dirty_rows or t.has_layer_work;
+        if (t.use_two_pass) {
+            if (t.root_scroll_blit_vacated_band) break :blk .dirty_rows_after_scroll_blit;
+            if (dirty_blur and loads) break :blk .dirty_rows_only;
+            break :blk .all_rows_with_retained;
+        }
+        if (t.is_smooth_scrolling) break :blk .all_rows_with_retained;
+        if (t.root_scroll_blit_vacated_band) break :blk .dirty_rows_after_scroll_blit;
+        if (!t.is_decorated_surface and !t.glow_enabled and has_dirty and !t.drawable_size_changed and loads) {
+            break :blk .dirty_rows_only;
+        }
+        break :blk .all_rows;
+    };
+
+    return .{
+        .reuses_root_contents = reuses_root,
+        .reuses_hosted_contents = reuses_hosted,
+        .partial_hosted_contents = partial_hosted,
+        .skips_surface_pass = reuses_root or reuses_hosted,
+        .can_dirty_only_with_blur = dirty_blur,
+        .loads_previous_contents = loads,
+        .redraws_everything = !guards_allow or (t.blur_enabled and !t.use_two_pass),
+        .row_pass_plan = plan,
+        .background_alpha = surfaceBackgroundAlpha(t.blur_enabled, t.is_decorated_surface, t.shader_chain_consumes_surface, t.is_popupmenu, t.configured_blur_alpha),
+    };
+}
+
+fn termBit(mask: usize, i: u6) bool {
+    return (mask >> i) & 1 == 1;
+}
+
+// GridSurfaceRenderer.draw as it stood before the decision was shared (the
+// oracle D3 transcribed): every assignment of its 13 terms. A skipped pass
+// answers "load" (the texture is kept); every other frame must agree exactly.
+test "surface frame decision agrees with the main window's original logic" {
+    var skip_seen = [2]usize{ 0, 0 };
+    var load_seen = [2]usize{ 0, 0 };
+    var mask: usize = 0;
+    while (mask < (1 << 13)) : (mask += 1) {
+        const row_mode = termBit(mask,0);
+        const blur = termBit(mask,1);
+        const use2pass = blur and termBit(mask, 2);
+        const dirty = termBit(mask,3);
+        const layer_work = termBit(mask,4);
+        const presented = termBit(mask,5);
+        const smooth = termBit(mask,6);
+        const size_chg = termBit(mask,7);
+        const glow = termBit(mask,8);
+        const gpu_scroll = termBit(mask,9);
+        const rect = termBit(mask,10);
+        const new_commit = termBit(mask,11);
+        const cursor_only = termBit(mask,12);
+
+        const no_main_work = (!new_commit or cursor_only) and !dirty and !layer_work and !rect and !smooth and !size_chg and presented;
+        const skip_main_pass = no_main_work and !glow;
+        const has_any_dirty = row_mode and (dirty or layer_work);
+        const dirty_blur = row_mode and use2pass and has_any_dirty and presented and !smooth and !size_chg and !glow;
+        const should_reuse = !glow and (gpu_scroll or dirty_blur or (!smooth and (rect or has_any_dirty)));
+        const force_reuse = !glow and (gpu_scroll or dirty_blur);
+        const load = (presented and !size_chg and force_reuse) or (!blur and presented and !size_chg and should_reuse);
+        const plan: RowPassPlan = if (use2pass)
+            (if (dirty_blur and load) .dirty_rows_only else .all_rows_with_retained)
+        else if (smooth)
+            .all_rows_with_retained
+        else if (!glow and (dirty or layer_work) and !size_chg and load)
+            .dirty_rows_only
+        else
+            .all_rows;
+
+        const d = surfaceFrameDecision(.{
+            .row_mode = row_mode,
+            .has_presented_once = presented,
+            .drawable_size_changed = size_chg,
+            .is_smooth_scrolling = smooth,
+            .blur_enabled = blur,
+            .use_two_pass = use2pass,
+            .glow_enabled = glow,
+            .has_dirty_rect = rect,
+            .has_dirty_rows = dirty,
+            .has_layer_work = layer_work,
+            .commit_changes_no_pixels = !new_commit or cursor_only,
+            .scroll_blit_kept_back_texture = gpu_scroll,
+        });
+        try std.testing.expectEqual(skip_main_pass, d.skips_surface_pass);
+        try std.testing.expect(!d.reuses_hosted_contents);
+        try std.testing.expect(!d.partial_hosted_contents);
+        try std.testing.expectEqual(dirty_blur, d.can_dirty_only_with_blur);
+        if (skip_main_pass) {
+            try std.testing.expect(d.loads_previous_contents);
+        } else {
+            try std.testing.expectEqual(load, d.loads_previous_contents);
+            try std.testing.expectEqual(plan, d.row_pass_plan);
+        }
+        try std.testing.expect(d.row_pass_plan != .dirty_rows_after_scroll_blit);
+        skip_seen[@intFromBool(d.skips_surface_pass)] += 1;
+        load_seen[@intFromBool(d.loads_previous_contents)] += 1;
+    }
+    // Every decision took both values, or a loop above asserted nothing.
+    try std.testing.expect(skip_seen[0] > 0 and skip_seen[1] > 0);
+    try std.testing.expect(load_seen[0] > 0 and load_seen[1] > 0);
+}
+
+// ExternalGridView.draw as it stood: every assignment of its 15 terms.
+test "surface frame decision agrees with the external window's original logic" {
+    var plans_seen = [4]usize{ 0, 0, 0, 0 };
+    var mask: usize = 0;
+    while (mask < (1 << 15)) : (mask += 1) {
+        const row_mode = termBit(mask,0);
+        const has_layers = termBit(mask,1);
+        const font_current = termBit(mask,2);
+        const presented = termBit(mask,3);
+        const layout_damage = termBit(mask,4);
+        const dirty = termBit(mask,5);
+        const pending_scroll = termBit(mask,6);
+        const size_chg = termBit(mask,7);
+        const scroll_off = termBit(mask,8);
+        const smooth = termBit(mask,9);
+        const glow = termBit(mask,10);
+        const decorated = termBit(mask,11);
+        const blur = termBit(mask,12);
+        const use2pass = blur and termBit(mask, 13);
+        const gpu_scroll = termBit(mask,14);
+
+        const guards = font_current and presented and !layout_damage and !pending_scroll and !size_chg and !scroll_off and !smooth and !glow and !decorated;
+        const reuse_hosted = row_mode and has_layers and guards and !dirty;
+        const reuse_root = row_mode and !has_layers and !dirty and guards;
+        const partial_hosted = row_mode and has_layers and dirty and guards and (!blur or use2pass);
+        const skip = row_mode and (reuse_root or reuse_hosted);
+        const has_any_dirty = row_mode and dirty;
+        const dirty_blur = row_mode and use2pass and has_any_dirty and presented and !smooth and !size_chg and !glow;
+        const should_reuse = font_current and !layout_damage and (!has_layers or reuse_hosted or partial_hosted) and !decorated and !glow and
+            (partial_hosted or reuse_hosted or reuse_root or gpu_scroll or dirty_blur or (!smooth and has_any_dirty));
+        const force_reuse = font_current and !layout_damage and !decorated and !glow and (reuse_hosted or reuse_root or gpu_scroll or dirty_blur);
+        const load = (presented and !size_chg and force_reuse) or (!blur and presented and !size_chg and should_reuse);
+        const plan: RowPassPlan = if (use2pass)
+            (if (gpu_scroll) .dirty_rows_after_scroll_blit else if (dirty_blur and load) .dirty_rows_only else .all_rows_with_retained)
+        else if (smooth)
+            .all_rows_with_retained
+        else if (gpu_scroll)
+            .dirty_rows_after_scroll_blit
+        else if (!decorated and !glow and dirty and !size_chg and load)
+            .dirty_rows_only
+        else
+            .all_rows;
+
+        const d = surfaceFrameDecision(.{
+            .row_mode = row_mode,
+            .row_mode_satisfied = row_mode,
+            .has_presented_once = presented,
+            .drawable_size_changed = size_chg,
+            .is_smooth_scrolling = smooth,
+            .blur_enabled = blur,
+            .use_two_pass = use2pass,
+            .glow_enabled = glow,
+            .is_decorated_surface = decorated,
+            .font_is_current = font_current,
+            .has_layout_damage = layout_damage,
+            .has_dirty_rows = dirty,
+            .has_staged_scroll = pending_scroll,
+            .scroll_offset_changed = scroll_off,
+            .hosts_layers_outside_dirty_set = has_layers,
+            .scroll_blit_kept_back_texture = gpu_scroll,
+            .root_scroll_blit_vacated_band = gpu_scroll,
+        });
+        try std.testing.expectEqual(reuse_hosted, d.reuses_hosted_contents);
+        try std.testing.expectEqual(reuse_root, d.reuses_root_contents);
+        try std.testing.expectEqual(partial_hosted, d.partial_hosted_contents);
+        try std.testing.expectEqual(skip, d.skips_surface_pass);
+        try std.testing.expectEqual(dirty_blur, d.can_dirty_only_with_blur);
+        try std.testing.expectEqual(load, d.loads_previous_contents);
+        try std.testing.expectEqual(plan, d.row_pass_plan);
+        plans_seen[@intFromEnum(d.row_pass_plan)] += 1;
+    }
+    for (plans_seen) |n| try std.testing.expect(n > 0);
+}
+
+// The Windows paint policy as it stood: force_full_rows = force_full or
+// cursor_grid_changed or glow or opacity < 1; preserve_back = !force_full_rows
+// and back_tex_valid. Its terms map onto the shared ones (translucency is
+// blur without a two-pass path; a seed or cursor-grid change refuses reuse).
+test "surface frame decision reproduces the Windows paint policy" {
+    var mask: usize = 0;
+    while (mask < (1 << 5)) : (mask += 1) {
+        const force_full = termBit(mask,0);
+        const cursor_grid_changed = termBit(mask,1);
+        const glow = termBit(mask,2);
+        const translucent = termBit(mask,3);
+        const back_tex_valid = termBit(mask,4);
+        const force_full_rows = force_full or cursor_grid_changed or glow or translucent;
+        const preserve_back = !force_full_rows and back_tex_valid;
+
+        const d = surfaceFrameDecision(.{
+            .has_presented_once = back_tex_valid,
+            .blur_enabled = translucent,
+            .glow_enabled = glow,
+            .has_dirty_rows = true,
+            .refuses_reuse = force_full or cursor_grid_changed,
+        });
+        try std.testing.expectEqual(force_full_rows, d.redraws_everything);
+        try std.testing.expectEqual(preserve_back, d.loads_previous_contents);
+    }
+}
+
+test "background alpha: popupmenu opaque, decorated transparent under blur unless a shader chain consumes it" {
+    var mask: usize = 0;
+    while (mask < (1 << 4)) : (mask += 1) {
+        const blur = termBit(mask,0);
+        const decorated = termBit(mask,1);
+        const shader = termBit(mask,2);
+        const pmenu = termBit(mask,3);
+        for ([_]f32{ 0, 0.35, 0.8, 1 }) |cfg| {
+            const want: f32 = if (pmenu) 1 else if (decorated) (if (shader) 1 else if (blur) 0 else 1) else if (blur) cfg else 1;
+            try std.testing.expectEqual(want, surfaceBackgroundAlpha(blur, decorated, shader, pmenu, cfg));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Mouse modifiers
 
 /// The modifier string of nvim_input_mouse ("S", "C", "A", "D" in that

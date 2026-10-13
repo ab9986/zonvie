@@ -476,8 +476,7 @@ fn drawDecoratedExternalSurface(
     vert_count: usize,
     cmdline_firstc: u8,
     scratch: *std.ArrayListUnmanaged(app_mod.Vertex),
-    glow_enabled: bool,
-    glow_intensity: f32,
+    glow: app_mod.GlowPaintSettings,
 ) !bool {
     const content = verts[0..vert_count];
     const window_w: f32 = @floatFromInt(g.width);
@@ -570,8 +569,8 @@ fn drawDecoratedExternalSurface(
     };
     const drawn = scratch.items[0..total];
     try g.drawEx(drawn, &[_]app_mod.Vertex{}, null, .{});
-    if (glow_enabled) {
-        g.drawBloomFromVerts(drawn, &[_]app_mod.Vertex{}, glow_intensity, 0, 0, g.width, g.height);
+    if (glow.enabled) {
+        g.drawBloomFromVerts(drawn, &[_]app_mod.Vertex{}, glow.intensity, 0, 0, g.width, g.height);
     }
     return true;
 }
@@ -798,7 +797,7 @@ fn drawNormalExternalSurfaceRowMode(
     var present = app_mod.PresentRectBuilder.begin(
         &ext_win.surf.paint.present_rects,
         app.alloc,
-        @as(usize, @max(rows_to_draw.items.len, ext_rows)) + 5 + tbs_snap.layers.len,
+        render_pipeline_helpers.presentRectCapacity(ext_rows, ext_rows, tbs_snap.layers.len, 5),
     );
 
     // Shared with the main window. An external window's back_tex is always
@@ -3181,8 +3180,6 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     if (c.IsIconic(hwnd) != 0) return;
 
     const glow = app_mod.glowPaintSettings(app);
-    const glow_enabled = glow.enabled;
-    const glow_intensity = glow.intensity;
     const glow_radius_scale = glow.radius_scale;
 
     app.mu.lockUncancelable(core.clock.io());
@@ -3421,7 +3418,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             // by an earlier normal row-mode incarnation of this window.
             ext_win.surf.dropRowVBs(app);
 
-            const drawn = drawDecoratedExternalSurface(surface_kind, g, app, grid_id, verts, vert_count, cmdline_firstc, &ext_win.decorated_scratch, glow_enabled, glow_intensity) catch |e| {
+            const drawn = drawDecoratedExternalSurface(surface_kind, g, app, grid_id, verts, vert_count, cmdline_firstc, &ext_win.decorated_scratch, glow) catch |e| {
                 if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow decorated draw failed: {any}\n", .{e});
                 requeueExternalFullPaint(app, grid_id, hwnd);
                 return;
@@ -3431,8 +3428,22 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                 ext_win.surf.completePaintRetry();
                 return;
             }
+            // The same gate the row drivers answer. A decorated draw clears
+            // and repaints the whole surface and keeps no damage list, so
+            // it is a forced-full frame with no rects: the gate presents it
+            // to every swapchain buffer.
+            const decorated_gate = render_pipeline_helpers.presentGate(.{
+                .force_full_rows = true,
+                .preserve_back = false,
+                .rows = 0,
+                .rows_to_draw = 0,
+                .skipped_empty = 0,
+                .custom_shader = g.custom_shader_pipelines.items.len != 0,
+                .present_rects = 0,
+            });
+            std.debug.assert(decorated_gate.verdict == .present and decorated_gate.full);
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow draw succeeded, presenting\n", .{});
-            g.presentFromBack(&.{}, true) catch |e| {
+            g.presentFromBack(&.{}, decorated_gate.full) catch |e| {
                 if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow present failed: {any}\n", .{e});
                 requeueExternalFullPaint(app, grid_id, hwnd);
                 return;

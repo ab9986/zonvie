@@ -497,27 +497,6 @@ func provisionSurfaceRowCapacity(
     return ledger.requiredRows == 0 ? .ready : .retry
 }
 
-/// What one on_vertices_row callback updates, decoded once for every surface
-/// (zonvie_core.h): MAIN replaces the rows, CURSOR without MAIN is
-/// cursor-only, and neither leaves both layers as they were.
-enum VertexRowUpdate {
-    case main, cursorOnly, none
-
-    init(flags: UInt32) {
-        // The core sets exactly one of MAIN and CURSOR; both is a core bug.
-        // Release keeps the MAIN-wins fallback below.
-        assert(flags & UInt32(ZONVIE_VERT_UPDATE_MAIN) == 0 || flags & UInt32(ZONVIE_VERT_UPDATE_CURSOR) == 0,
-               "on_vertices_row flags set both MAIN and CURSOR")
-        if flags & UInt32(ZONVIE_VERT_UPDATE_MAIN) != 0 {
-            self = .main
-        } else if flags & UInt32(ZONVIE_VERT_UPDATE_CURSOR) != 0 {
-            self = .cursorOnly
-        } else {
-            self = .none
-        }
-    }
-}
-
 /// Encode the user's custom post-process chain, sampling `input` and writing
 /// the last pass into `output`.
 ///

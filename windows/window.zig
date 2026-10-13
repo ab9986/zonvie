@@ -2399,14 +2399,19 @@ fn paintMainWindow(hwnd: c.HWND, app: *App, log_enabled: bool) void {
             }
 
             // Reserve every rect this paint can add: one span per
-            // dirty row, the copied paint damage, one per layer,
-            // and eight singletons — restored and captured
-            // scrollbar, rcPaint, gutter, cursor, three chrome
-            // strips.
+            // row the pass may end up redrawing, the copied paint
+            // damage, one per layer, and eight singletons — restored
+            // and captured scrollbar, rcPaint, gutter, cursor, three
+            // chrome strips.
             var present = app_mod.PresentRectBuilder.begin(
                 &app.surf.paint.present_rects,
                 app.alloc,
-                rows_to_draw.items.len + paint_rects_snapshot.items.len + tbs_snapshot.layers.len + 8,
+                render_helpers.presentRectCapacity(
+                    max_valid_row,
+                    effective_rows,
+                    tbs_snapshot.layers.len,
+                    paint_rects_snapshot.items.len + 8,
+                ),
             );
             const present_rects = present.list;
 

@@ -178,8 +178,8 @@ pub const GetAsciiTableFn = *const fn (
     out_lig_triggers: [*]u8,
 ) callconv(.c) c_int;
 
-pub const VERT_UPDATE_MAIN: u32 = 1 << 0;
-pub const VERT_UPDATE_CURSOR: u32 = 1 << 1;
+pub const VERT_UPDATE_MAIN = frontend_rules.VERT_UPDATE_MAIN;
+pub const VERT_UPDATE_CURSOR = frontend_rules.VERT_UPDATE_CURSOR;
 
 /// zonvie_core_send_key_event mods bits.
 pub const MOD_CTRL: u32 = 1 << 0;
@@ -1951,6 +1951,32 @@ pub export fn zonvie_core_clamp_mini_content(
 ) callconv(.c) usize {
     const dst = out orelse return 0;
     return frontend_rules.clampMiniContent(dst[0..cap], if (content) |cp| cp[0..len] else "");
+}
+
+pub export fn zonvie_core_row_update(flags: u32) callconv(.c) u8 {
+    return @intFromEnum(frontend_rules.rowUpdate(flags));
+}
+
+pub export fn zonvie_core_root_row_disposition(
+    flags: u32,
+    row_start: u32,
+    row_count: u32,
+    vert_count: usize,
+    total_rows: u32,
+    total_cols: u32,
+) callconv(.c) u8 {
+    return @intFromEnum(frontend_rules.rootRowDisposition(frontend_rules.rowUpdate(flags), row_start, row_count, vert_count, total_rows, total_cols));
+}
+
+pub const SurfaceFrameTermsC = frontend_rules.SurfaceFrameTerms;
+pub const SurfaceFrameDecisionC = frontend_rules.SurfaceFrameDecision;
+
+pub export fn zonvie_core_surface_frame_decision(
+    terms: ?*const frontend_rules.SurfaceFrameTerms,
+    out: ?*frontend_rules.SurfaceFrameDecision,
+) callconv(.c) void {
+    const t = terms orelse return;
+    (out orelse return).* = frontend_rules.surfaceFrameDecision(t.*);
 }
 
 pub export fn zonvie_core_panel_bg(r: f32, g: f32, b: f32, out: ?*[3]f32) callconv(.c) void {

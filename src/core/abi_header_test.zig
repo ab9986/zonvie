@@ -54,6 +54,8 @@ const pairs = .{
     .{ c.zonvie_config_values, c_api.zonvie_config_values },
     .{ c.zonvie_shader_uniforms, c_api.zonvie_shader_uniforms },
     .{ c.zonvie_shader_result, c_api.zonvie_shader_result },
+    .{ c.zonvie_surface_frame_terms, frontend_rules.SurfaceFrameTerms },
+    .{ c.zonvie_surface_frame_decision, frontend_rules.SurfaceFrameDecision },
 };
 
 fn expectEq(what: []const u8, a: usize, b: usize, failures: *usize) void {

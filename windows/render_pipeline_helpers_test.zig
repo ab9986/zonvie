@@ -644,6 +644,75 @@ test "sorted row merge leaves input intact on allocation failure" {
     try std.testing.expectEqualSlices(u32, &.{ 1, 3 }, rows.items);
 }
 
+test "present rect capacity covers a redraw set the row pass grows to every surface row" {
+    // The main driver's case from WIN2 #1: one dirty row, then the scroll
+    // shift and layer reach merge the whole surface in. Every rect the paint
+    // adds afterwards must fit without a heap grow.
+    var rows: std.ArrayListUnmanaged(u32) = .empty;
+    defer rows.deinit(std.testing.allocator);
+    var scratch: std.ArrayListUnmanaged(u32) = .empty;
+    defer scratch.deinit(std.testing.allocator);
+    const total_rows: u32 = 40;
+    // Only eight rows have vertices yet, so the dirty set is bounded by 8,
+    // while the pass can still merge rows up to the surface's 40.
+    const max_valid_row: u32 = 8;
+    try rows.append(std.testing.allocator, 7);
+    const layers: usize = 2;
+    const fixed: usize = 8;
+    const capacity = helpers.presentRectCapacity(max_valid_row, total_rows, layers, fixed);
+
+    try std.testing.expect(helpers.mergeSortedRowsWithRange(std.testing.allocator, &rows, &scratch, 0, total_rows));
+    try std.testing.expect(rows.items.len + layers + fixed <= capacity);
+    // One slot per row of the final set is the whole reason for the reserve.
+    try std.testing.expect(capacity >= total_rows + layers + fixed);
+}
+
+test "present rect capacity keeps a redraw set that starts past the surface's row count" {
+    // The main driver enumerates dirty rows below max_valid_row, which can
+    // exceed the effective row count the pass merges up to. Both bounds
+    // have to fit.
+    var rows: std.ArrayListUnmanaged(u32) = .empty;
+    defer rows.deinit(std.testing.allocator);
+    var scratch: std.ArrayListUnmanaged(u32) = .empty;
+    defer scratch.deinit(std.testing.allocator);
+    const max_valid_row: u32 = 50;
+    const total_rows: u32 = 40;
+    try rows.appendSlice(std.testing.allocator, &.{ 45, 46, 49 });
+    const capacity = helpers.presentRectCapacity(max_valid_row, total_rows, 0, 0);
+
+    try std.testing.expect(helpers.mergeSortedRowsWithRange(std.testing.allocator, &rows, &scratch, 0, total_rows));
+    try std.testing.expect(rows.items.len <= capacity);
+    // Not a blank cheque: it reserves the larger bound, not their sum.
+    try std.testing.expectEqual(@as(usize, 50), capacity);
+}
+
+test "present rect capacity is the same rule for both drivers" {
+    // An external surface's enumeration bound is its row count, so its
+    // capacity is rows + layers + its five singletons — what its driver
+    // reserved before the rule was shared.
+    try std.testing.expectEqual(@as(usize, 24 + 1 + 5), helpers.presentRectCapacity(24, 24, 1, 5));
+    try std.testing.expectEqual(@as(usize, 0 + 3), helpers.presentRectCapacity(0, 0, 0, 3));
+}
+
+test "a decorated surface's forced-full frame presents in full even with no damage rects" {
+    // Decorated external surfaces (cmdline, msg, popupmenu) clear and repaint
+    // everything and keep no damage list. The shared gate must not read the
+    // empty list as "nothing changed".
+    for ([_]bool{ false, true }) |shader| {
+        const gate = helpers.presentGate(.{
+            .force_full_rows = true,
+            .preserve_back = false,
+            .rows = 0,
+            .rows_to_draw = 0,
+            .skipped_empty = 0,
+            .custom_shader = shader,
+            .present_rects = 0,
+        });
+        try std.testing.expectEqual(helpers.PresentVerdict.present, gate.verdict);
+        try std.testing.expect(gate.full);
+    }
+}
+
 test "single sorted row insertion reports OOM without consuming scroll damage" {
     var storage: [2 * @sizeOf(u32)]u8 align(@alignOf(u32)) = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&storage);
