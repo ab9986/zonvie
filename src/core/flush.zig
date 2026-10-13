@@ -16265,6 +16265,62 @@ test "surface layout places splits and floats as ordered layers" {
     try std.testing.expectEqual(@as(i64, 2), state.layers[1].grid_id);
 }
 
+test "a new external window is created, then laid out, then sent its rows" {
+    // A frontend routes a grid's rows by the surface that places it, so in one
+    // bracket the window must exist and carry its layout before any row of it.
+    const Order = struct {
+        window_at: ?u32 = null,
+        layout_at: ?u32 = null,
+        first_row_at: ?u32 = null,
+        n: u32 = 0,
+
+        fn from(ctx: ?*anyopaque) *@This() {
+            return @ptrCast(@alignCast(ctx.?));
+        }
+        fn onWindow(ctx: ?*anyopaque, grid_id: i64, win: i64, rows: u32, cols: u32, start_row: i32, start_col: i32) callconv(.c) void {
+            _ = .{ win, rows, cols, start_row, start_col };
+            const self = from(ctx);
+            if (grid_id == 2 and self.window_at == null) self.window_at = self.n;
+            self.n += 1;
+        }
+        fn onLayout(ctx: ?*anyopaque, surface_id: i64, layers: [*]const c_api.Layer, count: usize, rows: u32, cols: u32) callconv(.c) void {
+            _ = .{ layers, count, rows, cols };
+            const self = from(ctx);
+            if (surface_id == 2 and self.layout_at == null) self.layout_at = self.n;
+            self.n += 1;
+        }
+        fn onRow(ctx: ?*anyopaque, grid_id: i64, row_start: u32, row_count: u32, verts: ?[*]const c_api.Vertex, vert_count: usize, flags: u32, total_rows: u32, total_cols: u32) callconv(.c) void {
+            _ = .{ row_start, verts, vert_count, total_rows, total_cols };
+            const self = from(ctx);
+            if (grid_id == 2 and row_count == 1 and flags & c_api.VERT_UPDATE_MAIN != 0 and self.first_row_at == null) self.first_row_at = self.n;
+            self.n += 1;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 4, 4);
+    try core.grid.resizeGrid(2, 4, 4);
+    try std.testing.expect(try core.grid.setWinExternalPos(2, 42));
+    for (0..4) |r| core.grid.putCellGrid(2, @intCast(r), 0, 'x', 0);
+    core.drawable_w_px = 4;
+    core.drawable_h_px = 4;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    core.grid.cursor_visible = false;
+
+    var order = Order{};
+    core.ctx = &order;
+    core.cb.on_external_window = Order.onWindow;
+    core.cb.on_surface_layout = Order.onLayout;
+    core.cb.on_vertices_row = Order.onRow;
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(4, 4);
+
+    try std.testing.expect(order.window_at.? < order.layout_at.?);
+    try std.testing.expect(order.layout_at.? < order.first_row_at.?);
+}
+
 test "the scroll fast path applies to a vertical split, a float, and both at once" {
     const State = struct {
         calls: u32 = 0,
