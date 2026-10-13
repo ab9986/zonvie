@@ -162,6 +162,33 @@ def main():
         # scroll window selected by the checker.
         time.sleep(4)
 
+    # Optional fixed floats over the scrolling area (ZONVIE_TRACE_FLOATS=N,
+    # N <= 3): 20x10 editor-relative, default zindex, opened without focus so
+    # the scroll keys still go to the main window. Lets the fixed-float mask
+    # cost be compared against an otherwise identical no-float run.
+    nfloats = int(os.environ.get("ZONVIE_TRACE_FLOATS", "0"))
+    if nfloats > 0:
+        float_lua = (
+            f"(function() for i = 0, {nfloats} - 1 do "
+            "local b = vim.api.nvim_create_buf(false, true); local t = {}; "
+            "for r = 1, 10 do t[r] = string.rep('float ' .. i .. ' ', 3) end; "
+            "vim.api.nvim_buf_set_lines(b, 0, -1, false, t); "
+            "vim.api.nvim_open_win(b, false, {relative = 'editor', "
+            "width = 20, height = 10, "
+            "row = math.floor(vim.o.lines / 2) - 5 + i * 3, "
+            f"col = math.floor(vim.o.columns / 2) - 10 + i * 25 - {(nfloats - 1) * 12}, "
+            "style = 'minimal', focusable = false}); end; "
+            "return #vim.api.nvim_list_wins() end)()"
+        )
+        r = remote_expr(f'luaeval("{float_lua}")')
+        if r.returncode != 0:
+            print("failed to open floats:", r.stderr, file=sys.stderr)
+            app_proc.terminate()
+            nvim_proc.terminate()
+            return 1
+        print(f"windows after opening floats: {r.stdout.strip()}")
+        time.sleep(1)
+
     if scenario == "tig":
         commit = biggest_recent_commit()
         remote_expr(f"execute('terminal cd {REPO} && tig show {commit}')")
