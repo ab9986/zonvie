@@ -2691,6 +2691,9 @@ pub fn computeRowsToDraw(
     // allocation.
     out.ensureTotalCapacity(alloc, @max(total_rows, max_valid_row)) catch return false;
 
+    // Postcondition, O(rows) so Debug only: ascending, unique, below max_valid_row.
+    defer if (builtin.mode == .Debug) std.debug.assert(render_pipeline_helpers.rowsSortedUnique(out.items, max_valid_row));
+
     if (force_full) {
         var r: u32 = 0;
         const n: u32 = @min(total_rows, max_valid_row);

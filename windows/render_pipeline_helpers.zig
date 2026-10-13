@@ -842,6 +842,18 @@ pub fn mergeSortedRowsWithRange(
     return true;
 }
 
+/// A paint's row list is strictly ascending and, when `limit` is given,
+/// below it. The row pass walks these lists by index and the present path
+/// turns runs of them into spans, so a duplicate or out-of-order row is a
+/// double draw or a lost span.
+pub fn rowsSortedUnique(rows: []const u32, limit: ?u32) bool {
+    for (rows, 0..) |r, i| {
+        if (limit) |l| if (r >= l) return false;
+        if (i > 0 and rows[i - 1] >= r) return false;
+    }
+    return true;
+}
+
 /// Insert one row into a sorted, deduplicated list. The list is unchanged on
 /// allocation failure so the caller can abort the partial paint transaction.
 pub fn insertSortedRow(
@@ -912,6 +924,8 @@ pub fn insertCursorEraseRows(
         if (r >= row_limit) continue;
         if (!insertSortedRow(alloc, rows, r)) return false;
     }
+    // O(rows): Debug only.
+    if (@import("builtin").mode == .Debug) std.debug.assert(rowsSortedUnique(rows.items, row_limit));
     return true;
 }
 

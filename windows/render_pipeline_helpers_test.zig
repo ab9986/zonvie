@@ -772,6 +772,19 @@ test "cursor erase rows are claimed only for a root cursor and only in range" {
     try std.testing.expectEqualSlices(u32, &.{ 2, 5, 7 }, rows.items);
 }
 
+test "a paint's row list is strictly ascending and below its limit" {
+    try std.testing.expect(helpers.rowsSortedUnique(&.{}, null));
+    try std.testing.expect(helpers.rowsSortedUnique(&.{}, 0));
+    try std.testing.expect(helpers.rowsSortedUnique(&.{ 0, 3, 9 }, 10));
+    try std.testing.expect(helpers.rowsSortedUnique(&.{ 0, 3, 9 }, null));
+    // A duplicate is a double draw; out of order breaks span building.
+    try std.testing.expect(!helpers.rowsSortedUnique(&.{ 2, 2 }, null));
+    try std.testing.expect(!helpers.rowsSortedUnique(&.{ 3, 1 }, null));
+    // The limit is exclusive.
+    try std.testing.expect(!helpers.rowsSortedUnique(&.{ 0, 10 }, 10));
+    try std.testing.expect(!helpers.rowsSortedUnique(&.{10}, 10));
+}
+
 test "a cursor erase row that cannot be claimed fails the paint" {
     // A dropped row would leave the previous cursor baked into the back
     // texture, so allocation failure must reach the caller.
