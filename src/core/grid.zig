@@ -2970,7 +2970,9 @@ pub const Grid = struct {
 
     /// Hide a Core-owned synthetic external surface. Returns whether it was
     /// visible, and advances the atlas-recovery input only on a real removal.
-    pub fn removeSyntheticExternal(self: *Grid, grid_id: i64) !bool {
+    /// True when the grid was external and is no longer. Cannot fail: no
+    /// allocation or callback is involved.
+    pub fn removeSyntheticExternal(self: *Grid, grid_id: i64) bool {
         if (!self.external_grids.contains(grid_id)) return false;
         self.invalidateSubgridVertexSurface(grid_id);
         if (self.external_grids.fetchRemove(grid_id) == null) return false;
@@ -4509,9 +4511,9 @@ test "synthetic external visibility advances glyph working set revision" {
     try grid.putSyntheticExternal(POPUPMENU_GRID_ID, .{ .win = 1, .start_row = 4, .start_col = 5 });
     try std.testing.expectEqual(initial +% 1, grid.glyph_working_set_rev);
 
-    try std.testing.expect(try grid.removeSyntheticExternal(POPUPMENU_GRID_ID));
+    try std.testing.expect(grid.removeSyntheticExternal(POPUPMENU_GRID_ID));
     try std.testing.expectEqual(initial +% 2, grid.glyph_working_set_rev);
-    try std.testing.expect(!try grid.removeSyntheticExternal(POPUPMENU_GRID_ID));
+    try std.testing.expect(!grid.removeSyntheticExternal(POPUPMENU_GRID_ID));
     try std.testing.expectEqual(initial +% 2, grid.glyph_working_set_rev);
 }
 

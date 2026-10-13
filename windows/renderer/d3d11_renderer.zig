@@ -1058,6 +1058,10 @@ pub const Renderer = struct {
 
         try self.resize();
         if (!self.resourcesReady()) return error.RenderResourcesUnavailable;
+        // Checked before the clear below: a borrowed atlas that is not yet
+        // built (borrowAtlas returned false) must fail the frame, not leave
+        // back_tex cleared and report success.
+        const srv = self.atlas_srv orelse return error.RenderResourcesUnavailable;
         // Frontend-authored vertices are already in clip space.
         try self.setLayerTransform(0, 0, 0, 0);
 
@@ -1166,9 +1170,7 @@ pub const Renderer = struct {
             const ps_set = ctx_vtbl.*.PSSetShader orelse return;
             ps_set(ctx, self.ps.?, null, 0);
 
-            // PS SRV (skip draw if atlas was destroyed and not yet recreated)
             const ps_set_srv = ctx_vtbl.*.PSSetShaderResources orelse return;
-            const srv = self.atlas_srv orelse return;
             var srvs: [1]?*c.ID3D11ShaderResourceView = .{srv};
             const pp_srvs: [*c]?*c.ID3D11ShaderResourceView =
                 @as([*c]?*c.ID3D11ShaderResourceView, @ptrCast(&srvs));

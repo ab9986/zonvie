@@ -339,10 +339,11 @@ fn touchGridVertexBudget(core: *Core, grid_id: i64, buf: *grid_mod.GridBuf) void
     if (buf.vertex_budget_touched) return;
     buf.vertex_budget_touched = true;
 
-    // Only track positive grid IDs (sub-grids). External grids (cmdline, popupmenu)
-    // have negative IDs and are not part of the vertex budget touched list.
+    // Grid 1 is checked through computeVertexBudgetAggregate instead. The
+    // core-owned synthetic grids (negative ids: cmdline, popupmenu, message
+    // panels) are not linked and so escape the completed-frame check.
     if (grid_id <= 0) return;
-    if (grid_id == 1) return;  // Grid 1 is main grid, not tracked separately
+    if (grid_id == 1) return;
 
     buf.vertex_budget_touched_next = core.vertex_budget_touched_grid_head;
     core.vertex_budget_touched_grid_head = grid_id;
@@ -4504,9 +4505,10 @@ pub fn notifyExternalWindowChanges(self: *Core) void {
         if (is_new) {
             // For ext_windows grids awaiting initial resize response from Neovim,
             // defer window creation until the grid has a reasonable size.
+            // The pending entry is dropped only after the callback completes
+            // below, so an aborted open still waits for a 2x2 grid on retry.
             if (self.grid.pending_ext_window_grids.contains(grid_id)) {
                 if (rows < 2 or cols < 2) continue;
-                _ = self.grid.pending_ext_window_grids.remove(grid_id);
             }
 
             // Reserve the known-map entry before invoking the frontend, so OOM
@@ -4538,6 +4540,7 @@ pub fn notifyExternalWindowChanges(self: *Core) void {
             .cols = cols,
         };
         if (is_new) {
+            _ = self.grid.pending_ext_window_grids.remove(grid_id);
             self.known_external_grids.putAssumeCapacityNoClobber(grid_id, known_info);
         } else if (self.known_external_grids.getPtr(grid_id)) |known| {
             known.* = known_info;
@@ -5672,10 +5675,7 @@ pub fn sendCmdlineHide(self: *Core) void {
     // Note: Don't call on_external_window_close here - it will be called by
     // notifyExternalWindowChanges() which detects the grid was removed from
     // external_grids but still exists in known_external_grids.
-    _ = self.grid.removeSyntheticExternal(cmdline_grid_id) catch |err| {
-        if (Core.isHardRenderFailure(err)) self.failHardRender(err);
-        return;
-    };
+    _ = self.grid.removeSyntheticExternal(cmdline_grid_id);
 
     // Fallback: restore cursor to pre-cmdline position if Neovim doesn't send grid_cursor_goto
     // (This is a workaround for possible Neovim bug where cursor position isn't updated after cmdline closes)
@@ -6081,10 +6081,7 @@ pub fn sendPopupmenuHide(self: *Core) void {
     // Note: Don't call on_external_window_close here - it will be called by
     // notifyExternalWindowChanges() which detects the grid was removed from
     // external_grids but still exists in known_external_grids.
-    _ = self.grid.removeSyntheticExternal(pum_grid_id) catch |err| {
-        if (Core.isHardRenderFailure(err)) self.failHardRender(err);
-        return;
-    };
+    _ = self.grid.removeSyntheticExternal(pum_grid_id);
 
     self.log.write("[popupmenu] hide\n", .{});
 }
@@ -7158,10 +7155,7 @@ fn resetMsgScroll(self: *Core) void {
 /// Hide msg_show external grid.
 pub fn hideMsgShow(self: *Core) void {
     const msg_grid_id = grid_mod.MESSAGE_GRID_ID;
-    _ = self.grid.removeSyntheticExternal(msg_grid_id) catch |err| {
-        if (Core.isHardRenderFailure(err)) self.failHardRender(err);
-        return;
-    };
+    _ = self.grid.removeSyntheticExternal(msg_grid_id);
     // Reset scroll state and invalidate cache
     resetMsgScroll(self);
     self.msg_total_lines = 0;
@@ -7533,10 +7527,7 @@ fn renderMsgHistoryGrid(self: *Core, entries: []const grid_mod.MsgHistoryEntry) 
 /// Hide msg_history external grid.
 pub fn hideMsgHistory(self: *Core) void {
     const history_grid_id = grid_mod.MSG_HISTORY_GRID_ID;
-    _ = self.grid.removeSyntheticExternal(history_grid_id) catch |err| {
-        if (Core.isHardRenderFailure(err)) self.failHardRender(err);
-        return;
-    };
+    _ = self.grid.removeSyntheticExternal(history_grid_id);
     // Drop any pending retry, mirroring hideMsgShow. nextMsgTimeoutNs reads
     // msg_history_retry_at unconditionally, but only the history_dirty block
     // clears it — so an auto-hide that lands between a failed dispatch and
@@ -9304,7 +9295,7 @@ test "external vertex aggregate follows lifecycle without layout-order scans" {
     try std.testing.expectEqual(@as(usize, 20), core.flush_vertex_count_aggregate);
     finishVertexBudgetTransaction(&core, true);
 
-    try std.testing.expect(try core.grid.removeSyntheticExternal(2));
+    try std.testing.expect(core.grid.removeSyntheticExternal(2));
     try std.testing.expectEqual(@as(usize, 0), core.grid.subgrid_surface_vertex_count);
     try std.testing.expectEqual(@as(usize, 0), surface.surface_vertex_count);
     try std.testing.expect(!surface.vertex_row_ledger_valid);

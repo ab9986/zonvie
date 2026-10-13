@@ -318,8 +318,13 @@ typedef void (*zonvie_on_connect_fn)(
                          -2 for the message panels (ZONVIE_GRID_ID_MESSAGE /
                          _MSG_HISTORY), which the frontend places top-right
                          (see zonvie_core_msg_float_origin)
-   Called on win_external_pos event. Frontend should create a separate window
-   and render the grid there. */
+   Fired inside the flush bracket, on the core thread, for a grid that has
+   become external (win_external_pos, or a core-owned grid shown as a window)
+   and again for the same grid_id whenever its win, position, or size changes.
+   Not fired while rows or cols is 0, nor, for an ext_windows grid awaiting
+   its first resize, while rows or cols is below 2. A frontend must treat a
+   repeat for a known grid_id as an update of that window, never as a second
+   window. */
 typedef void (*zonvie_on_external_window_fn)(
     void* ctx,
     int64_t grid_id,
@@ -891,7 +896,10 @@ typedef struct zonvie_callbacks {
        - IMMEDIATE: on_external_window / on_external_window_close,
          on_grid_scroll, and the cmdline / popupmenu / message show-family
          callbacks. Apply them on the spot and keep them even when refusing
-         the flush: the core does not resend them. */
+         the flush. The core does not resend one that completed; a lifecycle
+         callback that itself aborts the flush is not recorded and is fired
+         again by the retry, so a frontend must accept a repeated open or
+         close for the same grid_id. */
     void (*on_flush_begin)(void* ctx);
     void (*on_flush_end)(void* ctx);
 
