@@ -119,6 +119,8 @@ struct SurfaceFrameDecision {
     let rowPassPlan: SurfaceRowPassPlan
     /// The alpha the row shader multiplies background colours by.
     let backgroundAlpha: Float
+    /// What the decision was made from, for the trace line.
+    let terms: SurfaceFrameTerms
 
     static func make(terms: SurfaceFrameTerms) -> SurfaceFrameDecision {
         var t = terms.cTerms
@@ -139,7 +141,8 @@ struct SurfaceFrameDecision {
             canDirtyOnlyWithBlur: d.can_dirty_only_with_blur,
             loadsPreviousContents: d.loads_previous_contents,
             rowPassPlan: plan,
-            backgroundAlpha: d.background_alpha
+            backgroundAlpha: d.background_alpha,
+            terms: terms
         )
     }
 
@@ -161,18 +164,31 @@ struct SurfaceFrameDecision {
         return make(terms: terms).backgroundAlpha
     }
 
-    /// The decision, for `ZONVIE_DRAW_TRACE=1`. One line for both surfaces.
+    /// The load decision and every term behind it, for `ZONVIE_DRAW_TRACE=1`.
+    /// One field set for both surfaces. GUI scenarios parse this line
+    /// (`gate=load`, `layout=`, `rowDirty=`, `gpuScroll=`, `-> reuse=`), so
+    /// those names are part of its contract. `reuse` is whether the pass keeps
+    /// the previous back texture.
     func traceLine(surface: Int64) -> String {
+        let t = terms
+        let rowDirty = t.rowMode && (t.hasDirtyRows || t.hasLayerWork)
         let fields: [String] = [
-            "surface=\(surface) gate=frame",
-            "reuseRoot=\(reusesRootContents ? 1 : 0)",
-            "reuseHosted=\(reusesHostedContents ? 1 : 0)",
-            "partialHosted=\(partialHostedContents ? 1 : 0)",
-            "skip=\(skipsSurfacePass ? 1 : 0)",
+            "surface=\(surface) gate=load",
+            "glow=\(t.glowEnabled ? 1 : 0)",
+            "fontCurrent=\(t.fontIsCurrent ? 1 : 0)",
+            "layout=\(t.hasLayoutDamage ? 1 : 0)",
+            "decorated=\(t.isDecoratedSurface ? 1 : 0)",
+            "layersOutside=\(t.hostsLayersOutsideDirtySet ? 1 : 0)",
+            "gpuScroll=\(t.scrollBlitKeptBackTexture ? 1 : 0)",
             "dirtyBlur=\(canDirtyOnlyWithBlur ? 1 : 0)",
-            "load=\(loadsPreviousContents ? 1 : 0)",
+            "reuseHosted=\(reusesHostedContents ? 1 : 0)",
+            "reuseRoot=\(reusesRootContents ? 1 : 0)",
+            "partialHosted=\(partialHostedContents ? 1 : 0)",
+            "rect=\(t.hasDirtyRect ? 1 : 0)",
+            "rowDirty=\(rowDirty ? 1 : 0)",
+            "smooth=\(t.isSmoothScrolling ? 1 : 0)",
             "plan=\(rowPassPlan)",
-            "bgAlpha=\(backgroundAlpha)",
+            "-> reuse=\(loadsPreviousContents ? 1 : 0) skip=\(skipsSurfacePass ? 1 : 0)",
         ]
         return fields.joined(separator: " ")
     }
