@@ -34,6 +34,7 @@ pub const log_mod = @import("log.zig");
 
 test {
     _ = @import("abi_header_test.zig");
+    _ = @import("consumer_model.zig");
     _ = damage_bands;
 }
 
