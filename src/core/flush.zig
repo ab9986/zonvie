@@ -10192,17 +10192,26 @@ test "external scroll without row-shift callback regenerates every retained row"
     // A float over the external grid no longer blocks the hint: eligibility is
     // decided by the grid's own scroll state alone. That exclusion is exactly
     // what composition forced and what per-grid rows removed.
+    // The float sits at row 0 of grid 2, inside the scrolled region, and the
+    // shift is observed through onFlush, which is what decides it.
     core.grid.sub_grids.getPtr(2).?.clearScrollState();
     try core.grid.resizeGrid(3, 1, 1);
-    try core.grid.setWinFloatPos(3, 43, 100, 0, 10, 0, 2, true);
+    try core.grid.setWinFloatPos(3, 43, 0, 0, 10, 0, 2, true);
     core.cb.on_grid_row_scroll = State.onRowScroll;
     try flush_ctx.onFlush(4, 2);
     state = .{};
 
     core.grid.sub_grids.getPtr(2).?.clearScrollState();
     core.grid.scrollGrid(2, 0, 4, 0, 2, 1, 0);
-    try std.testing.expect(dispatchGridRowScroll(&core, State.onRowScroll, 2));
+    try flush_ctx.onFlush(4, 2);
     try std.testing.expectEqual(@as(u32, 1), state.scroll_calls);
+    // zonvie_core.h: after a row shift the core sends only the rows the shift
+    // vacated. Row 3 is that row; rows 1 and 2 moved with the shift. Row 0
+    // sits under the float, which is layer damage and undecided here.
+    try std.testing.expect(state.seen_rows[3]);
+    try std.testing.expect(!state.seen_rows[1]);
+    try std.testing.expect(!state.seen_rows[2]);
+    try std.testing.expectEqual(@as(u32, 2), state.row_calls);
 }
 
 test "an external scroll whose shift was never sent regenerates every row" {
@@ -14004,8 +14013,9 @@ test "a block element in normal text is marked as foreground, not background" {
     // the shader takes it for a background cell and fades it to the window's
     // background alpha under blur, while the glyphs beside it stay opaque.
     const State = struct {
-        solid_glyph_quads: u32 = 0,
-        unflagged_solid_quads: u32 = 0,
+        // Per cell column (cell width 1px): [0] the block, [1] the blank.
+        solid_glyph_quads: [2]u32 = .{ 0, 0 },
+        unflagged_solid_quads: [2]u32 = .{ 0, 0 },
 
         // The glyph pass only runs when the frontend offers some way to
         // resolve a glyph. Block elements never reach it, but the gate is
@@ -14037,20 +14047,23 @@ test "a block element in normal text is marked as foreground, not background" {
             _ = row_count;
             _ = total_rows;
             _ = total_cols;
-            const cursor_verts: ?[*]const c_api.Vertex = null;
-            const cursor_count: usize = 0;
-            _ = cursor_verts;
-            _ = cursor_count;
             _ = flags;
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             const verts = main_verts orelse return;
-            for (verts[0..main_count]) |v| {
+            var i: usize = 0;
+            while (i + 6 <= main_count) : (i += 6) {
+                const quad = verts[i .. i + 6];
                 // texCoord.x < 0 marks a solid quad; an atlas glyph carries a UV.
-                if (v.texCoord[0] >= 0) continue;
-                if ((v.deco_flags & c_api.DECO_SOLID_GLYPH) != 0) {
-                    self.solid_glyph_quads += 1;
+                if (quad[0].texCoord[0] >= 0) continue;
+                var max_x = quad[0].position[0];
+                for (quad[1..]) |v| max_x = @max(max_x, v.position[0]);
+                // A background run spanning both cells is the blank's (the
+                // block cell owns only quads inside its own column).
+                const col: usize = if (max_x <= 1.0) 0 else 1;
+                if ((quad[0].deco_flags & c_api.DECO_SOLID_GLYPH) != 0) {
+                    self.solid_glyph_quads[col] += 1;
                 } else {
-                    self.unflagged_solid_quads += 1;
+                    self.unflagged_solid_quads[col] += 1;
                 }
             }
         }
@@ -14074,11 +14087,14 @@ test "a block element in normal text is marked as foreground, not background" {
     var flush_ctx = FlushCtx{ .core = &core };
     try flush_ctx.onFlush(1, 2);
 
-    // The block element produced solid quads and every one of them is flagged.
-    try std.testing.expect(state.solid_glyph_quads > 0);
+    // The block element produced solid quads, and every one of its cell's
+    // solid quads is flagged.
+    try std.testing.expect(state.solid_glyph_quads[0] > 0);
+    try std.testing.expectEqual(@as(u32, 0), state.unflagged_solid_quads[0]);
     // The blank cell's background quad must NOT be flagged, or the frontend
     // would stop fading real backgrounds under a translucent window.
-    try std.testing.expect(state.unflagged_solid_quads > 0);
+    try std.testing.expectEqual(@as(u32, 0), state.solid_glyph_quads[1]);
+    try std.testing.expect(state.unflagged_solid_quads[1] > 0);
 }
 
 test "each status channel reaches its own route and its own callback" {
