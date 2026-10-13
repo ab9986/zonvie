@@ -4366,6 +4366,11 @@ fn emitSurfaceLayout(self: *Core, surface_id: i64) bool {
     const layers = collectSurfaceLayers(self, surface_id);
     if (self.flush_aborted) return false;
     if (layers.len == 0) return true;
+    // The first layer is the surface's own root (zonvie_core.h: z 0, anchored
+    // to itself); that it carries the surface's size is this emitter's rule,
+    // which both frontends read.
+    std.debug.assert(layers[0].grid_id == surface_id);
+    std.debug.assert(layers[0].rows == rows and layers[0].cols == cols);
     if (self.last_surface_layout.getPtr(surface_id)) |prev| {
         if (prev.matches(layers, rows, cols)) return true;
     }
