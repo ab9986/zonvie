@@ -487,12 +487,14 @@ test "after a shifted external scroll the consumer holds what a full resend woul
     // Neovim scrolls the grid up one row and draws the row it exposed.
     core.grid.scrollGrid(2, 0, 4, 0, 2, 1, 0);
     core.grid.putCellGrid(2, 3, 0, 'Z', 9);
+    const sends_before = m.main_sends;
     try flush_ctx.onFlush(4, 2);
     try std.testing.expect(m.violation == null);
     try std.testing.expectEqual(@as(u32, 2), m.commits);
-    // The shift path was taken, not a full regeneration that would make the
-    // comparison below trivially true.
+    // The shift path was taken and only the exposed row was resent, not a
+    // regeneration that would make the comparison below trivially true.
     try std.testing.expectEqual(@as(u32, 1), m.shifts);
+    try std.testing.expectEqual(@as(u32, 1), m.main_sends - sends_before);
 
     var full = try fullResend(&core, 4);
     defer full.deinit();
@@ -529,6 +531,58 @@ test "a refused bracket is resent by the next flush and ends where a full resend
     defer full.deinit();
     if (diff(m.grid(2).?, full.grid(2).?)) |why| {
         std.debug.print("after refusal, incremental != full: {s}\n", .{why});
+        return error.IncrementalDiffersFromFull;
+    }
+}
+
+/// Grid 2 as a split of the main window at (0, 0), holding the same cells
+/// `externalGridCore` gives the external window.
+fn splitGridCore(core: *Core, rows: u32) !void {
+    try defineRowColors(core);
+    try core.grid.resizeGrid(1, rows, 2);
+    try core.grid.resizeGrid(2, rows, 2);
+    try core.grid.setWinPos(2, 42, 0, 0);
+    for (0..rows) |row| core.grid.putCellGrid(2, @intCast(row), 0, @intCast('A' + row), @intCast(row + 1));
+    core.drawable_w_px = 2;
+    core.drawable_h_px = rows;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    core.grid.cursor_visible = false;
+}
+
+test "a scrolled split and a scrolled external window end with the same rows" {
+    var cores: [2]Core = .{ Core.initForTest(std.testing.allocator), Core.initForTest(std.testing.allocator) };
+    defer for (&cores) |*c| c.deinitForTest();
+    try splitGridCore(&cores[0], 4);
+    try externalGridCore(&cores[1], 4);
+    var models: [2]Model = .{ Model.init(std.testing.allocator), Model.init(std.testing.allocator) };
+    defer for (&models) |*m| m.deinit();
+
+    for (&cores, &models) |*core, *m| {
+        m.install(&core.cb, &core.ctx);
+        m.abort_flag = &core.flush_aborted;
+        var flush_ctx = FlushCtx{ .core = core };
+        try flush_ctx.onFlush(4, 2);
+        // Neovim scrolls the window up one row and draws the row it exposed.
+        core.grid.scrollGrid(2, 0, 4, 0, 2, 1, 0);
+        core.grid.putCellGrid(2, 3, 0, 'Z', 9);
+        const sends_before = m.main_sends;
+        try flush_ctx.onFlush(4, 2);
+        try std.testing.expect(m.violation == null);
+        // Both shift and resend only the exposed row; a regenerated region
+        // would make the comparison below trivially true.
+        try std.testing.expectEqual(@as(u32, 1), m.shifts);
+        try std.testing.expectEqual(@as(u32, 1), m.main_sends - sends_before);
+    }
+
+    if (diff(models[0].grid(2).?, models[1].grid(2).?)) |why| {
+        std.debug.print("split != external: {s}\n", .{why});
+        return error.SplitDiffersFromExternal;
+    }
+    var full = try fullResend(&cores[0], 4);
+    defer full.deinit();
+    if (diff(models[0].grid(2).?, full.grid(2).?)) |why| {
+        std.debug.print("split incremental != full: {s}\n", .{why});
         return error.IncrementalDiffersFromFull;
     }
 }

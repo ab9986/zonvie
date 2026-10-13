@@ -216,6 +216,9 @@ typedef void (*zonvie_on_vertices_row_fn)(
    The region is always full width; a partial-width scroll, two different
    regions in one batch, or a shift past half the region is refused here and
    the grid is regenerated instead.
+   Grid 1 never gets a shift: a scroll on it regenerates every row of the
+   region. Under ext_multigrid Neovim scrolls window and message content on
+   their own grids, so grid 1 carries no scroll in practice.
    A grid resized in the same batch gets no shift: its rows are resent. A grid
    moved to another surface also has all its rows resent, so a shift never
    refers to rows held for a different surface.
