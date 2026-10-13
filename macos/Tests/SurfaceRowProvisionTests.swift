@@ -434,17 +434,16 @@ private enum SurfaceRowProvisionTests {
         float.isFloat = true
         let layers = [split, float].map { SurfaceLayerFrame(layer: $0, set: nil, state: nil) }
 
-        let mask = SurfaceFixedFloatMask()
-        var scratch: [GridSurfaceRenderer.FixedFloatRect] = []
-        mask.rebuild(layers: layers, rootGridId: 1, smoothScrolling: true,
-                     cellW: 10, cellH: 20, scratch: &scratch)
-
         // Offsets as the view fills them: Neovim zindex (the float's is 1).
         var offsets = [
             GridSurfaceRenderer.ScrollOffset(grid_id: 2, offset_y: 0, content_top_y: 0, content_bottom_y: 0, zindex: 0),
             GridSurfaceRenderer.ScrollOffset(grid_id: 5, offset_y: 0, content_top_y: 0, content_bottom_y: 0, zindex: 1),
             GridSurfaceRenderer.ScrollOffset(grid_id: 1, offset_y: 0, content_top_y: 0, content_bottom_y: 0, zindex: 7),
         ]
+        let mask = SurfaceFixedFloatMask()
+        var scratch: [GridSurfaceRenderer.FixedFloatRect] = []
+        mask.rebuild(layers: layers, rootGridId: 1, smoothScrolling: true, offsets: offsets,
+                     cellW: 10, cellH: 20, scratch: &scratch)
         SurfaceFixedFloatMask.rankOffsets(&offsets, layers: [split, float])
         require(offsets.map { $0.zindex } == [1, 2, 0], "offsets must carry the layers' paint ranks, got \(offsets.map { $0.zindex })")
 
@@ -452,6 +451,41 @@ private enum SurfaceRowProvisionTests {
                 "a scrolled fixed float must not be masked inside its own rect")
         require(maskCoversAbove(bands: mask.bands, intervals: mask.intervals, x: 300, y: 200, scrollZ: Float(offsets[0].zindex)),
                 "the split under the fixed float must be masked")
+    }
+
+    // The shader clips scrolled content to its grid's rectangle, so a fixed
+    // float no scrolled layer touches masks nothing and must not be bound:
+    // the search it adds runs for every fragment of the frame. Neovim's
+    // message grid docked under a scrolling split is the everyday case.
+    private static func verifyUnreachableFixedFloatsLeaveTheMask() {
+        // A 52-row split over 54 rows; the message grid starts at row 53.
+        let split = SurfaceLayer(gridId: 2, anchorGrid: 1, originPx: .zero, rows: 52, cols: 100, z: 1, followsScroll: false)
+        var msg = SurfaceLayer(gridId: 3, anchorGrid: 1, originPx: simd_float2(0, 53 * 20), rows: 54, cols: 100, z: 2, followsScroll: false)
+        msg.isFloat = true
+        var overlapping = SurfaceLayer(gridId: 5, anchorGrid: 2, originPx: simd_float2(100, 100), rows: 10, cols: 40, z: 3, followsScroll: false)
+        overlapping.isFloat = true
+        let layers = [split, msg, overlapping].map { SurfaceLayerFrame(layer: $0, set: nil, state: nil) }
+        let mask = SurfaceFixedFloatMask()
+        var scratch: [GridSurfaceRenderer.FixedFloatRect] = []
+
+        // Only the split scrolls: the float over it stays, the docked message grid goes.
+        let splitScrolls = [GridSurfaceRenderer.ScrollOffset(grid_id: 2, offset_y: 0.1, content_top_y: 0, content_bottom_y: 0, zindex: 1)]
+        mask.rebuild(layers: layers, rootGridId: 1, smoothScrolling: true, offsets: splitScrolls,
+                     cellW: 10, cellH: 20, scratch: &scratch)
+        require(scratch.count == 1 && scratch[0].zindex == 3,
+                "only the float the scrolled split reaches is masked, got \(scratch.map { $0.zindex })")
+        require(!mask.bands.isEmpty, "the reachable float still produces a band")
+
+        // The root scrolls: everything is reachable.
+        let rootScrolls = [GridSurfaceRenderer.ScrollOffset(grid_id: 1, offset_y: 0.1, content_top_y: 0, content_bottom_y: 0, zindex: 0)]
+        mask.rebuild(layers: layers, rootGridId: 1, smoothScrolling: true, offsets: rootScrolls,
+                     cellW: 10, cellH: 20, scratch: &scratch)
+        require(scratch.count == 2, "a scrolled root reaches every fixed float, got \(scratch.count)")
+
+        // Nothing scrolls: no mask at all, whatever the layout.
+        mask.rebuild(layers: layers, rootGridId: 1, smoothScrolling: true, offsets: [],
+                     cellW: 10, cellH: 20, scratch: &scratch)
+        require(scratch.isEmpty && mask.bands.isEmpty, "with no scrolled grid nothing can bleed, so nothing is masked")
     }
 
     private static func verifyFixedFloatMaskZOrder() {
@@ -764,6 +798,7 @@ private enum SurfaceRowProvisionTests {
         verifyLayerGrowthWithoutRetry(device: device)
         verifyFixedFloatMaskZOrder()
         verifyMaskAndOffsetsShareOneScale()
+        verifyUnreachableFixedFloatsLeaveTheMask()
         verifyRowCapacityDemandAndSlotPredicate(device: device)
         verifyRowCapacityVerdictIsOneRuleForBothSurfaces(device: device)
 

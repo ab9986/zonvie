@@ -3744,24 +3744,63 @@ final class SurfaceFixedFloatMask {
         return false
     }
 
+    /// Whether a fixed float at `rect` can receive a scrolled fragment at
+    /// all: the fragment shader clips scrolled content to its own grid's
+    /// rectangle (`content_top_y`/`content_bottom_y`), so a float that meets
+    /// no scrolled layer's rectangle is never tested against and only costs
+    /// every fragment a band search. A scrolled root covers the surface.
+    /// `offsets` lists the grids whose vertices the shader treats as scrolled.
+    static func reachable(
+        _ rect: GridSurfaceRenderer.FixedFloatRect,
+        offsets: [GridSurfaceRenderer.ScrollOffset],
+        layers: [SurfaceLayerFrame], rootGridId: Int64,
+        cellW: Float, cellH: Float
+    ) -> Bool {
+        for offset in offsets {
+            let gridId = Int64(offset.grid_id)
+            if gridId == rootGridId { return true }
+            // A scrolled grid the layout does not place is drawn nowhere, so
+            // it reaches nothing; a placed one reaches its own rectangle.
+            guard let entry = layers.first(where: { $0.layer.gridId == gridId }) else { continue }
+            let l = entry.layer
+            let x1 = l.originPx.x + Float(l.cols) * cellW
+            let y1 = l.originPx.y + Float(l.rows) * cellH
+            if l.originPx.x < rect.x1 && x1 > rect.x0 && l.originPx.y < rect.bottom && y1 > rect.top {
+                return true
+            }
+        }
+        return false
+    }
+
     /// Rebuild the mask from `layers` for a frame that eases a scroll, or
-    /// clear it for one that does not. `scratch` is the caller's persistent
+    /// clear it for one that does not. Only the floats a scrolled grid can
+    /// reach are kept (`reachable`): the mask is a per-fragment search, and a
+    /// message grid docked below a scrolling split costs a frame a millisecond
+    /// of GPU time while masking nothing. `scratch` is the caller's persistent
     /// rect buffer. Draw thread only.
+    /// `rootScrolled` says the root's own offset is live when the caller
+    /// keeps it apart from `offsets` (the external surface does): a scrolled
+    /// root reaches every float.
     func rebuild(
         layers: [SurfaceLayerFrame], rootGridId: Int64, smoothScrolling: Bool,
+        offsets: [GridSurfaceRenderer.ScrollOffset], rootScrolled: Bool = false,
         cellW: Float, cellH: Float, scratch: inout [GridSurfaceRenderer.FixedFloatRect]
     ) {
         scratch.removeAll(keepingCapacity: true)
         if smoothScrolling {
             for entry in layers where Self.masks(entry.layer, rootGridId: rootGridId) {
                 let layer = entry.layer
-                scratch.append(GridSurfaceRenderer.FixedFloatRect(
+                let rect = GridSurfaceRenderer.FixedFloatRect(
                     x0: layer.originPx.x,
                     x1: layer.originPx.x + Float(layer.cols) * cellW,
                     top: layer.originPx.y,
                     bottom: layer.originPx.y + Float(layer.rows) * cellH,
                     zindex: Int32(clamping: layer.z)
-                ))
+                )
+                if !rootScrolled && !Self.reachable(rect, offsets: offsets, layers: layers, rootGridId: rootGridId, cellW: cellW, cellH: cellH) {
+                    continue
+                }
+                scratch.append(rect)
                 // One rect past the representable count is enough to select
                 // the cell-aligned fallback; stop rather than grow the scratch.
                 if scratch.count > Self.maxRects { break }

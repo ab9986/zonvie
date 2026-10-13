@@ -2568,6 +2568,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             // surface-absolute, so the rectangle needs no further placement.
             fixedFloatMask.rebuild(
                 layers: layerSnapshot, rootGridId: gridId, smoothScrolling: smoothScrolling,
+                offsets: hostedScrollOffsetSnapshot, rootScrolled: scrollOffsetSnapshot != nil,
                 cellW: Float(shared.cellWidthPx), cellH: Float(ch), scratch: &fixedFloatRectsScratch
             )
 

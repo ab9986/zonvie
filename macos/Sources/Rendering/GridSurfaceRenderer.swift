@@ -3436,6 +3436,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // skew by a commit.
             fixedFloatMask.rebuild(
                 layers: layerSnapshot, rootGridId: 1, smoothScrolling: smoothScrolling,
+                offsets: scrollSnapshot,
                 cellW: cellWidthPx, cellH: cellHeightPx, scratch: &fixedFloatRectsScratch
             )
             fixedFloatBandsSnapshot = fixedFloatMask.bands  // Value-type copies (safe across frames)
