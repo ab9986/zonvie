@@ -4206,6 +4206,217 @@ test "win_viewport with a non-integer field is skipped, not applied with zeros" 
     }
 }
 
+test "msg_set_pos places the message grid on grid 1 at its row, full width" {
+    // :help ui-events msg_set_pos: "The grid will be displayed at `row` on
+    // the default grid (grid=1), covering the full column width", and
+    // "zindex ... always has a fixed value of 200".
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(10, 20);
+    try grid.resizeGrid(3, 2, 20);
+
+    const t = try arena.alloc(mp.Value, 6);
+    t[0] = .{ .int = 3 };
+    t[1] = .{ .int = 8 }; // row
+    t[2] = .{ .bool = false }; // scrolled
+    t[3] = .{ .str = "" }; // sep_char
+    t[4] = .{ .int = 200 }; // zindex
+    t[5] = .{ .int = 7 }; // compindex
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "msg_set_pos", t));
+    const pos = grid.win_pos.get(3).?;
+    try std.testing.expectEqual(@as(u32, 8), pos.row);
+    try std.testing.expectEqual(@as(u32, 0), pos.col);
+    try std.testing.expectEqual(@as(i64, 1), pos.anchor_grid);
+    const layer = grid.win_layer.get(3).?;
+    try std.testing.expectEqual(@as(i64, 200), layer.zindex);
+    try std.testing.expectEqual(@as(i64, 7), layer.compindex);
+}
+
+test "msg_set_pos in the four-field form still places the grid, at the spec's zindex" {
+    // Zonvie rule: the four-field form ([grid, row, scrolled, sep_char]) an
+    // older Neovim sent is still accepted. zindex is the value the spec fixes
+    // (200); compindex, which that form lacks, is 0.
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(10, 20);
+    try grid.resizeGrid(3, 2, 20);
+
+    const t = try arena.alloc(mp.Value, 4);
+    t[0] = .{ .int = 3 };
+    t[1] = .{ .int = 5 };
+    t[2] = .{ .bool = true };
+    t[3] = .{ .str = "-" };
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "msg_set_pos", t));
+    try std.testing.expectEqual(@as(u32, 5), grid.win_pos.get(3).?.row);
+    try std.testing.expectEqual(@as(i64, 200), grid.win_layer.get(3).?.zindex);
+    try std.testing.expectEqual(@as(i64, 0), grid.win_layer.get(3).?.compindex);
+
+    // A six-field tuple whose zindex is not an Integer is malformed: skipped.
+    const bad = try arena.alloc(mp.Value, 6);
+    @memcpy(bad[0..4], t);
+    bad[1] = .{ .int = 9 };
+    bad[4] = .{ .str = "junk" };
+    bad[5] = .{ .int = 0 };
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "msg_set_pos", bad));
+    try std.testing.expectEqual(@as(u32, 5), grid.win_pos.get(3).?.row);
+}
+
+test "win_viewport_margins stores the four margins, clamped to the grid on read" {
+    // :help ui-events win_viewport_margins: [grid, win, top, bottom, left,
+    // right] are the rows/columns of the grid outside the viewport.
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(10, 20);
+    try grid.resizeGrid(2, 6, 8);
+
+    const t = try arena.alloc(mp.Value, 6);
+    t[0] = .{ .int = 2 };
+    t[1] = .{ .int = 1000 };
+    t[2] = .{ .int = 1 }; // top (winbar)
+    t[3] = .{ .int = 0 };
+    t[4] = .{ .int = 0 };
+    t[5] = .{ .int = 99 }; // larger than the grid
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "win_viewport_margins", t));
+    const m = grid.getViewportMargins(2);
+    try std.testing.expectEqual(@as(u32, 1), m.top);
+    try std.testing.expectEqual(@as(u32, 0), m.bottom);
+    try std.testing.expectEqual(@as(u32, 8), m.right);
+}
+
+test "win_viewport_margins sent before the grid exists is kept until it does" {
+    // Zonvie rule (grid.zig setViewportMargins): Neovim announces a new
+    // window's margins before the grid_resize that creates it and only
+    // resends them on change, so they are kept for a grid not created yet.
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(10, 20);
+
+    const t = try arena.alloc(mp.Value, 6);
+    t[0] = .{ .int = 4 };
+    t[1] = .{ .int = 1001 };
+    t[2] = .{ .int = 1 };
+    t[3] = .{ .int = 0 };
+    t[4] = .{ .int = 0 };
+    t[5] = .{ .int = 0 };
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "win_viewport_margins", t));
+    // No grid yet: nothing to report.
+    try std.testing.expectEqual(@as(u32, 0), grid.getViewportMargins(4).top);
+    try grid.resizeGrid(4, 6, 8);
+    try std.testing.expectEqual(@as(u32, 1), grid.getViewportMargins(4).top);
+}
+
+test "win_viewport_margins applies a non-integer margin as zero" {
+    // The spec does not say what a malformed tuple means. Zonvie's current
+    // rule, pinned here so a change to it is deliberate: the grid id must be
+    // an Integer, and any margin that is not one is read as 0 and the tuple
+    // applied (unlike win_viewport, which skips the whole tuple).
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(10, 20);
+    try grid.resizeGrid(2, 6, 8);
+
+    const t = try arena.alloc(mp.Value, 6);
+    t[0] = .{ .int = 2 };
+    t[1] = .{ .int = 1000 };
+    t[2] = .{ .str = "junk" };
+    t[3] = .{ .int = 2 };
+    t[4] = .{ .int = 0 };
+    t[5] = .{ .int = 0 };
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "win_viewport_margins", t));
+    try std.testing.expectEqual(@as(u32, 0), grid.getViewportMargins(2).top);
+    try std.testing.expectEqual(@as(u32, 2), grid.getViewportMargins(2).bottom);
+
+    // A non-integer grid id is the one field that skips the tuple.
+    const bad = try arena.dupe(mp.Value, t);
+    bad[0] = .{ .str = "junk" };
+    bad[3] = .{ .int = 5 };
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "win_viewport_margins", bad));
+    try std.testing.expectEqual(@as(u32, 2), grid.getViewportMargins(2).bottom);
+}
+
+test "win_close stops tracking an ext_windows grid, win_hide keeps it for the re-show" {
+    // :help ui-events: win_hide "can be shown again later"; win_close
+    // "Close the window". Zonvie rule built on that: both stop placing the
+    // grid, and only a close forgets the ext_windows mapping a later win_pos
+    // restores the window from.
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(10, 20);
+    try grid.resizeGrid(2, 4, 8);
+    try grid.resizeGrid(3, 4, 8);
+    try grid.setWinPos(2, 1000, 0, 0);
+    try grid.setWinPos(3, 1001, 4, 0);
+    try grid.ext_windows_grids.put(std.testing.allocator, 2, 1000);
+    try grid.ext_windows_grids.put(std.testing.allocator, 3, 1001);
+
+    const hide = try arena.alloc(mp.Value, 1);
+    hide[0] = .{ .int = 2 };
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "win_hide", hide));
+    try std.testing.expect(!grid.win_pos.contains(2));
+    try std.testing.expect(grid.ext_windows_grids.contains(2));
+    try std.testing.expect(!grid.composited_win_closed);
+
+    const close = try arena.alloc(mp.Value, 1);
+    close[0] = .{ .int = 3 };
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "win_close", close));
+    try std.testing.expect(!grid.win_pos.contains(3));
+    try std.testing.expect(!grid.ext_windows_grids.contains(3));
+    // Grid 3 was a composited (split, non-float) window: the promotion step
+    // in rpc_session reads this to drop Neovim's fallback grid 2.
+    try std.testing.expect(grid.composited_win_closed);
+}
+
+test "win_close of a float does not count as closing a composited window" {
+    // Zonvie rule: composited_win_closed means a split that drew on grid 1
+    // went away; a float (win_layer) closing is not that.
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(10, 20);
+    try grid.resizeGrid(5, 2, 4);
+    try grid.setWinFloatPos(5, 1002, 1, 1, 50, 0, 1, true);
+
+    const close = try arena.alloc(mp.Value, 1);
+    close[0] = .{ .int = 5 };
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "win_close", close));
+    try std.testing.expect(!grid.win_pos.contains(5));
+    try std.testing.expect(!grid.composited_win_closed);
+}
+
 test "a mode_info_set whose cursor_style_enabled is not a Boolean is skipped" {
     // :help ui-events mode_info_set: "cursor_style_enabled is a boolean".
     // Anything else is a malformed tuple: neither the flag nor the table
