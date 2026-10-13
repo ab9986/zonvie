@@ -191,9 +191,83 @@ const constant_pairs = .{
     .{ c.ZONVIE_MSG_EVENT_MSG_SHOWCMD, @intFromEnum(c_api.zonvie_msg_event.msg_showcmd) },
     .{ c.ZONVIE_MSG_EVENT_MSG_RULER, @intFromEnum(c_api.zonvie_msg_event.msg_ruler) },
     .{ c.ZONVIE_MSG_EVENT_MSG_HISTORY_SHOW, @intFromEnum(c_api.zonvie_msg_event.msg_history_show) },
+    .{ c.ZONVIE_ROW_UPDATE_NONE, @intFromEnum(frontend_rules.RowUpdate.none) },
+    .{ c.ZONVIE_ROW_UPDATE_MAIN, @intFromEnum(frontend_rules.RowUpdate.main) },
+    .{ c.ZONVIE_ROW_UPDATE_CURSOR_ONLY, @intFromEnum(frontend_rules.RowUpdate.cursor_only) },
+    .{ c.ZONVIE_ROOT_ROW_RETAIN_ROWS, @intFromEnum(frontend_rules.RootRowDisposition.retain_rows) },
+    .{ c.ZONVIE_ROOT_ROW_LAYOUT_ONLY, @intFromEnum(frontend_rules.RootRowDisposition.layout_only) },
+    .{ c.ZONVIE_ROOT_ROW_OUT_OF_RANGE, @intFromEnum(frontend_rules.RootRowDisposition.out_of_range) },
+    .{ c.ZONVIE_ROOT_ROW_SINGLE_ROW, @intFromEnum(frontend_rules.RootRowDisposition.single_row) },
+    .{ c.ZONVIE_ROOT_ROW_MULTI_ROW, @intFromEnum(frontend_rules.RootRowDisposition.multi_row) },
+    .{ c.ZONVIE_ROOT_ROW_NO_ROW, @intFromEnum(frontend_rules.RootRowDisposition.no_row) },
+    .{ c.ZONVIE_ROW_PASS_DIRTY_ROWS_ONLY, @intFromEnum(frontend_rules.RowPassPlan.dirty_rows_only) },
+    .{ c.ZONVIE_ROW_PASS_DIRTY_ROWS_AFTER_SCROLL_BLIT, @intFromEnum(frontend_rules.RowPassPlan.dirty_rows_after_scroll_blit) },
+    .{ c.ZONVIE_ROW_PASS_ALL_ROWS_WITH_RETAINED, @intFromEnum(frontend_rules.RowPassPlan.all_rows_with_retained) },
+    .{ c.ZONVIE_ROW_PASS_ALL_ROWS, @intFromEnum(frontend_rules.RowPassPlan.all_rows) },
     .{ c.ZONVIE_SHADER_TARGET_MSL, @intFromEnum(c_api.zonvie_shader_target.msl) },
     .{ c.ZONVIE_SHADER_TARGET_HLSL, @intFromEnum(c_api.zonvie_shader_target.hlsl) },
 };
+
+fn isZonvieFn(comptime M: type, comptime name: []const u8) bool {
+    if (!std.mem.startsWith(u8, name, "zonvie_")) return false;
+    return @typeInfo(@TypeOf(@field(M, name))) == .@"fn";
+}
+
+/// Compare one function's parameters and return type by size and float-ness,
+/// the same way checkCallbacks compares callback signatures.
+fn checkFn(comptime name: []const u8, comptime fa: std.builtin.Type.Fn, comptime fb: std.builtin.Type.Fn, failures: *usize) void {
+    expectEq(name ++ " param count", fa.params.len, fb.params.len, failures);
+    if (fa.params.len == fb.params.len) {
+        inline for (fa.params, fb.params, 0..) |pa, pb, i| {
+            const pw = comptime blk: {
+                @setEvalBranchQuota(100000);
+                break :blk std.fmt.comptimePrint("{s} param {d}", .{ name, i });
+            };
+            expectEq(pw ++ " size", @sizeOf(pa.type.?), @sizeOf(pb.type.?), failures);
+            expectEq(pw ++ " is float", isFloat(pa.type.?), isFloat(pb.type.?), failures);
+        }
+    }
+    expectEq(name ++ " return size", sizeOrZero(fa.return_type.?), sizeOrZero(fb.return_type.?), failures);
+}
+
+// Every `pub export fn zonvie_*` in c_api.zig is declared in a header with
+// the same shape, and every `zonvie_*` function a header declares is
+// exported by c_api.zig. Both directions, so a function added to one side
+// alone fails here instead of at a frontend's link step.
+test "exported functions match their header declarations" {
+    @setEvalBranchQuota(200000);
+    var failures: usize = 0;
+    var exported: usize = 0;
+    inline for (@typeInfo(c_api).@"struct".decls) |d| {
+        if (comptime isZonvieFn(c_api, d.name)) {
+            exported += 1;
+            if (@hasDecl(c, d.name)) {
+                checkFn(
+                    d.name,
+                    @typeInfo(@TypeOf(@field(c, d.name))).@"fn",
+                    @typeInfo(@TypeOf(@field(c_api, d.name))).@"fn",
+                    &failures,
+                );
+            } else {
+                std.debug.print("ABI mismatch: {s} is exported but not declared in a header\n", .{d.name});
+                failures += 1;
+            }
+        }
+    }
+    var declared: usize = 0;
+    inline for (@typeInfo(c).@"struct".decls) |d| {
+        if (comptime isZonvieFn(c, d.name)) {
+            declared += 1;
+            if (!@hasDecl(c_api, d.name)) {
+                std.debug.print("ABI mismatch: {s} is declared in a header but not exported\n", .{d.name});
+                failures += 1;
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), failures);
+    try std.testing.expect(exported > 0);
+    try std.testing.expectEqual(exported, declared);
+}
 
 test "header constants match their c_api twins" {
     var failures: usize = 0;
