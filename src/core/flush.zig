@@ -3336,8 +3336,12 @@ pub const FlushCtx = struct {
     pub fn onFlush(ctx: *FlushCtx, rows: u32, cols: u32) !void {
         ctx.saw_flush = true;
         ctx.core.flush_retryable = true;
-        // Precondition: grid_mu must be held by the caller (production contract; test harness may not hold lock)
-        // In production, verify: std.debug.assert(ctx.core.grid_mu.tryLock() == false);
+        // Precondition: the caller holds grid_mu as the redraw owner
+        // (lockGridAsRedrawOwner). Every callback this flush invokes may
+        // re-enter the core on that understanding. Unit tests drive a Core
+        // with no other thread and own no lock; marking them as the owner
+        // would switch other paths to their re-entrant branches.
+        if (!@import("builtin").is_test) std.debug.assert(ctx.core.onRedrawThread());
         // Verify no orphaned transaction from previous attempt's error path.
         assertTransactionInactive(ctx.core);
         ctx.core.grid.assertMainShapeMirrored();
