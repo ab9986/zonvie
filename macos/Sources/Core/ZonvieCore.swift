@@ -6920,7 +6920,7 @@ final class ZonvieCore {
         // Expand MTKView to fill the entire container so bloom blur can bleed
         // into the padding area around grid content.
         gridView.frame = layout.containerFrame
-        gridView.viewportOriginPx = CGPoint(x: layout.gridFrame.origin.x, y: layout.gridFrame.origin.y)
+        gridView.viewportOriginPt = CGPoint(x: layout.gridFrame.origin.x, y: layout.gridFrame.origin.y)
         context.containerView.frame = layout.containerFrame
         if let iconFrame = layout.iconFrame, let iconView = self.cmdlineIconView {
             iconView.frame = iconFrame

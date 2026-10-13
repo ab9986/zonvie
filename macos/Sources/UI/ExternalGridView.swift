@@ -645,10 +645,10 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     private let blurEnabled: Bool
     private let isDecoratedSurface: Bool
 
-    // Viewport origin offset (in pixels) for decorated windows where the MTKView
+    // Viewport origin offset (in points) for decorated windows where the MTKView
     // fills the full container but grid content is inset by padding.
     // Allows bloom blur to bleed into the padding area around grid content.
-    var viewportOriginPx: CGPoint = .zero
+    var viewportOriginPt: CGPoint = .zero
 
     // --- Post-process bloom (neon glow) ---
     // Pipelines and sampler are shared from GridSurfaceRenderer.
@@ -1842,7 +1842,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         let offX = Float(windowOffset.x)
         let offY = Float(windowOffset.y)
         // Cursor verts are this grid's own local pixels, y down. The render
-        // path maps them through MTLViewport(origin: viewportOriginPx*scale,
+        // path maps them through MTLViewport(origin: viewportOriginPt*scale,
         // ...) on this view's drawable, and `windowOffset` places that
         // drawable inside the main window's screen space — so the same two
         // translations put the rect where the shader resolves it. The
@@ -1853,8 +1853,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         // preserves the Ghostty contract: iCurrentCursor == the cursor's
         // true on-screen rect.
         let scale = Float(backingScale)
-        let vpOriginX = Float(viewportOriginPx.x) * scale
-        let vpOriginY = Float(viewportOriginPx.y) * scale
+        let vpOriginX = Float(viewportOriginPt.x) * scale
+        let vpOriginY = Float(viewportOriginPt.y) * scale
         // The origin of the grid the cursor is on, which the draw path also
         // feeds SurfaceViewportMetrics, so the two mappings cannot drift. A
         // layer's origin is already surface-absolute (drawHostedLayers binds
@@ -2548,8 +2548,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             let vpWidth = Double(snapGridCols) * Double(cellWi)
             let vpHeight = Double(snapGridRows) * Double(cellHi)
             let scale = backingScale
-            let vpOriginX = Double(viewportOriginPx.x) * Double(scale)
-            let vpOriginY = Double(viewportOriginPx.y) * Double(scale)
+            let vpOriginX = Double(viewportOriginPt.x) * Double(scale)
+            let vpOriginY = Double(viewportOriginPt.y) * Double(scale)
             // The root layer drives the pixel space core vertices arrive in.
             let rootLayerOrigin = rootLayerOriginSnapshot
             let viewportMetrics = SurfaceViewportMetrics(
@@ -3034,7 +3034,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                         if !nonZeroTranslations.isEmpty {
                             ZonvieCore.appLog("[ext_draw_debug] gridId=\(gridId) nonZeroTranslationY rows: \(nonZeroTranslations.map { "r\($0.0):ty=\($0.1):slot=\($0.2):src=\($0.3)" }.joined(separator: " "))")
                         }
-                        ZonvieCore.appLog("[ext_draw_debug] gridId=\(gridId) safeRowCount=\(safeRowCount) dirtyRows=\(dirtyRows.count) useGpuScrollCopy=\(useGpuScrollCopy) use2Pass=\(use2Pass) canBlink=false loadAction=\(rpd.colorAttachments[0].loadAction.rawValue) vpH=\(vpHeight) snapRows=\(snapGridRows) drawableH=\(view.drawableSize.height) vpOriginY=\(viewportOriginPx.y)")
+                        ZonvieCore.appLog("[ext_draw_debug] gridId=\(gridId) safeRowCount=\(safeRowCount) dirtyRows=\(dirtyRows.count) useGpuScrollCopy=\(useGpuScrollCopy) use2Pass=\(use2Pass) canBlink=false loadAction=\(rpd.colorAttachments[0].loadAction.rawValue) vpH=\(vpHeight) snapRows=\(snapGridRows) drawableH=\(view.drawableSize.height) vpOriginY=\(viewportOriginPt.y)")
                     }
 
                     // Shared with GridSurfaceRenderer: the geometry every row
@@ -3406,7 +3406,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         // on that path, so take it from the same source here.
         retention.setDepthRows(core?.getMouseScrollVer() ?? 0)
 
-        let vpOriginYPxForGridTop = Float(viewportOriginPx.y)
+        let vpOriginYPxForGridTop = Float(viewportOriginPt.y)
             * Float(backingScale)
 
         // Resolve every hosted grid's own offset, the way the main window's
@@ -3807,21 +3807,21 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             afterPrecise: { _ in requestRedraw() })
     }
 
-    /// Cursor is grid-local; viewportOriginPx adds a decorated surface's inset
+    /// Cursor is grid-local; viewportOriginPt adds a decorated surface's inset
     /// (e.g. the cmdline icon/padding).
     override func imeCursorRectInView() -> NSRect? {
         guard let core = core else { return nil }
         let cursor = core.getCursorPositionNonBlocking()
         guard cursor.row >= 0, cursor.col >= 0, let origin = imeCursorGridOriginPt(cursor.gridId) else { return nil }
         let cell = imePreeditCellSize
-        return NSRect(x: viewportOriginPx.x + origin.x + CGFloat(cursor.col) * cell.width,
+        return NSRect(x: viewportOriginPt.x + origin.x + CGFloat(cursor.col) * cell.width,
                       y: imeContentTopPt(rowHeightPt: cell.height) - origin.y - CGFloat(cursor.row + 1) * cell.height,
                       width: cell.width, height: cell.height)
     }
 
     override func imeFallbackRectInView() -> NSRect {
         let cell = imePreeditCellSize
-        return NSRect(x: viewportOriginPx.x,
+        return NSRect(x: viewportOriginPt.x,
                       y: imeContentTopPt(rowHeightPt: cell.height) - cell.height,
                       width: cell.width, height: cell.height)
     }
@@ -3859,7 +3859,7 @@ extension ExternalGridView {
         let extent = committedExtent
         lock.unlock()
         let rows = extent.resolved(liveWidth: gridCols, liveHeight: gridRows).height
-        return viewportOriginPx.y + CGFloat(rows) * rowHeightPt
+        return viewportOriginPt.y + CGFloat(rows) * rowHeightPt
     }
 
 }
