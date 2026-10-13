@@ -35,6 +35,7 @@ pub const log_mod = @import("log.zig");
 test {
     _ = @import("abi_header_test.zig");
     _ = @import("consumer_model.zig");
+    _ = @import("redraw_fuzz_test.zig");
     _ = damage_bands;
 }
 
@@ -3326,7 +3327,7 @@ pub export fn zonvie_core_fail_render_budget(p: ?*zonvie_core) callconv(.c) void
 // single active cursor at a time (tracked via cursor_grid/cursor_row/
 // cursor_col), so one cursor_rev bump covers whichever grid currently
 // owns it, main or external.
-fn forceResendAll(cp: *core.Core) void {
+pub fn forceResendAll(cp: *core.Core) void {
     // A newly registered surface needs placement as well as retained rows.
     var layout_it = cp.last_surface_layout.valueIterator();
     while (layout_it.next()) |layout| layout.invalidate();
