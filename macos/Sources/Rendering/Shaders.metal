@@ -216,6 +216,11 @@ struct FixedFloatInterval {
 static inline bool insideFixedFloatAbove(float pixel_x, float pixel_y, float scroll_z,
                                          constant FixedFloatBand* bands, uint band_count,
                                          constant FixedFloatInterval* intervals) {
+    // Bands are sorted by top and disjoint (buildSurfaceFixedFloatMask), so a
+    // pixel outside their combined y range would end the search with false.
+    if (band_count == 0u || pixel_y < bands[0].top || pixel_y > bands[band_count - 1u].bottom) {
+        return false;
+    }
     uint lo = 0u;
     uint hi = band_count;
     while (lo < hi) {
