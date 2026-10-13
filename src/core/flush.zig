@@ -1749,6 +1749,54 @@ const GridRowsResult = struct {
     hl_cache_misses: u32 = 0,
 };
 
+/// Whether a grid's pass must regenerate every row rather than its dirty
+/// ones: a forced redraw, a whole-grid invalidation, or a scroll the
+/// frontend was not sent a row shift for (dispatchGridRowScroll), which left
+/// its rows where they were. One rule for grid 1 and every other grid; grid
+/// 1 never records a scroll op, so for it only the first two terms fire.
+fn rowsOwedFull(buf: *const grid_mod.GridBuf, forced: bool) bool {
+    return forced or buf.dirty_all or (buf.last_scroll_op != null and !buf.row_shift_sent);
+}
+
+/// One grid's row pass, the same for grid 1 and every other grid: emit the
+/// owed rows of `buf` in its own grid-local pixel space, move the dirty state
+/// to owed (the bracket commits or returns it), and keep a grid whose glyph
+/// rasterization missed dirty so the miss is retried rather than left blank.
+/// Nothing is consumed on an abort or an atlas reset: the caller restarts or
+/// cancels every grid's emission.
+fn emitGridPass(
+    core: *Core,
+    row_cb: anytype,
+    grid_id: i64,
+    buf: *grid_mod.GridBuf,
+    tables: RowComposeTables,
+    full_regen: bool,
+    perf: ?*RootRowPerf,
+    log_empty_rows: bool,
+) GridRowsResult {
+    const src = GridRowSource{
+        .grid_id = grid_id,
+        .buf = buf,
+        // The viewport's shape, so the frontend's scroll offset calculation
+        // matches the rows emitted; rows beyond it are not drawable.
+        .rows = buf.rows,
+        .cols = buf.cols,
+        .margins = core.grid.getViewportMargins(grid_id),
+        .is_cmdline = grid_id == grid_mod.CMDLINE_GRID_ID,
+        // A surface root hosting layers skips its default background under
+        // blur, or a second premultiplied `over` compounds the alpha. Settled
+        // for every root before any row by
+        // regenerateRootsWhoseDefaultBgRuleFlipped; a layer's own flag is
+        // never set, which is its answer.
+        .skip_default_bg = buf.skip_default_bg_last,
+    };
+    const pass = emitGridRows(core, row_cb, src, tables, full_regen, perf, log_empty_rows);
+    if (pass.atlas_reset) return pass;
+    if (!core.flush_aborted) buf.consumeDirtyForSend(full_regen);
+    if (pass.had_glyph_miss) buf.markAllDirty();
+    return pass;
+}
+
 /// Compose, generate, charge and send the owed rows of `src`: every row when
 /// `all_rows`, else each dirty row. Stops at an abort, or at a row that reset
 /// the atlas (the flag is consumed and that row is not sent); the caller owns
@@ -3917,28 +3965,6 @@ pub const FlushCtx = struct {
                     // that re-rasterizes every glyph every frame and triggers
                     // constant atlas resets.
 
-                    // Get viewport margins for scrollable row detection
-                    const main_margins = ctx.core.grid.getViewportMargins(1);
-                    const main_src = GridRowSource{
-                        .grid_id = 1,
-                        .buf = ctx.core.grid.bufFor(1).?,
-                        .rows = rows,
-                        .cols = cols,
-                        .margins = main_margins,
-                        .is_cmdline = false,
-                        // The root grid is a container once its windows draw as
-                        // layers: every layer paints the same default
-                        // background, and a second premultiplied `over`
-                        // compounds alpha (0.5 -> 0.75 -> 0.875), which stopped
-                        // the Windows main window being translucent enough for
-                        // blur to show. BLUR ONLY: without blur the frontends
-                        // force backgrounds opaque and apply window opacity at
-                        // the layer level, so nothing compounds and dropping the
-                        // run only thins the surface and leaves the gaps between
-                        // layers unpainted. Settled once this flush, before any
-                        // row, by regenerateRootsWhoseDefaultBgRuleFlipped.
-                        .skip_default_bg = ctx.core.grid.main_buf.skip_default_bg_last,
-                    };
                     const main_tables = RowComposeTables{
                         .hl_cache = hl_cache,
                         .hl_valid = hl_valid,
@@ -3947,13 +3973,11 @@ pub const FlushCtx = struct {
                         .glow_hl_ids = glow_hl_ids,
                     };
 
-                    // Grid 1 owns only its own rows, and under ext_multigrid
-                    // Neovim scrolls the window grids, not grid 1: each
-                    // publishes its own shift through on_grid_row_scroll, so
-                    // the main surface has no scroll fast path of its own and
-                    // every row it owes is a dirty row. A retry after an atlas
-                    // reset arrives with every surface marked dirty.
-                    const pass = emitGridRows(ctx.core, row_cb, main_src, main_tables, rebuild_all, &perf, log_enabled and scrolled_count > 0);
+                    // The row pass is the one every grid runs; the caller's
+                    // rows/cols are grid 1's own shape (assertMainShapeMirrored).
+                    const main_buf = &ctx.core.grid.main_buf;
+                    std.debug.assert(rows == main_buf.rows and cols == main_buf.cols);
+                    const pass = emitGridPass(ctx.core, row_cb, 1, main_buf, main_tables, rowsOwedFull(main_buf, false), &perf, log_enabled and scrolled_count > 0);
                     perf.hl_cache_hits += pass.hl_cache_hits;
                     perf.hl_cache_misses += pass.hl_cache_misses;
                     had_glyph_miss = pass.had_glyph_miss;
@@ -3963,17 +3987,8 @@ pub const FlushCtx = struct {
                         }
                         return true;
                     }
-
-                    // Dirty state is moved to owed, not cleared: the outer
-                    // defer commits it with the bracket or returns it
-                    // (returnOwed) when the frontend refuses. Not consumed on
-                    // an abort raised inside the loop, since nothing was sent.
-                    if (!ctx.core.flush_aborted) ctx.core.grid.main_buf.consumeDirtyForSend(rebuild_all);
-                    if (had_glyph_miss) {
-                        ctx.core.grid.markAllDirty();
-                        if (log_enabled) {
-                            ctx.core.log.write("[scroll_debug] markAllDirty: glyph_miss=true scrolled={d}\n", .{scrolled_count});
-                        }
+                    if (had_glyph_miss and log_enabled) {
+                        ctx.core.log.write("[scroll_debug] markAllDirty: glyph_miss=true scrolled={d}\n", .{scrolled_count});
                     }
                     if (log_enabled and !p.perf_logged.*) {
                         p.perf_logged.* = true;
@@ -4174,8 +4189,7 @@ pub fn placedSurfaceForGrid(grid: *const grid_mod.Grid, grid_id: i64) ?i64 {
 /// Whether positioned grid `grid_id` is a non-empty layer of `surface_id`.
 /// An external grid is its own surface, never a layer of another.
 fn isLayerOfSurface(self: *Core, grid_id: i64, surface_id: i64) bool {
-    if (grid_id == 1) return false;
-    if (self.grid.external_grids.contains(grid_id)) return false;
+    if (self.grid.isSurfaceRoot(grid_id)) return false;
     if (placedSurfaceForGrid(&self.grid, grid_id) != surface_id) return false;
     const sg = self.grid.sub_grids.getPtr(grid_id) orelse return false;
     return sg.rows != 0 and sg.cols != 0;
@@ -4246,7 +4260,7 @@ fn collectSurfaceLayers(self: *Core, surface_id: i64) []const c_api.Layer {
         return &.{};
     };
 
-    if (surface_id != 1 and !self.grid.external_grids.contains(surface_id)) return self.layout_scratch.items;
+    if (!self.grid.isSurfaceRoot(surface_id)) return self.layout_scratch.items;
 
     const entries = collectSurfaceLayerEntries(self, surface_id);
 
@@ -4330,7 +4344,7 @@ fn collectEmitGrids(self: *Core) void {
     }
     var it = self.grid.win_pos.keyIterator();
     while (it.next()) |id| {
-        if (id.* == 1 or self.grid.external_grids.contains(id.*)) continue;
+        if (self.grid.isSurfaceRoot(id.*)) continue;
         if (placedSurfaceForGrid(&self.grid, id.*) == null) continue;
         const sg = self.grid.sub_grids.get(id.*) orelse continue;
         if (sg.rows == 0 or sg.cols == 0) continue;
@@ -4451,7 +4465,7 @@ fn publishSurfaceLayouts(self: *Core) void {
         var sig_it = self.last_surface_layout.iterator();
         while (sig_it.next()) |entry| {
             const id = entry.key_ptr.*;
-            if (id == 1 or self.grid.external_grids.contains(id)) continue;
+            if (self.grid.isSurfaceRoot(id)) continue;
             entry.value_ptr.deinit();
             self.last_surface_layout.removeByPtr(entry.key_ptr);
         }
@@ -5076,13 +5090,9 @@ fn sendExternalGridVertices(
         // Cursor rows are handled via dirty_rows marking below.
         const need_full_redraw = force_redraw_this;
 
-        const viewport_cols = sg.cols;
-        const viewport_rows = sg.rows;
         var ext_saw_atlas_reset: bool = false;
-        var ext_had_glyph_miss: bool = false;
         // Rows this pass regenerated, for the [ext_grid_row] report.
         var regen_count: u32 = 0;
-        var sent_every_row = need_full_redraw;
 
         ext_verts.clearRetainingCapacity();
 
@@ -5092,45 +5102,9 @@ fn sendExternalGridVertices(
 
         // Cursor-only changes must not allocate/scan an entire external grid.
         // The row pipeline below is needed only when content itself is dirty.
+        // The cursor is a separate layer emitted after the rows, never inline
+        // in row vertices, which is what stops it ghosting across a scroll copy.
         if (sg.dirty or need_full_redraw) {
-            const ext_margins = self.grid.getViewportMargins(grid_id);
-
-            const is_cmdline = grid_id == grid_mod.CMDLINE_GRID_ID;
-            // An external grid is a surface root and can host floats, so it owes
-            // the same rule the main root does: once a layer paints the default
-            // background over it, painting it here too compounds the alpha under
-            // blur. Settled for every root at the start of the flush
-            // (regenerateRootsWhoseDefaultBgRuleFlipped); a layer's own flag
-            // is never set, which is its answer.
-            const surface_skips_default_bg = sg.skip_default_bg_last;
-
-            // A scroll the frontend was sent a row shift for (see
-            // dispatchGridRowScroll) needs only the rows it vacated; scroll()
-            // marks exactly those dirty. Any other scroll left the frontend's
-            // rows where they were, so every row is regenerated — a rejected
-            // fast path (several scrolls in a batch, a delta past half the
-            // region, a partial width) and a shift never dispatched alike.
-            // This pass used to re-derive the dispatch's conditions instead of
-            // asking whether it ran, and the two could disagree.
-            const ext_scroll_needs_full_regen: bool =
-                sg.last_scroll_op != null and !sg.row_shift_sent;
-            if (ext_scroll_needs_full_regen) sent_every_row = true;
-
-            // The cursor is a separate layer emitted after the row loop, never
-            // inline in row vertices, which is what stops it ghosting across a
-            // scroll copy.
-
-            // Viewport dimensions, not sg's, so the frontend's scroll offset
-            // calculation matches the rows emitted here.
-            const ext_src = GridRowSource{
-                .grid_id = grid_id,
-                .buf = sg,
-                .rows = viewport_rows,
-                .cols = viewport_cols,
-                .margins = ext_margins,
-                .is_cmdline = is_cmdline,
-                .skip_default_bg = surface_skips_default_bg,
-            };
             const ext_tables = RowComposeTables{
                 .hl_cache = ext_hl_cache,
                 .hl_valid = ext_hl_valid,
@@ -5138,15 +5112,10 @@ fn sendExternalGridVertices(
                 .glow_all = ext_glow_all,
                 .glow_hl_ids = ext_glow_hl_ids,
             };
-            // Only up to viewport_rows, not sg.rows: rows beyond it are not
-            // drawable, so the frontend must not receive vertices for them.
-            // After a scroll the fast path rejected, the frontend cannot
-            // shift rows itself, so every row is regenerated.
-            const pass = emitGridRows(self, row_cb, ext_src, ext_tables, need_full_redraw or ext_scroll_needs_full_regen, null, false);
+            const pass = emitGridPass(self, row_cb, grid_id, sg, ext_tables, rowsOwedFull(sg, need_full_redraw), null, false);
             regen_count = pass.regen_count;
             hl_cache_hits = pass.hl_cache_hits;
             hl_cache_misses = pass.hl_cache_misses;
-            ext_had_glyph_miss = pass.had_glyph_miss;
             // Rows grid 1 and earlier grids sent this flush are stale too.
             if (pass.atlas_reset) ext_saw_atlas_reset_any = true;
         }
@@ -5168,16 +5137,6 @@ fn sendExternalGridVertices(
             grid_id, hl_cache_hits, hl_cache_misses,
         });
 
-        // Dirty state is moved to owed; the outer defer commits or returns
-        // it (returnOwed). A row error aborted before anything was consumed,
-        // so the failed rows stay dirty and the retry owes exactly them.
-        if (!self.flush_aborted) sg.consumeDirtyForSend(sent_every_row);
-        // A rasterizer miss is transient (font backend/cache publication may
-        // complete before the next frame), so keep the grid dirty rather than
-        // let the missing glyph become permanently blank.
-        if (ext_had_glyph_miss) {
-            sg.markAllDirty();
-        }
         // The caller restarts or cancels every grid's emission.
         if (ext_saw_atlas_reset_any) break;
     }
@@ -5805,7 +5764,7 @@ pub const PopupmenuAnchorPlacement = struct { win: i64, row: i32, col: i32 };
 /// hosts was published under its own id, found no window, and was placed
 /// against the main window.
 pub fn popupmenuAnchorPlacement(g: *const grid_mod.Grid, anchor_grid: i64, anchor_row: i32, anchor_col: i32) PopupmenuAnchorPlacement {
-    if (anchor_grid == 1 or g.external_grids.contains(anchor_grid)) {
+    if (g.isSurfaceRoot(anchor_grid)) {
         return .{ .win = anchor_grid, .row = anchor_row, .col = anchor_col };
     }
     const pos = g.win_pos.get(anchor_grid) orelse return .{ .win = anchor_grid, .row = anchor_row, .col = anchor_col };

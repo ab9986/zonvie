@@ -2017,7 +2017,7 @@ pub const Grid = struct {
     /// placed or made an external root. Grid 1 short-circuits so grid_line on
     /// it does no hash lookup.
     fn gridShown(self: *const Grid, grid_id: i64) bool {
-        return grid_id == 1 or self.win_pos.contains(grid_id) or self.external_grids.contains(grid_id);
+        return self.isSurfaceRoot(grid_id) or self.win_pos.contains(grid_id);
     }
 
     pub fn putCell(self: *Grid, row: u32, col: u32, cp: u32, hl: u32) void {
@@ -2121,7 +2121,7 @@ pub const Grid = struct {
         var id = grid_id;
         var remaining = self.win_pos.count() + 1;
         while (remaining > 0) : (remaining -= 1) {
-            if (id == 1 or self.external_grids.contains(id)) return id;
+            if (self.isSurfaceRoot(id)) return id;
             const pos = self.win_pos.get(id) orelse return null;
             id = pos.anchor_grid;
         }
@@ -2992,6 +2992,13 @@ pub const Grid = struct {
 
     pub fn isExternalGrid(self: *const Grid, grid_id: i64) bool {
         return self.external_grids.contains(grid_id);
+    }
+
+    /// Whether `grid_id` is the root of a surface: grid 1 (the main window)
+    /// or an external grid. Every other grid is a layer of some root. The
+    /// one definition the layout, anchor and placement code share.
+    pub fn isSurfaceRoot(self: *const Grid, grid_id: i64) bool {
+        return grid_id == 1 or self.external_grids.contains(grid_id);
     }
 
     /// Ignores an unknown grid or a cell outside it, leaving the previous
