@@ -3271,6 +3271,9 @@ pub export fn zonvie_core_invalidate_glyph_cache(p: ?*zonvie_core) callconv(.c) 
 pub export fn zonvie_core_abort_flush(p: ?*zonvie_core) callconv(.c) void {
     if (p == null) return;
     const box = asBox(p.?);
+    // flush_aborted is a plain bool read by the flush on the core thread; a
+    // write from any other thread is a data race.
+    std.debug.assert(box.core.onRedrawThread());
     box.core.flush_aborted = true;
 }
 
@@ -3341,6 +3344,7 @@ pub export fn zonvie_core_force_resend(p: ?*zonvie_core) callconv(.c) void {
 pub export fn zonvie_core_force_resend_locked(p: ?*zonvie_core) callconv(.c) void {
     if (p == null) return;
     const box = asBox(p.?);
+    std.debug.assert(box.core.onRedrawThread());
     forceResendAll(&box.core);
 }
 

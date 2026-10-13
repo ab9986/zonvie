@@ -1716,7 +1716,13 @@ fn sendRowUpdate(
         .main => c_api.VERT_UPDATE_MAIN,
         .cursor => c_api.VERT_UPDATE_CURSOR,
     };
-    std.debug.assert(@popCount(flags & (c_api.VERT_UPDATE_MAIN | c_api.VERT_UPDATE_CURSOR)) == 1);
+    // The zonvie_core.h on_vertices_row contract, enforced at the one emission point.
+    std.debug.assert(row_count <= 1);
+    if (kind == .main and row_count == 0) {
+        std.debug.assert(verts == null);
+        std.debug.assert(vert_count == 0);
+        std.debug.assert(rows == 0 or cols == 0);
+    }
     row_cb(core.ctx, grid_id, row_start, row_count, verts, vert_count, flags, rows, cols);
 }
 
