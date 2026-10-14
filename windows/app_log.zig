@@ -108,12 +108,19 @@ fn enqueueParts(parts: []const []const u8) void {
     g_queue_cond.signal(clock.io());
 }
 
+/// Monotonic nanoseconds for line stamps, like macOS's CLOCK_UPTIME_RAW. The
+/// GUI harness filters lines by stamp, so a wall-clock step (time sync) would
+/// stamp new lines before ones already written and hide them from it.
+fn monoNs() i128 {
+    return std.Io.Timestamp.now(clock.io(), .awake).nanoseconds;
+}
+
 /// `[zonvie] [   12.345ms] `, the prefix the macOS frontend writes and the GUI
 /// harness parses (test/gui/app_log.zig lineTimestampMs). Without it every
 /// timestamp-filtered helper there discards the line.
 fn stampInto(buf: []u8) []const u8 {
     const start = g_start_ns.load(.acquire);
-    const elapsed_ns: i64 = if (start == 0) 0 else @truncate(clock.nowNs() - start);
+    const elapsed_ns: i64 = if (start == 0) 0 else @truncate(monoNs() - start);
     const ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
     return std.fmt.bufPrint(buf, "[zonvie] [{d:>9.3}ms] ", .{ms}) catch "[zonvie] [    0.000ms] ";
 }
@@ -197,7 +204,7 @@ fn logThreadMain() void {
 /// This is the single source of truth for "frontend logging enabled".
 pub fn setEnabled(enabled: bool) void {
     if (enabled and g_start_ns.load(.acquire) == 0) {
-        g_start_ns.store(@truncate(clock.nowNs()), .release);
+        g_start_ns.store(@truncate(monoNs()), .release);
     }
     if (enabled and g_log_thread == null) {
         g_queue_stop = false;
@@ -288,8 +295,11 @@ pub fn setLogPath(path: ?[]const u8) void {
     if (path) |p| {
         if (p.len > 0) {
             // Append, as macOS does, so a restart keeps the previous session's log.
+            // Read access is required for length(): a write-only handle fails
+            // the stat with AccessDenied, the seek is skipped, and writes then
+            // start at offset 0 over the previous session's lines.
             const io = clock.io();
-            const f = std.Io.Dir.createFileAbsolute(io, p, .{ .truncate = false }) catch return;
+            const f = std.Io.Dir.createFileAbsolute(io, p, .{ .truncate = false, .read = true }) catch return;
             if (f.length(io)) |len| io.vtable.fileSeekTo(io.userdata, f, len) catch {} else |_| {}
             g_log_file = f;
         }
