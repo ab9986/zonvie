@@ -749,6 +749,8 @@ pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, c
 
         // External grid row-buffer scroll fast path notification
         .on_grid_row_scroll = box.cb.on_grid_row_scroll,
+
+        .on_callback_error = box.cb.on_callback_error,
     };
 
     box.core = core.Core.init(box.allocator(), cb_core, ctx);
@@ -1690,29 +1692,6 @@ pub export fn zonvie_core_resolve_pointer_grid(
     ) orelse return 0;
     out.?.* = hit;
     return 1;
-}
-
-/// Whether a float can scroll its own content: it holds more buffer lines than
-/// its content area shows, margins excluded. A float that already shows every
-/// line is transparent to a wheel event.
-///
-/// `pointer_target.resolve` applies this itself; this is for a frontend that
-/// resolves a pointer against its own DRAWN geometry rather than the cell
-/// positions the rule reads — the external surface on macOS — and so needs the
-/// predicate without the rest. Scalars rather than the struct, so the caller
-/// passes what it has.
-pub export fn zonvie_core_captures_scroll(
-    rows: i32,
-    margin_top: i32,
-    margin_bottom: i32,
-    line_count: i64,
-) callconv(.c) c_int {
-    return @intFromBool(pointer_target.capturesScroll(.{
-        .rows = rows,
-        .margin_top = margin_top,
-        .margin_bottom = margin_bottom,
-        .line_count = line_count,
-    }));
 }
 
 pub const zonvie_scrollbar_metrics = scrollbar_metrics.Metrics;
@@ -3799,3 +3778,11 @@ test "special keys are the ones the core names, on either platform's key codes" 
     try std.testing.expect(zonvie_core_key_is_special(0x10000 | 0x2D)); // VK_INSERT
     try std.testing.expect(!zonvie_core_key_is_special(0x10000 | 0x41)); // 'A'
 }
+
+/// zonvie_callback_error_code.
+pub const CallbackErrorCode = enum(u32) {
+    oom = 1,
+    glyph_rasterize = 2,
+    atlas_full = 3,
+    shape_failed = 4,
+};

@@ -53,7 +53,8 @@ const OverflowGridIndex = struct {
 /// 15 elements matches scanEmojiCluster extras and emoji_cluster_buf capacity,
 /// covering the longest ZWJ sequences (e.g., kiss with skin tones = 9 extras).
 pub const OverflowExtras = struct {
-    buf: [15]u32 = undefined,
+    pub const capacity = 15;
+    buf: [capacity]u32 = undefined,
     len: u8 = 0,
 
     pub fn slice(self: *const OverflowExtras) []const u32 {

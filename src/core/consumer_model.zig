@@ -125,6 +125,21 @@ pub const Model = struct {
         return self.committed.getPtr(grid_id);
     }
 
+    /// Neovim shows one cursor, so with it visible on `owner` exactly that
+    /// grid holds a non-empty cursor layer; every other grid was cleared
+    /// (header :205: vert_count=0 clears). null: no grid shows one.
+    pub fn cursorOwnerMismatch(self: *const Model, owner: ?i64) ?[]const u8 {
+        var it = self.committed.iterator();
+        while (it.next()) |e| {
+            const holds = e.value_ptr.cursor.len != 0;
+            const should = owner != null and owner.? == e.key_ptr.*;
+            if (holds and !should) return "a grid the cursor is not on holds a cursor layer";
+            if (!holds and should) return "the cursor's grid holds no cursor layer";
+        }
+        if (owner) |g| if (!self.committed.contains(g)) return "the cursor's grid was never sent";
+        return null;
+    }
+
     fn fail(self: *Model, why: []const u8) void {
         if (self.violation == null) self.violation = why;
     }
@@ -186,7 +201,9 @@ pub const Model = struct {
         const payload: []const Vertex = if (verts) |v| v[0..vert_count] else &.{};
 
         if (cursor) {
-            // Header :196: the complete cursor layer; rows untouched.
+            // Header :173: a vertex carries the grid it belongs to.
+            for (payload) |v| if (v.grid_id != grid_id) return self.fail("CURSOR vertex grid_id differs from the callback's");
+            // Header :205-206: the complete cursor layer; rows untouched.
             self.alloc.free(g.cursor);
             g.cursor = self.alloc.dupe(Vertex, payload) catch return self.fail("model OOM");
             return;
@@ -222,6 +239,8 @@ pub const Model = struct {
         const self = from(ctx);
         if (self.pending == null) return self.fail("on_grid_row_scroll outside a bracket");
         self.shifts += 1;
+        // Header :228: grid 1 never gets a shift.
+        if (grid_id == 1) return self.fail("row shift for grid 1");
         const g = self.pendingGrid(grid_id) catch return self.fail("model OOM");
         // Header :216: always full width.
         if (col_start != 0 or col_end != g.total_cols) return self.fail("row shift not full width");
@@ -320,7 +339,8 @@ test "MAIN replaces one row and leaves the others; CURSOR never touches rows" {
     Model.onFlushBegin(&m);
     const v1 = rowVerts(1, 9);
     sendMain(&m, 2, 1, &v1, 3);
-    const cur = [_]Vertex{vertAt(0, 7)};
+    var cur = [_]Vertex{vertAt(0, 7)};
+    cur[0].grid_id = 2;
     Model.onVerticesRow(&m, 2, 0, 1, &cur, 1, c_api.VERT_UPDATE_CURSOR, 3, 4);
     Model.onFlushEnd(&m);
 
@@ -602,4 +622,37 @@ test "diff reports a row the core never sent" {
     sendMain(&full, 2, 1, &w, 2);
     Model.onFlushEnd(&full);
     try std.testing.expect(diff(m.grid(2).?, full.grid(2).?) != null);
+}
+
+test "a scroll on grid 1 is resent, never shifted" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try defineRowColors(&core);
+    try core.grid.resizeGrid(1, 4, 2);
+    for (0..4) |row| core.grid.putCellGrid(1, @intCast(row), 0, @intCast('A' + row), @intCast(row + 1));
+    core.drawable_w_px = 2;
+    core.drawable_h_px = 4;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    core.grid.cursor_visible = false;
+
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.install(&core.cb, &core.ctx);
+    m.abort_flag = &core.flush_aborted;
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(4, 2);
+    core.grid.scrollGrid(1, 0, 4, 0, 2, 1, 0);
+    core.grid.putCellGrid(1, 3, 0, 'Z', 9);
+    try flush_ctx.onFlush(4, 2);
+    if (m.violation) |why| {
+        std.debug.print("grid 1 scroll: {s}\n", .{why});
+        return error.HeaderViolation;
+    }
+    var full = try fullResend(&core, 4);
+    defer full.deinit();
+    if (diff(m.grid(1).?, full.grid(1).?)) |why| {
+        std.debug.print("grid 1 incremental != full: {s}\n", .{why});
+        return error.IncrementalDiffersFromFull;
+    }
 }

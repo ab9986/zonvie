@@ -692,10 +692,7 @@ fn drawNormalExternalSurfaceRowMode(
         .cursor_grid_changed = cursor_grid_changed,
         .glow_enabled = glow.enabled,
         .opacity = g.opacity,
-        // An external window keeps no back-buffer validity flag of its own, so
-        // it asserts one; that is exactly what its previous bare
-        // `!force_full_rows` preserve_back meant.
-        .back_tex_valid = true,
+        .back_tex_valid = ext_win.back_tex_valid,
     });
     const force_full_rows = paint_policy.force_full_rows;
 
@@ -797,7 +794,7 @@ fn drawNormalExternalSurfaceRowMode(
     var present = app_mod.PresentRectBuilder.begin(
         &ext_win.surf.paint.present_rects,
         app.alloc,
-        render_pipeline_helpers.presentRectCapacity(ext_rows, ext_rows, tbs_snap.layers.len, 5),
+        render_pipeline_helpers.presentRectCapacity(ext_rows, ext_rows, tbs_snap.layers.len, 6),
     );
 
     // Shared with the main window. An external window's back_tex is always
@@ -856,39 +853,32 @@ fn drawNormalExternalSurfaceRowMode(
     // The renderer carries this damage independently for every rotating flip
     // buffer, so a buffer not current this frame catches up when it rotates in.
     // The row-run spans the main driver builds too (rowSpanRects), written
-    // into the rows + 5 slots reserved before the layer plan above, which
+    // into the rows + 6 slots reserved before the layer plan above, which
     // publishes each drawn layer's rectangle into the same list.
     present.addRowSpans(rows_to_draw.items, 0, @intCast(g.width), row_h_px);
     present.addOpt(scroll_damage);
     present.addOpt(restored_scrollbar_rect);
 
     // Cursor shape/blink changes can clear/redraw a row even when no content
-    // row was dirty. Include both the old and new overlay rows.
-    //
-    // Both are rows of the cursor's OWN grid, so a cursor inside a layer needs
-    // that layer's origin added to reach the surface row it was drawn on —
-    // the same term drawCursorOverlay draws it with. Without it a float's
-    // cursor was drawn at one row and presented at another, so a cursor-only
-    // update or a blink tick could reach back_tex and never reach the screen.
-    // (The main window builds this rect from the cursor vertices plus the same
-    // origin; see window.zig's cursor_rc_opt.)
-    const cursor_rect_top_px: i32 = cursor_layer_y_px;
-    if (cursor_row_before) |row| {
-        present.add(.{
-            .left = 0,
-            .top = cursor_rect_top_px + @as(i32, @intCast(row)) * row_h_px,
-            .right = @intCast(g.width),
-            .bottom = cursor_rect_top_px + @as(i32, @intCast(row + 1)) * row_h_px,
-        });
-    }
-    if (ext_win.surf.paint.last_painted_cursor_row) |row| {
-        present.add(.{
-            .left = 0,
-            .top = cursor_rect_top_px + @as(i32, @intCast(row)) * row_h_px,
-            .right = @intCast(g.width),
-            .bottom = cursor_rect_top_px + @as(i32, @intCast(row + 1)) * row_h_px,
-        });
-    }
+    // row was dirty. Shared with the main driver.
+    const cursor_damage = render_pipeline_helpers.cursorDamageRects(
+        c.RECT,
+        cursor_erase_rows,
+        core.cursor_rect.bounds(
+            app_mod.Vertex,
+            tbs_cursor.verts.items,
+            @floatFromInt(cursor_layer_x_px),
+            @floatFromInt(cursor_layer_y_px),
+        ),
+        0,
+        0,
+        content_right,
+        cursor_layer_y_px,
+        row_h_px,
+        @intCast(g.width),
+        @intCast(g.height),
+    );
+    for (cursor_damage) |rc| present.addOpt(rc);
 
     // Scrollbar overlay. Capture the clean, fully-composited strip after
     // bloom so restoring it on the next fade tick does not punch a no-glow
@@ -2996,6 +2986,7 @@ fn requeueExternalFullPaint(app: *App, grid_id: i64, hwnd: c.HWND) void {
     // The retry timer, or device recovery, is what wakes the failing
     // window -- as it is for the main window.
     if (ext_win) |ew| {
+        ew.back_tex_valid = false;
         device_lost = ew.renderer.device_lost;
         main_hwnd = app.hwnd;
     }
@@ -3256,6 +3247,10 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     // geometry.
     const shared_metrics_gen_snapshot = app.shared_metrics_gen;
     const row_h_px_snapshot = app.rowHeightPx();
+    // This surface's counterpart of the main driver's row_layout_gen: a
+    // layout landing mid-paint refuses the present.
+    const layout_rows_snapshot = ext_win.surf.surface.rows;
+    const layout_cols_snapshot = ext_win.surf.surface.cols;
 
     // Get renderer and atlas
     const g: *d3d11.Renderer = &ext_win.renderer;
@@ -3295,7 +3290,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             return;
         }
         // Append cursor vertices so decorated surfaces (cmdline) can render the
-        // cursor, on the blink phase the main driver's flat path uses.
+        // cursor, on the cursor overlay's blink rule.
         const cursor_items = render_pipeline_helpers.cursorVertsForFrame(
             app_mod.Vertex,
             tbs_cursor.verts.items,
@@ -3326,6 +3321,10 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     }
     var ext_paint_full = tbs_snapshot.paint_full or ext_win.surf.surface.paint_full;
     ext_win.surf.surface.paint_full = false;
+    // A device-lost recovery swaps in a fresh renderer and flags paint_full.
+    if (ext_paint_full) ext_win.back_tex_valid = false;
+    // No previous frame to keep: only a full repaint can present.
+    if (!ext_win.back_tex_valid) ext_paint_full = true;
 
     // Check if renderer resize is needed (deferred from onVerticesRow to avoid deadlock)
     const needs_resize = ext_win.needs_renderer_resize;
@@ -3383,6 +3382,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
         if (resized) {
             // back_tex was recreated — force full repaint so all rows are redrawn.
             ext_paint_full = true;
+            ext_win.back_tex_valid = false;
 
             // After resize, DXGI may have pumped messages. Check if ext_win was closed.
             app.mu.lockUncancelable(core.clock.io());
@@ -3433,6 +3433,10 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             // it is a forced-full frame with no rects: the gate presents it
             // to every swapchain buffer.
             const decorated_gate = render_pipeline_helpers.presentGate(.{
+                // Metrics were checked before the draw; a full redraw from
+                // scratch has no snapshotted row layout to go stale.
+                .layout_ok = true,
+                .metrics_ok = true,
                 .force_full_rows = true,
                 .preserve_back = false,
                 .rows = 0,
@@ -3475,6 +3479,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
         ) catch |e| {
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow normal draw failed: {any}\n", .{e});
             if (e == error.RowVBPhysicalBudgetExceeded) {
+                ext_win.back_tex_valid = false;
                 app_mod.failRowVbBudget(app, &ext_win.surf.tbs, tbs_snapshot.layers.slice());
                 return;
             }
@@ -3482,11 +3487,15 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             return;
         };
 
-        const metrics_still_current = !is_row_mode_normal or blk: {
+        var metrics_still_current = true;
+        var layout_still_current = true;
+        {
             app.mu.lockUncancelable(core.clock.io());
             defer app.mu.unlock(core.clock.io());
-            break :blk app.shared_metrics_gen == shared_metrics_gen_snapshot;
-        };
+            if (is_row_mode_normal) metrics_still_current = app.shared_metrics_gen == shared_metrics_gen_snapshot;
+            layout_still_current = ext_win.surf.surface.rows == layout_rows_snapshot and
+                ext_win.surf.surface.cols == layout_cols_snapshot;
+        }
 
         // Asked for, not failed: this frame still presents what it drew, as
         // the main driver's does.
@@ -3497,17 +3506,15 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
         }
         // The main driver's gate, with no seed; an incomplete frame was
         // refused above, by the draw's error.
-        const present_gate = render_pipeline_helpers.presentGate(.{
-            .metrics_ok = metrics_still_current,
-            .force_full_rows = present_facts.force_full_rows,
-            .present_rects_overflowed = present_facts.present_rects_overflowed,
-            .custom_shader = present_facts.custom_shader,
-            .preserve_back = true,
-            .rows = 0,
-            .rows_to_draw = 0,
-            .skipped_empty = 0,
-            .present_rects = ext_win.surf.paint.present_rects.items.len,
-        });
+        const present_gate = render_pipeline_helpers.presentGate(render_pipeline_helpers.externalPresentGateInputs(
+            layout_still_current,
+            metrics_still_current,
+            ext_win.back_tex_valid,
+            present_facts.force_full_rows,
+            present_facts.present_rects_overflowed,
+            present_facts.custom_shader,
+            ext_win.surf.paint.present_rects.items.len,
+        ));
         if (present_gate.verdict == .refuse) {
             requeueExternalFullPaint(app, grid_id, hwnd);
             return;
@@ -3529,6 +3536,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
         }
         // What a test waits on instead of sleeping for a frame.
         if (applog.isEnabled()) applog.appLog("[trace] event=frame_done surface={d}\n", .{grid_id});
+        ext_win.back_tex_valid = present_gate.back_tex_valid;
         ext_win.surf.completePaintRetry();
     }
 }

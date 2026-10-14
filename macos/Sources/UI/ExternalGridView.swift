@@ -130,11 +130,14 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         // Placement alone is content: it must rotate and schedule a paint
         // even when this flush does not submit any rows.
         flushHadContent = true
+        let stagedOwner = cursorOwner.staged
         lock.unlock()
-        if let owner = cursorOwner.staged,
+        if let owner = stagedOwner,
            !layers.contains(where: { $0.gridId == owner }) {
             submitLayerCursor(gridId: owner, ptr: nil, count: 0)
+            lock.lock()
             cursorOwner.stage(gridId)
+            lock.unlock()
         }
     }
 
@@ -231,21 +234,15 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         return -Float(rows) * cellHeightPx
     }
 
-    /// The same debt, read with `lock` already held and the anchor's count
-    /// taken before it. Never seeds: the draw's body call defines the zero.
-    private func hostedFloatDebtPxLocked(gridId: Int64, anchorRowsUp: Int, cellHeightPx: Float) -> Float {
-        guard cellHeightPx > 0 else { return 0 }
-        let rows = floatDebtLedger.rows(
-            gridId: gridId,
-            anchorGridId: self.gridId,
-            anchorRowsUp: anchorRowsUp,
-            placementRowsUp: placementRowsUpSnapshot[gridId] ?? 0,
-            seeding: false,
-            surfaceId: self.gridId,
-            log: nil
-        )
-        return -Float(rows) * cellHeightPx
-    }
+    /// Each follower's debt in rows for the frame being drawn. Filled once
+    /// under `lock` at the committed snapshot; the body, glow and cursor
+    /// placements read it, so the encode loop takes no lock. Draw thread only.
+    private var followerDebtRowsSnapshot: [Int64: Int] = [:]
+    /// The shader cursor's one evaluation moved the rect: whole-surface
+    /// fragment work, so an idle-gate term. Kept across frames that bail
+    /// before presenting, because `evaluate` reports a move only once.
+    /// Draw thread only.
+    private var shaderCursorMovedThisFrame = false
 
     /// Whether a hosted layer moves bodily with this window's root scroll.
     /// Only a float anchored to the root: one anchored to another float would
@@ -253,6 +250,20 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     /// never scrolls, and drift. The main surface refuses the same case.
     private func followsRootScroll(anchorGrid: Int64, followsScroll: Bool) -> Bool {
         followsScroll && anchorGrid == gridId
+    }
+
+    /// Whether a hosted layer follows the root this frame, asked the way the
+    /// main surface asks it of a window-anchored float.
+    private func followsRootScrollNow(
+        anchorGrid: Int64,
+        followsScroll: Bool,
+        ownOffset: GridSurfaceRenderer.ScrollOffset?,
+        rootOffset: GridSurfaceRenderer.ScrollOffset?
+    ) -> Bool {
+        anchorGrid == gridId && surfaceFloatFollowsAnchorScroll(
+            followsScroll: followsScroll,
+            scrolledInOwnRight: ownOffset != nil,
+            anchorIsScrolledWindow: rootOffset != nil)
     }
 
     /// Where a hosted grid is drawn this frame. A grid scrolled in its own
@@ -272,13 +283,17 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         viewportHeightPx: Float,
         cellHeightPx: Float
     ) -> simd_float2 {
-        guard ownOffset == nil, followsRootScroll(anchorGrid: anchorGrid, followsScroll: followsScroll),
+        guard followsRootScrollNow(anchorGrid: anchorGrid, followsScroll: followsScroll,
+                                   ownOffset: ownOffset, rootOffset: rootOffset),
               let rootOffset else { return originPx }
         // The shared helper also refuses a non-finite offset or a zero
         // viewport; the cursor's result reaches `Int(... .rounded(.down))`,
         // where a NaN traps.
         var origin = displacedLayerOriginPx(originPx: originPx, offset: rootOffset, viewportHeightPx: viewportHeightPx)
-        origin.y += hostedFloatDebtPx(gridId: layerGridId, anchorGridId: anchorGrid, cellHeightPx: cellHeightPx)
+        // Sign as in hostedFloatDebtPx.
+        if cellHeightPx > 0 {
+            origin.y -= Float(followerDebtRowsSnapshot[layerGridId] ?? 0) * cellHeightPx
+        }
         return origin
     }
 
@@ -290,6 +305,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     /// Shared with GridSurfaceRenderer. Starts nil — nothing staged yet — and
     /// a nil owner owns nothing, which is what makes a clear from a grid that
     /// is not the owner get dropped before the first cursor arrives.
+    /// Every access, staged and committed, is under `lock`, as on the main
+    /// surface.
     private var cursorOwner = SurfaceCursorOwner(initial: nil)
     var renderTraceFlushId: UInt64 = 0 // Core callback thread only.
 
@@ -339,8 +356,12 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     func submitLayerCursor(gridId id: Int64, ptr: UnsafePointer<zonvie_vertex>?, count: Int, rootRow: Int = -1) {
         guard isInFlush else { return }
         // Clearing another grid must not erase this surface's current cursor.
-        guard cursorOwner.admit(id, count: count, rootRow: rootRow) else {
-            ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=cursor_ignore surface=\(gridId) grid=\(id) owner=\(cursorOwner.staged ?? 0) reason=empty_nonowner")
+        lock.lock()
+        let admitted = cursorOwner.admit(id, count: count, rootRow: rootRow)
+        let stagedOwner = cursorOwner.staged
+        lock.unlock()
+        guard admitted else {
+            ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=cursor_ignore surface=\(gridId) grid=\(id) owner=\(stagedOwner ?? 0) reason=empty_nonowner")
             return
         }
         ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=cursor_route surface=\(gridId) grid=\(id) vertices=\(count)")
@@ -361,14 +382,24 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         }
     }
 
-    func applyLayerRowScroll(gridId id: Int64, rowStart: Int, rowEnd: Int, rowsDelta: Int, totalRows: Int, totalCols: Int) {
+    func applyLayerRowScroll(gridId id: Int64, rowStart: Int, rowEnd: Int, colStart: Int = 0, colEnd: Int? = nil,
+                             rowsDelta: Int, totalRows: Int, totalCols: Int) {
         ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=row_shift surface=\(gridId) grid=\(id) start=\(rowStart) end=\(rowEnd) delta=\(rowsDelta)")
         guard rowsDelta != 0 else { return }
+        // Outside a bracket nothing is latched: it would fail the next flush.
+        // prepareRowWriteState latches its own failure.
         // No capacity pre-check: shift hints precede the rows that grow a
         // layer, and remapSurfaceRowSlots grows the storage itself.
-        guard isInFlush, prepareRowWriteState(),
-              let sets = gridBuffers.existingSets(for: id),
+        guard isInFlush, prepareRowWriteState() else { return }
+        guard let sets = gridBuffers.existingSets(for: id),
               rowStart >= 0, rowEnd > rowStart else {
+            flushFailed = true
+            return
+        }
+        // on_grid_row_scroll's region is always full grid-local width; a
+        // narrower one is a core bug whole-row remaps cannot carry. Fail the
+        // flush so the retry resends every row, as the main surface does.
+        guard colStart == 0, (colEnd ?? totalCols) == totalCols else {
             flushFailed = true
             return
         }
@@ -649,6 +680,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     // fills the full container but grid content is inset by padding.
     // Allows bloom blur to bleed into the padding area around grid content.
     var viewportOriginPt: CGPoint = .zero
+    /// Protected by `lock`; written on the main thread only.
+    private var cursorProjection: CursorProjection?
 
     // --- Post-process bloom (neon glow) ---
     // Pipelines and sampler are shared from GridSurfaceRenderer.
@@ -1050,11 +1083,11 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         // safe (no concurrent committed-set mutation can start once this is
         // set).
         bracketOpen = true
+        cursorOwner.restoreStagedFromCommitted()
         lock.unlock()
 
         isInFlush = true
         flushHadContent = false
-        cursorOwner.restoreStagedFromCommitted()
         return true
     }
 
@@ -1202,6 +1235,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             }
             // Layers and the vertices they place become visible together.
             if let staged = pendingSurfaceLayers {
+                let placementChanged = surfaceLayerPlacementChanged(staged: staged, committed: committedSurfaceLayers)
                 accumulateSurfaceLayerPlacementTravel(
                     staged: staged,
                     committed: committedSurfaceLayers,
@@ -1213,8 +1247,9 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                 pendingSurfaceLayers = nil
                 pruneSurfaceLayerLedger(&layerPlacementRowsUp, to: staged)
                 floatDebtLedger.prune(to: staged)
-                // Removing the last child must erase its old pixels too.
-                pendingLayoutDamage = true
+                // Only a placement change exposes pixels (removing the last
+                // child must erase them too); the same test as the main surface.
+                if placementChanged { pendingLayoutDamage = true }
             }
             // Publish this bracket's retention together with the vertices it
             // belongs to: a retained row shown against pre-scroll content
@@ -1482,16 +1517,12 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         guard rowsDelta != 0 else { return }
         guard rowStart >= 0, rowEnd > rowStart else { return }
 
-        // Consumer-side eligibility: only remap full-width scrolls. The core
-        // only shifts on full grid-local width (gridScrollFastPathRegion in
-        // src/core/flush.zig), so a narrower one has to be redrawn rather than
-        // staged as a shift the blit would apply too wide — returning here
-        // left the region carrying the pre-scroll pixels with nothing owed.
-        // `applyLayerRowScroll` in GridSurfaceRenderer takes the same else.
+        // on_grid_row_scroll's region is always full grid-local width
+        // (gridScrollFastPathRegion in src/core/flush.zig); a narrower one is
+        // a core bug whole-row remaps cannot carry. Fail the flush so the
+        // retry resends every row, as both applyLayerRowScroll do.
         guard colStart == 0, colEnd == totalCols else {
-            lock.lock()
-            flushDirtyRows.insert(integersIn: rowStart..<rowEnd)
-            lock.unlock()
+            flushFailed = true
             return
         }
         // No capacity pre-check here, matching applyLayerRowScroll in
@@ -1831,16 +1862,21 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             lock.unlock()
         }
         guard let local = source.px, let color = source.color else { return }
-        guard let mainView = mainTerminalView else { return }
-        // Same screen-space parameters the shader uniforms use, so the
-        // cursor rect lands in the same coordinate system the shader
-        // resolves against.
-        let (_, windowOffset) = screenSpaceParameters(
-            mainView: mainView,
-            selfView: self
-        )
-        let offX = Float(windowOffset.x)
-        let offY = Float(windowOffset.y)
+        // AppKit geometry is main-thread only; the core thread (cursor
+        // forward) reads the last projection the main thread measured.
+        let projection: CursorProjection
+        if Thread.isMainThread {
+            guard let measured = measureCursorProjection() else { return }
+            projection = measured
+        } else {
+            lock.lock()
+            let cached = cursorProjection
+            lock.unlock()
+            guard let cached else { return }
+            projection = cached
+        }
+        let offX = projection.offX
+        let offY = projection.offY
         // Cursor verts are this grid's own local pixels, y down. The render
         // path maps them through MTLViewport(origin: viewportOriginPt*scale,
         // ...) on this view's drawable, and `windowOffset` places that
@@ -1852,9 +1888,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         // surfaces. Keeping the mapping identical to the render path
         // preserves the Ghostty contract: iCurrentCursor == the cursor's
         // true on-screen rect.
-        let scale = Float(backingScale)
-        let vpOriginX = Float(viewportOriginPt.x) * scale
-        let vpOriginY = Float(viewportOriginPt.y) * scale
+        let vpOriginX = projection.vpOriginX
+        let vpOriginY = projection.vpOriginY
         // The origin of the grid the cursor is on, which the draw path also
         // feeds SurfaceViewportMetrics, so the two mappings cannot drift. A
         // layer's origin is already surface-absolute (drawHostedLayers binds
@@ -1900,6 +1935,37 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         } else {
             shared.shaderCursor.stage(rect: rect, color: color, gridId: owner, by: self)
         }
+    }
+
+    /// The window and viewport translations the cursor projection needs,
+    /// measured on the main thread.
+    struct CursorProjection {
+        var offX: Float
+        var offY: Float
+        var vpOriginX: Float
+        var vpOriginY: Float
+    }
+
+    /// Measure the projection and cache it under `lock` for the core thread.
+    /// Main thread only. Same screen-space parameters the shader uniforms
+    /// use, so the cursor rect lands in the coordinate system the shader
+    /// resolves against.
+    @discardableResult
+    private func measureCursorProjection() -> CursorProjection? {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard let mainView = mainTerminalView else { return nil }
+        let (_, windowOffset) = screenSpaceParameters(mainView: mainView, selfView: self)
+        let scale = Float(backingScale)
+        let measured = CursorProjection(
+            offX: Float(windowOffset.x),
+            offY: Float(windowOffset.y),
+            vpOriginX: Float(viewportOriginPt.x) * scale,
+            vpOriginY: Float(viewportOriginPt.y) * scale
+        )
+        lock.lock()
+        cursorProjection = measured
+        lock.unlock()
+        return measured
     }
 
     /// Shift the back texture's pixels for a committed row scroll, and report
@@ -1985,6 +2051,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             // A repeat held over this view is disarmed from its own frames:
             // the main window may not be drawing at all.
             core?.keyInput.tickKeyRepeatSynthesis()
+            measureCursorProjection()
             defer {
                 FrameTracer.trace(.drawEnd, seq: UInt32(truncatingIfNeeded: gridId))
                 if !finishedRedraw {
@@ -2098,282 +2165,21 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             if previousFrameFailed { hasPresentedOnce = false }
 
             // --- Snapshot committed state under lock (same pattern as GridSurfaceRenderer) ---
-            let csi: Int
-            let cci: Int
-            // Read with `csi`, under the lock: a cursor-only commit refreshes
-            // the committed set's reference while a frame may be encoding it.
-            let atlasTextureSnapshot: MTLTexture?
-            let currentCommitRevision: UInt64
-            let pendingScroll: SurfaceRowScroll?
-            var submittedDirtyRows: [Int] = []
-
-            let snappedCommittedExtent: SurfaceCommittedExtent
-            let lastKnownCursorRowSnapshot: Int
-            let cursorBlinkStateSnapshot: Bool
-            let committedFontIsCurrent: Bool
-            // The shader cursor's measured rect as of this commit. Taken under
-            // the same hold as the committed set, because commitFlush publishes
-            // it under that lock: the uniforms closure below evaluates THIS
-            // value, not whatever a commit landing later in the frame put
-            // there — which was a rect a row step ahead of the rows drawn.
-            let cursorShaderRawSnapshot: SurfaceShaderCursor.Raw
-            let scrollOffsetSnapshot: GridSurfaceRenderer.ScrollOffset?
-            let hostedScrollOffsetSnapshot: [GridSurfaceRenderer.ScrollOffset]
-            let cursorOwnerOffset: GridSurfaceRenderer.ScrollOffset?
-            let cursorShaderOffsetPx: Float?
-            /// The one evaluation moved the rect. Whole-surface fragment work,
-            /// so a term of the idle gate — as on the main surface. Evaluated
-            /// before the gate, a moved rect the gate then skipped was never
-            /// asked for again: the next evaluation finds it already current.
-            let shaderCursorMoved: Bool
-            // Latched with the committed set, not read later: commitFlush
-            // publishes the retention inside this same lock, so taking it
-            // afterwards can pair set N's vertices with set N+1's retained
-            // rows — the retained line drawn against pre-scroll content, which
-            // is the duplicate the publish-on-commit rule exists to prevent.
-            // (GridSurfaceRenderer already snapshots it under its lock.)
-            let retainedSnapshot: [RetainedScrollRow]
-            // commitFlush replaces committedSurfaceLayers wholesale under this
-            // lock, so the root origin must be copied out here rather than read
-            // later in the frame.
-            let rootLayerOriginSnapshot: simd_float2
-            let cursorOwnerSnapshot: Int64
-            let cursorLayerOriginSnapshot: simd_float2
-            let cursorLayerFollowsScrollSnapshot: Bool
-            let cursorLayerAnchorGridSnapshot: Int64
-            let layoutDamageSnapshot: Bool
-
-            // Settle this frame's scroll state BEFORE the latch below, which is
-            // where the main renderer settles its own (`onBeforeCommittedSnapshot`
-            // ahead of its committed snapshot). External windows reuse the main
-            // view's scroll offset storage but do not benefit from its onPreDraw
-            // hook each frame.
-            //
-            // Ordering is the point, not the work: servicing afterwards let a
-            // commit land in between and paired set N's rows and retained band
-            // with set N+1's offset correction — a one-row jump mid-gesture. It
-            // also ran `retention.clearPublished()` after the band had been
-            // snapshotted, so a settled root still drew its stale retained rows.
-            //
-            // Settled against THIS surface's commit, the way the main renderer
-            // settles against its own; shared with it. Returns with `lock` held.
-            var hasScrollOffset = false
-            // For the shader cursor's debt below: a follower follows only the
-            // root (followsRootScroll). Read after serviceFrame, which lands a
-            // pending grid_scroll and bumps the count, so it pairs with the
-            // offset updateScrollShaderOffset publishes, as the body's
-            // hostedFloatDebtPx does.
-            var rootAnchorRowsUp = 0
-            settleSurfaceAgainstOwnCommit(
-                lock: lock,
-                commitRevision: { self.commitRevision },
-                service: {
-                    self.core?.scrollModel.serviceFrame()
-                    rootAnchorRowsUp = self.core?.scrollModel.anchorLandedRowsUpSnapshot(self.gridId) ?? 0
-                    hasScrollOffset = self.updateScrollShaderOffset()
-                }
-            )
-            if rowCapacity.blocksDraw {
-                let terminal = rowCapacity.hardFailure
-                lock.unlock()
-                FrameTracer.trace(.drawSkipRowCapacity, seq: UInt32(truncatingIfNeeded: gridId))
-                inflightSemaphore.signal()
-                redrawScheduler.didDrawFrame()
-                finishedRedraw = true
-                // A hard failure is terminal and never cleared, so re-requesting
-                // a draw only spins without ever presenting.
-                if !terminal {
-                    DispatchQueue.main.async { [weak self] in
-                        self?.requestRedraw()
-                    }
-                }
-                return
-            }
-            csi = committedSetIndex
-            atlasTextureSnapshot = bufferSets[csi].atlasTextureSnapshot
-            retainedSnapshot = retention.snapshotPublished()
-            currentCommitRevision = commitRevision
-            snappedCommittedExtent = committedExtent
-            committedFontIsCurrent = fontResetState.isCurrent(
-                committedGeneration: bufferSets[csi].fontGeneration
-            )
-            gpuInFlightCount[csi] += 1  // Prevent beginFlush from reusing this set
-            // surfaceInflightRowBuffers reports at most two in-flight sets; a
-            // third would escape the row-buffer alias guard.
-            assert(gpuInFlightCount.reduce(0) { $0 + ($1 > 0 ? 1 : 0) } <= 2, "more than two row sets in flight")
-            // The cursor rotates on its own index, so it is snapshotted and
-            // protected on its own: this frame may draw a cursor published
-            // after the row set it draws it over.
-            cci = committedCursorSetIndex
-            cursorGpuInFlightCount[cci] += 1
-            pendingScroll = pendingScrollAccum ?? bufferSets[csi].pendingScroll
-            pendingScrollAccum = nil
-            swap(&submittedDirtyRows, &submittedDirtyRowsScratch)
-            submittedDirtyRows.removeAll(keepingCapacity: true)
-            submittedDirtyRows.append(contentsOf: pendingDirtyRows)
-            pendingDirtyRows.removeAll()
-            lastKnownCursorRowSnapshot = cursorOwner.committedRootRow
-            cursorShaderRawSnapshot = shared.shaderCursor.rawSnapshot()
-            cursorBlinkStateSnapshot = blink.visibleLocked
-            rootLayerOriginSnapshot = committedSurfaceLayers.first?.originPx ?? simd_float2(0, 0)
-            layoutDamageSnapshot = pendingLayoutDamage
-            pendingLayoutDamage = false
-            // One read of the committed owner, used by everything this frame
-            // places against it: the cursor body's origin, whether that origin
-            // follows the scroll, and the shader effect that has to land on the
-            // same cursor. Asking again later is how the body and the effect
-            // came to answer different flushes.
-            cursorOwnerSnapshot = cursorOwner.committed ?? gridId
-            // One resolve where this was three scans of the same list for
-            // three fields of the same entry — which is also what keyed the
-            // float ledger by the pair (float, its anchor).
-            let cursorPlacement = resolveSurfaceCursorPlacement(
-                ownerGridId: cursorOwnerSnapshot,
-                rootGridId: gridId,
-                layers: committedSurfaceLayers
-            )
-            cursorLayerOriginSnapshot = cursorPlacement.originPx
-            cursorLayerFollowsScrollSnapshot = cursorPlacement.followsScroll
-            cursorLayerAnchorGridSnapshot = cursorPlacement.anchorGrid
-            layerSnapshot.removeAll(keepingCapacity: true)
-            // Latched HERE, with the placements it describes. Read anywhere
-            // else it is a commit out of step with them: the counter is copied
-            // before the flush that publishes a placement and this snapshot is
-            // taken after it, which is the skew the main surface had.
-            placementRowsUpSnapshot.removeAll(keepingCapacity: true)
-            for (layerGridId, rows) in layerPlacementRowsUp {
-                placementRowsUpSnapshot[layerGridId] = rows
-            }
-            for layer in committedSurfaceLayers where layer.gridId != gridId {
-                if let sets = gridBuffers.existingSets(for: layer.gridId) {
-                    // This surface keeps no per-layer draw state, so every
-                    // entry owes everything.
-                    layerSnapshot.append(SurfaceLayerFrame(layer: layer, set: sets[csi], state: nil))
-                }
-            }
-            // The displacements this frame draws with, latched with the rows
-            // and the cursor rect they belong to. Only this thread writes
-            // them, so reading them here rather than at the passes below
-            // changes nothing about their value — only that the shader cursor
-            // can be evaluated against them now, under the same hold, which
-            // is the point the main renderer evaluates at too.
-            // More fixed floats than the mask can hold drops the whole scroll
-            // transform for the frame, as the main surface does: a partial
-            // mask lets shifted content bleed through an omitted float, and
-            // clearing the mask alone left every offset applied unmasked.
-            let fixedFloatOverflow = SurfaceFixedFloatMask.overflows(layers: committedSurfaceLayers, rootGridId: gridId)
-            drewWithoutScrollTransform = fixedFloatOverflow
-            scrollOffsetSnapshot = scrollOffsetLatch.isActive && !fixedFloatOverflow ? scrollOffsetData : nil
-            hostedScrollOffsetSnapshot = fixedFloatOverflow ? [] : hostedScrollOffsetData  // Value-type copy
-            // And no retained rows: they are drawn only beside an offset that
-            // places them, and without one they land unshifted and unclipped.
-            if fixedFloatOverflow { hasScrollOffset = false }
-            // What displaces the cursor's own grid, resolved exactly as
-            // drawHostedLayers resolves a layer's: its own offset when it is
-            // scrolling in its own right, the root's when it merely follows,
-            // and nothing at all when it stands still. The body and the cursor
-            // have to answer the same offset or they are drawn a row apart.
-            let cursorOwnOffset = surfaceScrollOffset(gridId: cursorOwnerSnapshot, offsets: hostedScrollOffsetSnapshot)
-            let cursorFollowsRoot = cursorOwnerSnapshot != gridId && cursorOwnOffset == nil
-                && followsRootScroll(anchorGrid: cursorLayerAnchorGridSnapshot, followsScroll: cursorLayerFollowsScrollSnapshot)
-            cursorOwnerOffset = cursorOwnerSnapshot == gridId
-                ? scrollOffsetSnapshot
-                : (cursorOwnOffset ?? (cursorFollowsRoot ? scrollOffsetSnapshot : nil))
-            // Shared with GridSurfaceRenderer. The height is the one every
-            // NDC above was built against, latched beside them rather than
-            // recomputed on a cell size the core may have moved since. A
-            // follower's effect carries its debt, as its body does and as the
-            // main surface folds it into offset_y.
-            var cursorShaderOffset = cursorOwnerOffset
-            if cursorFollowsRoot, var followed = cursorShaderOffset, scrollOffsetViewportHeight > 0 {
-                let debtPx = hostedFloatDebtPxLocked(
-                    gridId: cursorOwnerSnapshot,
-                    anchorRowsUp: rootAnchorRowsUp,
-                    cellHeightPx: Float(shared.cellHeightPx)
-                )
-                followed.offset_y -= debtPx * 2 / scrollOffsetViewportHeight
-                cursorShaderOffset = followed
-            }
-            cursorShaderOffsetPx = surfaceShaderCursorOffsetPx(
-                rawGridId: cursorShaderRawSnapshot.gridId,
-                ownerGridId: cursorOwnerSnapshot,
-                offset: cursorShaderOffset,
-                viewportHeightPx: scrollOffsetViewportHeight
-            )
-            shaderCursorMoved = shared.shaderCursor.evaluate(
-                scrollOffsetPx: cursorShaderOffsetPx, raw: cursorShaderRawSnapshot)
-            lock.unlock()
+            var f = ExternalSurfaceFrame()
+            guard snapshotCommittedFrame(&f, finishedRedraw: &finishedRedraw) else { return }
             defer {
-                submittedDirtyRows.removeAll(keepingCapacity: true)
-                swap(&submittedDirtyRows, &submittedDirtyRowsScratch)
+                f.submittedDirtyRows.removeAll(keepingCapacity: true)
+                swap(&f.submittedDirtyRows, &submittedDirtyRowsScratch)
             }
 
             // Snapshot the previous-frame gate state BEFORE draw() overwrites
             // it (blink.lastRendered at the blink-detection line,
             // lastDrawnRevision right after hasNewCommit is computed), so the
-            // bail helper below can roll both back — mirrors the
+            // bail helper can roll both back — mirrors the
             // prevDrawnRevision/prevRenderedBlinkState rollback in
             // GridSurfaceRenderer.bailWithoutSubmit.
-            let prevDrawnRevision = lastDrawnRevision
-            let prevRenderedBlinkState = blink.lastRendered
-
-            // Restores state consumed above and schedules a retry when a later
-            // resource acquisition fails (back buffer / command buffer / drawable).
-            // Restoring the rows alone is NOT enough: by the time the loss sites
-            // run, lastDrawnRevision has already been overwritten below, so a
-            // retry draw would compute hasNewCommit == false and take the idle
-            // early-exit, re-consuming and discarding the restored rows. Rolling
-            // lastDrawnRevision (and blink.lastRendered) back makes the retry
-            // draw see the commit as new again.
-            // restoreScroll: pass false when the scroll blit has ALREADY been
-            // committed into backTex (the drawable-nil site) — re-queueing the
-            // scroll there would double-shift the already-shifted pixels.
-            /// Put back what this draw consumed, so a retry heals it.
-            ///
-            /// Restores EXACTLY that: the rows it submitted, the flags it
-            /// cleared, the scroll it took. GridSurfaceRenderer restores a
-            /// superset instead — every row dirty and every layer needing a
-            /// full redraw. Two policies for one job, unmeasured against each
-            /// other because the path runs only when a draw gives up, which no
-            /// scenario provokes.
-            func bailWithoutSubmit(_ reason: String, restoreScroll: Bool = true) {
-                ZonvieCore.appLog("[WARNING][ExternalGridView] draw bailed (\(reason)); restoring dirty state for retry gridId=\(gridId)")
-                lock.lock()
-                // Element-wise: IndexSet(submittedDirtyRows) would allocate on
-                // a bail path that already failed to acquire what it needed.
-                for r in submittedDirtyRows { pendingDirtyRows.insert(r) }
-                if layoutDamageSnapshot { pendingLayoutDamage = true }
-                if restoreScroll, let scroll = pendingScroll {
-                    if let existing = pendingScrollAccum,
-                       existing.rowStart == scroll.rowStart,
-                       existing.rowEnd == scroll.rowEnd {
-                        // A concurrent flush installed a NEW accum for the same
-                        // region while this draw was in progress — merge the
-                        // deltas rather than dropping either side, using the
-                        // same merge logic as applyRowScroll's accumulation.
-                        pendingScrollAccum = SurfaceRowScroll(
-                            rowStart: existing.rowStart, rowEnd: existing.rowEnd,
-                            colStart: existing.colStart, colEnd: existing.colEnd,
-                            rowsDelta: clampRowsDelta(existing.rowsDelta &+ scroll.rowsDelta),
-                            totalRows: existing.totalRows, totalCols: existing.totalCols
-                        )
-                    } else if pendingScrollAccum == nil {
-                        pendingScrollAccum = scroll
-                    }
-                    // else: a concurrent flush installed an accum for a
-                    // DIFFERENT region — keep the newer one. The restored dirty
-                    // rows plus the revision rollback force a redraw that heals
-                    // the un-applied older shift via row regeneration.
-                }
-                lock.unlock()
-                lastDrawnRevision = prevDrawnRevision
-                blink.lastRendered = prevRenderedBlinkState
-                finishedRedraw = true
-                redrawScheduler.didDrawFrame()
-                DispatchQueue.main.async { [weak self] in
-                    self?.requestRedraw()
-                }
-            }
+            f.prevDrawnRevision = lastDrawnRevision
+            f.prevRenderedBlinkState = blink.lastRendered
 
             // Safety defer: decrement gpuInFlight and signal semaphore on early return.
             // On normal GPU submission, the completion handler handles cleanup.
@@ -2388,6 +2194,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             // `self` weakly so an abandoned frame does not keep the view alive;
             // the lock and semaphore strongly so the release still runs when it
             // is already gone.
+            let csi = f.csi
+            let cci = f.cci
             let sem = inflightSemaphore
             let tbLock = lock
             let releaseFrameState: () -> Void = { [weak self] in
@@ -2404,7 +2212,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             // The cursor this frame draws, held against reuse by the in-flight
             // count taken with it. Its slot is independent of `committed`.
             let committedCursor = cursorSlots[cci]
-            let rowMode = committed.rowState.usingRowBuffers
+            f.rowMode = committed.rowState.usingRowBuffers
             // Use committed grid dimensions (snapped at commitFlush) to guarantee
             // viewport matches the NDC coordinates baked into committed vertices.
             // Same approach as GridSurfaceRenderer's committedDrawableW/H.
@@ -2413,44 +2221,45 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             // viewport_rows exceeds drawable rows (e.g. sg.rows=45 with winbar
             // but window fits 44), Metal clips to the render target bounds
             // automatically — the NDC mapping stays correct for visible rows.
-            let (snapGridCols, snapGridRows) = snappedCommittedExtent.resolved(
+            let (snapGridCols, snapGridRows) = f.committedExtent.resolved(
                 liveWidth: gridCols,
                 liveHeight: gridRows
             )
+            f.snapGridRows = snapGridRows
             // External grids are row-mode only: the core reaches them through
             // on_vertices_row, and the ABI has no whole-surface callback.
-            if !rowMode {
+            if !f.rowMode {
                 return
             }
             if committed.rowState.buffers.isEmpty {
                 return
             }
 
-            let blinkStateChanged = cursorBlinkStateSnapshot != blink.lastRendered
-            blink.lastRendered = cursorBlinkStateSnapshot
+            f.blinkStateChanged = f.cursorBlink != blink.lastRendered
+            blink.lastRendered = f.cursorBlink
 
-            let drawableSizeChanged = surfaceDrawableSizeChanged(
+            f.drawableSizeChanged = surfaceDrawableSizeChanged(
                 backBufferSize: backBuffer == nil ? nil : backBufferSize,
                 drawableSize: view.drawableSize
             )
-            let hasNewCommit = currentCommitRevision != lastDrawnRevision
-            lastDrawnRevision = currentCommitRevision
+            f.hasNewCommit = f.commitRevision != lastDrawnRevision
+            lastDrawnRevision = f.commitRevision
             // Content questions, asked of content. They used to be gated on
             // `hasNewCommit` because a cursor-only commit did not bump; now that
             // every commit does, the gate would make them true for frames that
             // changed nothing.
-            let hasDirtyContent = !submittedDirtyRows.isEmpty
-            let hasPendingScroll = pendingScroll != nil
+            let hasDirtyContent = !f.submittedDirtyRows.isEmpty
+            f.hasPendingScroll = f.pendingScroll != nil
 
             // `hasScrollOffset` was settled with the rest of this frame's scroll
             // state ahead of the latch, so the offset the shader applies belongs
             // to the set this frame draws.
-            let scrollOffsetChanged = hasScrollOffsetStateChangedSinceLastPresent()
+            f.scrollOffsetChanged = hasScrollOffsetStateChangedSinceLastPresent()
             // Under `lock` because both halves of the latch cross threads here:
             // `updateScrollShaderOffset` sets the live one and
             // `markScrollOffsetStatePresented` moves it into the previous frame.
             lock.lock()
-            let smoothScrolling = scrollOffsetLatch.isSmoothScrolling
+            f.smoothScrolling = scrollOffsetLatch.isSmoothScrolling
             lock.unlock()
 
             // Early exit: nothing changed. A cursor submit is published by a
@@ -2490,20 +2299,20 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             // skip.
             let idleTerms = SurfaceIdleTerms(
                 hasPresentedOnce: hasPresentedOnce,
-                rowModeSatisfied: rowMode,
-                hasNewCommit: hasNewCommit,
+                rowModeSatisfied: f.rowMode,
+                hasNewCommit: f.hasNewCommit,
                 hasDirtyRows: hasDirtyContent,
                 // Layout damage is the whole surface owing a redraw that no
                 // row expresses. It came only with a commit until a
                 // background change could raise it between commits.
-                hasDirtyRect: layoutDamageSnapshot,
-                hasStagedScroll: hasPendingScroll,
-                scrollOffsetChanged: scrollOffsetChanged,
-                isSmoothScrolling: smoothScrolling,
-                blinkStateChanged: blinkStateChanged,
-                drawableSizeChanged: drawableSizeChanged,
+                hasDirtyRect: f.layoutDamage,
+                hasStagedScroll: f.hasPendingScroll,
+                scrollOffsetChanged: f.scrollOffsetChanged,
+                isSmoothScrolling: f.smoothScrolling,
+                blinkStateChanged: f.blinkStateChanged,
+                drawableSizeChanged: f.drawableSizeChanged,
                 shaderAnimates: shaderAnimates,
-                shaderCursorMoved: shaderCursorMoved
+                shaderCursorMoved: shaderCursorMovedThisFrame
             )
             let idleGateSkips = idleTerms.skipsFrame
             ZonvieCore.drawTrace(idleTerms.traceLine(surface: gridId))
@@ -2539,26 +2348,25 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
 
             // Cell dimensions — integer-rounded, same formula as GridSurfaceRenderer.
             let cw = Float(shared.cellWidthPx)
-            let ch = Float(shared.cellHeightPx)
-            let cellWi = max(1, UInt32(cw.rounded(.up)))
-            let cellHi = max(1, UInt32(ch.rounded(.up)))
+            f.ch = Float(shared.cellHeightPx)
+            f.cellWi = max(1, UInt32(cw.rounded(.up)))
+            f.cellHi = max(1, UInt32(f.ch.rounded(.up)))
             // Viewport: grid-rows based (NOT drawable-based). An external
             // grid's viewport_rows may differ from drawableH / cellH, and the
             // core bakes NDC with grid_h = viewport_rows * cellH.
-            let vpWidth = Double(snapGridCols) * Double(cellWi)
-            let vpHeight = Double(snapGridRows) * Double(cellHi)
+            f.vpWidth = Double(snapGridCols) * Double(f.cellWi)
+            f.vpHeight = Double(snapGridRows) * Double(f.cellHi)
             let scale = backingScale
-            let vpOriginX = Double(viewportOriginPt.x) * Double(scale)
-            let vpOriginY = Double(viewportOriginPt.y) * Double(scale)
+            f.vpOriginX = Double(viewportOriginPt.x) * Double(scale)
+            f.vpOriginY = Double(viewportOriginPt.y) * Double(scale)
             // The root layer drives the pixel space core vertices arrive in.
-            let rootLayerOrigin = rootLayerOriginSnapshot
-            let viewportMetrics = SurfaceViewportMetrics(
-                viewportWidth: vpWidth,
-                viewportHeight: vpHeight,
+            f.viewportMetrics = SurfaceViewportMetrics(
+                viewportWidth: f.vpWidth,
+                viewportHeight: f.vpHeight,
                 drawableSize: view.drawableSize,
-                originX: vpOriginX,
-                originY: vpOriginY,
-                layerOriginPx: rootLayerOrigin
+                originX: f.vpOriginX,
+                originY: f.vpOriginY,
+                layerOriginPx: f.rootLayerOrigin
             )
 
             // The union this surface's scrolled content must not bleed over.
@@ -2567,52 +2375,45 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             // nothing displaced to discard. A layer's originPx is already
             // surface-absolute, so the rectangle needs no further placement.
             fixedFloatMask.rebuild(
-                layers: layerSnapshot, rootGridId: gridId, smoothScrolling: smoothScrolling,
-                offsets: hostedScrollOffsetSnapshot, rootScrolled: scrollOffsetSnapshot != nil,
-                cellW: Float(shared.cellWidthPx), cellH: Float(ch), scratch: &fixedFloatRectsScratch
+                layers: layerSnapshot, rootGridId: gridId, smoothScrolling: f.smoothScrolling,
+                offsets: f.hostedScrollOffsets, rootScrolled: f.scrollOffset != nil,
+                cellW: Float(shared.cellWidthPx), cellH: Float(f.ch), scratch: &fixedFloatRectsScratch
             )
 
             // Glow disables partial-redraw optimizations to prevent additive
             // bloom composite from accumulating brightness.
-            let glowEnabled = SurfaceFixedFloatMask.permitsGlow(
-                configured: core?.isGlowEnabled() ?? false, smoothScrolling: smoothScrolling,
+            f.glowEnabled = SurfaceFixedFloatMask.permitsGlow(
+                configured: core?.isGlowEnabled() ?? false, smoothScrolling: f.smoothScrolling,
                 bands: fixedFloatMask.bands)
 
-            let use2Pass = blurEnabled && shared.backgroundPipeline != nil && shared.glyphPipeline != nil
+            f.use2Pass = blurEnabled && shared.backgroundPipeline != nil && shared.glyphPipeline != nil
 
             // Whether a scroll blit MAY run this frame. `useGpuScrollCopy`
-            // below is whether one DID, which is what the load action and
+            // is whether one DID, which is what the load action and
             // the row-pass plan ask; the main surface has always answered
             // them from the outcome, and this surface used to hand them the
             // permission under the same name.
-            let mayGpuScrollCopy = rowMode
-                && !layoutDamageSnapshot
-                && committedFontIsCurrent
-                && pendingScroll != nil
+            f.mayGpuScrollCopy = f.rowMode
+                && !f.layoutDamage
+                && f.fontIsCurrent
+                && f.pendingScroll != nil
                 && !isDecoratedSurface
                 && SurfaceScrollBlitGate(
                     hasPresentedOnce: hasPresentedOnce,
-                    smoothScrolling: smoothScrolling,
-                    drawableSizeChanged: drawableSizeChanged,
-                    hasNewCommit: hasNewCommit,
-                    glowEnabled: glowEnabled,
+                    smoothScrolling: f.smoothScrolling,
+                    drawableSizeChanged: f.drawableSizeChanged,
+                    hasNewCommit: f.hasNewCommit,
+                    glowEnabled: f.glowEnabled,
                     blurEnabled: blurEnabled,
-                    useTwoPass: use2Pass
+                    useTwoPass: f.use2Pass
                 ).refusal == nil
 
             // Row state resolution.
             // A stale set may stay GPU in-flight and must remain immutable.
             // Suppress it logically instead of clearing its row counts.
-            let safeRowCount = rowMode && committedFontIsCurrent
+            f.safeRowCount = f.rowMode && f.fontIsCurrent
                 ? committed.rowLogicalToSlot.count
                 : 0
-
-            func resolvedRowState(_ logicalRow: Int) -> (vc: Int, vb: MTLBuffer, translationY: Float)? {
-                guard logicalRow < safeRowCount else { return nil }
-                // The resolver this surface's hosted layers use: the root is a
-                // grid of this surface like they are.
-                return resolveSurfaceGridRow(committed, row: logicalRow, cellHeightPx: Float(cellHi))
-            }
 
             // Rows retained across a smooth-scroll step are drawn as virtual
             // rows past the end of the grid, so the existing row encoder
@@ -2631,30 +2432,18 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             // above the content edge it left through. With no offset the band
             // is closed and every real row is drawn on the cell grid, so
             // there is nothing for a retained row to cover.
-            let retainedRows = hasScrollOffset ? retainedSnapshot : []
-            let retainedRowBase = safeRowCount
-            let smoothRowRange = 0..<(safeRowCount + retainedRows.count)
-            // Shared with GridSurfaceRenderer; this surface's root is its own grid.
-            func resolvedSmoothRowState(_ logicalRow: Int) -> (vc: Int, vb: MTLBuffer, translationY: Float)? {
-                resolveSurfaceSmoothRow(
-                    logicalRow: logicalRow,
-                    retainedRowBase: retainedRowBase,
-                    retainedRows: retainedRows,
-                    rootGridId: gridId,
-                    cellHeightPx: Int(cellHi),
-                    resolveRow: resolvedRowState
-                )
-            }
+            f.retainedRows = f.hasScrollOffset ? f.retained : []
+            f.smoothRowRange = 0..<(f.safeRowCount + f.retainedRows.count)
 
             // --- Ensure back buffer ---
             ensureBackBuffer(drawableSize: view.drawableSize, pixelFormat: view.colorPixelFormat)
             guard let backTex = backBuffer else {
-                bailWithoutSubmit("no backbuffer")
+                bailWithoutSubmit("no backbuffer", &f, finishedRedraw: &finishedRedraw)
                 return
             }
 
             guard let cmd = queue.makeCommandBuffer() else {
-                bailWithoutSubmit("command buffer creation failed")
+                bailWithoutSubmit("command buffer creation failed", &f, finishedRedraw: &finishedRedraw)
                 return
             }
 
@@ -2676,6 +2465,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             // `mainTerminalView?.renderer`, which is why an external surface
             // could not draw at all without the main window's renderer alive.
             let atlasReader = shared
+            let atlasTextureSnapshot = f.atlasTextureSnapshot
             // `guard let` rather than a plain guard: nil means no read was
             // registered, so the downstream `if let tex = atlasTex` gates become
             // compile errors rather than dead conditionals that would
@@ -2686,7 +2476,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                 // empty command buffer for prompt driver resource release, then
                 // retain this frame's dirty state for the writer retry.
                 cmd.commit()
-                bailWithoutSubmit("atlas reader admission deferred")
+                bailWithoutSubmit("atlas reader admission deferred", &f, finishedRedraw: &finishedRedraw)
                 return
             }
 
@@ -2702,99 +2492,19 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             // A root scroll without pixel copy requires full redraw. Any content
             // change without a root scroll — hosted or the root's own rows —
             // can use its surface damage bands without moving retained pixels.
-            var scrollClearBand: (clearTopPx: Int, clearBottomPx: Int)? = nil
-            var dirtyRows: [Int] = []
-            swap(&dirtyRows, &dirtyRowsScratch)
-            dirtyRows.removeAll(keepingCapacity: true)
-            if mayGpuScrollCopy || !hasPendingScroll {
-                dirtyRows.append(contentsOf: submittedDirtyRows)
+            swap(&f.dirtyRows, &dirtyRowsScratch)
+            f.dirtyRows.removeAll(keepingCapacity: true)
+            if f.mayGpuScrollCopy || !f.hasPendingScroll {
+                f.dirtyRows.append(contentsOf: f.submittedDirtyRows)
             }
-            var useGpuScrollCopy = false
             defer {
-                dirtyRows.removeAll(keepingCapacity: true)
-                swap(&dirtyRows, &dirtyRowsScratch)
+                f.dirtyRows.removeAll(keepingCapacity: true)
+                swap(&f.dirtyRows, &dirtyRowsScratch)
             }
-            if mayGpuScrollCopy, let scroll = pendingScroll {
-                let scrollCopy = encodePendingScrollCopy(
-                    commandBuffer: cmd,
-                    backTexture: backTex,
-                    drawableWidthPx: Int(vpWidth > 0 ? vpWidth : view.drawableSize.width),
-                    rowHeightPx: Int(cellHi),
-                    scroll: scroll
-                )
-                if let scrollCopy {
-                    useGpuScrollCopy = true
-                    scrollClearBand = (
-                        clearTopPx: scrollCopy.clearTopPx,
-                        clearBottomPx: scrollCopy.clearBottomPx
-                    )
-                    dirtyRows.append(contentsOf: scrollCopy.dirtyRows)
-                    // A hosted layer's pixels sit inside the rectangle this blit
-                    // moved: the copy is the surface's full width and cannot tell
-                    // them from the root's. They landed `rowsDelta` rows against
-                    // the scroll, so the root rows they were dragged into hold
-                    // layer pixels now — redraw those from the root's vertices,
-                    // and the rows they came from as well, since a layer off the
-                    // cell grid straddles a row boundary at both ends. Each layer
-                    // then puts itself back on top: `drawHostedLayers` redraws
-                    // every row of it while a scroll is pending.
-                    appendRowsDraggedByLayers(
-                        into: &dirtyRows,
-                        plan: scrollCopy,
-                        rowsDelta: scroll.rowsDelta,
-                        cellWidthPx: Int(cellWi),
-                        rowHeightPx: Int(cellHi)
-                    )
-                } else {
-                    // The blit never ran (scratch texture or blit encoder
-                    // creation failed, or a degenerate copy height — see
-                    // encodePendingScrollCopy's guard clauses), so the back
-                    // texture's pixels were never shifted for this scroll.
-                    // submittedDirtyRows only covers the vacated band on the
-                    // assumption the blit succeeded; every other row in the
-                    // scroll region would otherwise keep its stale,
-                    // un-shifted content forever (the core never re-sends
-                    // rows it only expects the frontend to visually shift).
-                    // Mark the whole scroll region dirty so the per-row
-                    // scissor draw below fully overwrites it from the
-                    // already-remapped row slots' vertex data.
-                    // Keep expansion linear in the scroll-region height; the
-                    // combined rows are canonicalized below.
-                    if let stale = RowScrollBlitPlan.dirtyRowsWithoutBlit(
-                        rowStart: scroll.rowStart,
-                        rowEnd: scroll.rowEnd,
-                        textureHeightPx: backTex.height,
-                        rowHeightPx: Int(cellHi)
-                    ) {
-                        dirtyRows.append(contentsOf: stale)
-                    }
-                }
-            }
-            // Always, not only for a scroll copy. Three consumers below draw
-            // one row per entry, so a duplicate is a redundant draw, and the
-            // hosted-layer band loop turns each entry into a scissor+encode —
-            // where duplicates and out-of-order entries cost the most. The
-            // compaction only shortens the array in place, so this adds no
-            // heap work to the frame.
-            surfaceSortAndDeduplicateRows(&dirtyRows)
-            // The core's damage bands (SurfaceDamageBands): the root and every
-            // hosted layer repaint the rows the bands reach, clipped to the
-            // band, so a partial frame equals a full one inside each band.
-            damageBands.reset()
-            if rowMode && !dirtyRows.isEmpty && Int(cellHi) > 0 {
-                damageBands.addRows(dirtyRows, originYPx: 0, rowHeightPx: Int(cellHi))
-                damageBands.resolve(rowHeightPx: Int(cellHi), surfaceHeightPx: backTex.height)
-                damageBands.layerRows(originYPx: 0, rowCount: safeRowCount, rowHeightPx: Int(cellHi), into: &dirtyRows)
-            }
-            if let scroll = pendingScroll {
-                ZonvieCore.appLog("[ext_scroll_draw] gridId=\(gridId) delta=\(scroll.rowsDelta) rows=\(scroll.rowStart)..<\(scroll.rowEnd) may=\(mayGpuScrollCopy) used=\(useGpuScrollCopy) newCommit=\(hasNewCommit) layout=\(layoutDamageSnapshot) font=\(committedFontIsCurrent) presented=\(hasPresentedOnce) smooth=\(smoothScrolling) size=\(drawableSizeChanged) submitted=\(submittedDirtyRows.count) dirty=\(dirtyRows.count) rev=\(currentCommitRevision)")
-            }
+            encodeRootScrollBlit(&f, cmd: cmd, backTex: backTex, view: view)
+            collectDamageBands(&f, backTex: backTex)
 
             // --- Render into back buffer ---
-            let rpd = MTLRenderPassDescriptor()
-            rpd.colorAttachments[0].texture = backTex
-            rpd.colorAttachments[0].storeAction = .store
-
             // Shared with GridSurfaceRenderer: every per-frame decision below
             // — reuse arms, load action, row-pass plan, background alpha —
             // comes from one term set. This surface has no dirty-rect state
@@ -2811,184 +2521,69 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             // `reusesRootContents`/`reusesHostedContents`, which, like the
             // main surface's skipMainPass, refuse while an ease holds an offset.
             let frameDecision = SurfaceFrameDecision.make(terms: SurfaceFrameTerms(
-                rowMode: rowMode,
-                rowModeSatisfied: rowMode,
+                rowMode: f.rowMode,
+                rowModeSatisfied: f.rowMode,
                 hasPresentedOnce: hasPresentedOnce,
-                drawableSizeChanged: drawableSizeChanged,
-                isSmoothScrolling: smoothScrolling,
+                drawableSizeChanged: f.drawableSizeChanged,
+                isSmoothScrolling: f.smoothScrolling,
                 blurEnabled: blurEnabled,
-                useTwoPass: use2Pass,
-                glowEnabled: glowEnabled,
+                useTwoPass: f.use2Pass,
+                glowEnabled: f.glowEnabled,
                 isDecoratedSurface: isDecoratedSurface,
                 isPopupmenu: gridId == ZonvieCore.popupmenuGridId,
                 shaderChainConsumesSurface: shaderChainConsumesSurface,
                 configuredBlurAlpha: ZonvieConfig.shared.backgroundAlpha,
-                fontIsCurrent: committedFontIsCurrent,
-                hasLayoutDamage: layoutDamageSnapshot,
-                hasDirtyRows: !dirtyRows.isEmpty,
-                hasStagedScroll: hasPendingScroll,
-                scrollOffsetChanged: scrollOffsetChanged,
+                fontIsCurrent: f.fontIsCurrent,
+                hasLayoutDamage: f.layoutDamage,
+                hasDirtyRows: !f.dirtyRows.isEmpty,
+                hasStagedScroll: f.hasPendingScroll,
+                scrollOffsetChanged: f.scrollOffsetChanged,
                 hostsLayersOutsideDirtySet: !layerSnapshot.isEmpty,
-                scrollBlitKeptBackTexture: useGpuScrollCopy,
-                rootScrollBlitVacatedBand: useGpuScrollCopy
+                scrollBlitKeptBackTexture: f.useGpuScrollCopy,
+                rootScrollBlitVacatedBand: f.useGpuScrollCopy
             ))
-            let backgroundAlpha = frameDecision.backgroundAlpha
-            let reuseHostedContents = frameDecision.reusesHostedContents
-            let reuseRootContents = frameDecision.reusesRootContents
-            let partialHostedContents = frameDecision.partialHostedContents
-            if partialHostedContents {
-                ZonvieCore.renderTrace("event=hosted_partial surface=\(gridId) dirty_rows=\(dirtyRows.count)")
+            f.backgroundAlpha = frameDecision.backgroundAlpha
+            f.partialHostedContents = frameDecision.partialHostedContents
+            if f.partialHostedContents {
+                ZonvieCore.renderTrace("event=hosted_partial surface=\(gridId) dirty_rows=\(f.dirtyRows.count)")
             }
             ZonvieCore.drawTrace(frameDecision.traceLine(surface: gridId))
-            rpd.colorAttachments[0].loadAction = frameDecision.loadsPreviousContents ? .load : .clear
+            // Nothing this frame draws into backTex: both reuse arms skip
+            // every root row, and the hosted layers are skipped with them (or
+            // have no layer to visit). With `.load` and `.store` the pass would
+            // still make the GPU resolve the whole attachment for no draw, so
+            // the plan encodes no pass, as the main renderer's skipMainPass
+            // has always done. The cursor is composited onto the drawable in
+            // its own pass below, and the atlas read is released by the command
+            // buffer's completion handler either way.
+            let plan = SurfaceFramePlan.external(decision: frameDecision, rowMode: f.rowMode)
+            let rpd = MTLRenderPassDescriptor()
+            rpd.colorAttachments[0].texture = backTex
+            rpd.colorAttachments[0].storeAction = .store
+            rpd.colorAttachments[0].loadAction = plan.loadsPreviousContents ? .load : .clear
             rpd.colorAttachments[0].clearColor = makeSurfaceClearColor(
                 bgRGB: surfaceBgRGB,
                 clearAlpha: surfaceClearAlpha
             )
 
-            // `scrollOffsetSnapshot`, `hostedScrollOffsetSnapshot` and
-            // `cursorOwnerOffset` were latched with the committed snapshot
-            // above, so the cursor and glow passes below can use them even on
-            // a frame that encodes no surface pass.
+            // `scrollOffset`, `hostedScrollOffsets` and `cursorOwnerOffset`
+            // were latched with the committed snapshot, so the cursor and glow
+            // passes below can use them even on a frame that encodes no
+            // surface pass.
             // Placed as the body of the grid it sits on, or the cursor and its
             // rows are drawn rows apart.
-            let cursorDrawOrigin = hostedDrawOriginPx(
-                originPx: cursorLayerOriginSnapshot,
-                gridId: cursorOwnerSnapshot,
-                anchorGrid: cursorLayerAnchorGridSnapshot,
-                followsScroll: cursorLayerFollowsScrollSnapshot,
-                ownOffset: surfaceScrollOffset(gridId: cursorOwnerSnapshot, offsets: hostedScrollOffsetSnapshot),
-                rootOffset: scrollOffsetSnapshot,
-                viewportHeightPx: viewportMetrics.fragmentHeight,
-                cellHeightPx: Float(ch)
+            f.cursorDrawOrigin = hostedDrawOriginPx(
+                originPx: f.cursorLayerOrigin,
+                gridId: f.cursorOwner,
+                anchorGrid: f.cursorLayerAnchorGrid,
+                followsScroll: f.cursorLayerFollowsScroll,
+                ownOffset: surfaceScrollOffset(gridId: f.cursorOwner, offsets: f.hostedScrollOffsets),
+                rootOffset: f.scrollOffset,
+                viewportHeightPx: f.viewportMetrics.fragmentHeight,
+                cellHeightPx: Float(f.ch)
             )
 
-            /// `glowPipeline` non-nil IS the glow pass. The caller binds it
-            /// from the main renderer's `if let` chain, so passing it in keeps
-            /// that proof instead of reaching back through `mainTerminalView`
-            /// for a pipeline the enclosing scope already holds.
-            func drawHostedLayers(_ encoder: MTLRenderCommandEncoder, glowPipeline: MTLRenderPipelineState? = nil) {
-                let glow = glowPipeline != nil
-                guard committedFontIsCurrent else { return }
-                let extent = simd_float2(viewportMetrics.fragmentWidth, viewportMetrics.fragmentHeight)
-                for entry in layerSnapshot {
-                    let layer = entry.layer
-                    guard let set = entry.set else { continue }
-                    let rows = min(layer.rows, set.rowLogicalToSlot.count)
-                    guard rows > 0 else { continue }
-                    // The shader displaces the rows of a layer with an offset of
-                    // its own, clipped to its content bounds; a follower moves
-                    // bodily — the main window's per-row offset vs `move_all`
-                    // split. Either way clip and geometry share one space.
-                    let layerOffset = surfaceScrollOffset(
-                        gridId: layer.gridId, offsets: hostedScrollOffsetSnapshot)
-                    let origin = hostedDrawOriginPx(
-                        originPx: layer.originPx,
-                        gridId: layer.gridId,
-                        anchorGrid: layer.anchorGrid,
-                        followsScroll: layer.followsScroll,
-                        ownOffset: layerOffset,
-                        rootOffset: scrollOffsetSnapshot,
-                        viewportHeightPx: extent.y,
-                        cellHeightPx: Float(ch)
-                    )
-                    guard let scissor = makeSurfaceLayerScissor(
-                        originPx: origin,
-                        viewportOriginPx: simd_float2(Float(vpOriginX), Float(vpOriginY)),
-                        cols: layer.cols, rows: rows,
-                        cellWidthPx: Int(cellWi), cellHeightPx: Int(cellHi),
-                        scale: glow ? 0.5 : 1,
-                        targetWidth: glow ? max(1, backTex.width / 2) : backTex.width,
-                        targetHeight: glow ? max(1, backTex.height / 2) : backTex.height
-                    ) else { continue }
-                    encoder.setScissorRect(scissor)
-                    bindLayerTransform(encoder: encoder, LayerTransform(originPx: origin, extentPx: extent))
-                    bindSingleSurfaceScrollOffset(encoder: encoder, offset: layerOffset)
-                    // This layer's rows, then the rows its own smooth scroll
-                    // retained, both in its grid-local space; the same
-                    // resolution the main renderer's layer pass uses.
-                    let retainedForLayerCount = collectSurfaceLayerRetainedRows(
-                        gridId: layer.gridId,
-                        retained: retainedSnapshot,
-                        hasScrollOffset: layerOffset != nil,
-                        cellHeightPx: Float(cellHi),
-                        into: &retainedIndexScratch
-                    )
-                    let scratch = retainedIndexScratch
-                    func resolveLayerRow(_ row: Int) -> (vc: Int, vb: MTLBuffer, translationY: Float)? {
-                        resolveSurfaceLayerRow(
-                            row,
-                            set: set,
-                            rowCount: rows,
-                            retained: retainedSnapshot,
-                            retainedIndices: scratch,
-                            cellHeightPx: Float(cellHi)
-                        )
-                    }
-                    if partialHostedContents && !glow {
-                        // Recompose each damage band back-to-front. Every
-                        // layer is clipped to the band the root erased, so
-                        // unchanged pixels are neither cleared nor blended.
-                        var encodedRows = 0
-                        for band in damageBands.bands {
-                            let top = max(scissor.y, Int(band.top_px))
-                            let bottom = min(scissor.y + scissor.height, Int(band.bottom_px))
-                            guard top < bottom else { continue }
-                            encoder.setScissorRect(MTLScissorRect(x: scissor.x, y: top,
-                                width: scissor.width, height: bottom - top))
-                            guard let bandRows = SurfaceDamageBands.rows(
-                                in: band, originYPx: Int(origin.y.rounded(.down)),
-                                rowCount: rows, rowHeightPx: Int(cellHi)
-                            ) else { continue }
-                            encodedRows += encodeSurfaceRowDraws(encoder: encoder, rows: bandRows,
-                                resolve: { resolveSurfaceGridRow(set, row: $0, cellHeightPx: Float(cellHi)) },
-                                pipeline: pipeline, backgroundPipeline: shared.backgroundPipeline,
-                                glyphPipeline: shared.glyphPipeline, useTwoPass: use2Pass,
-                                unifiedBlurPipeline: shared.unifiedBlurPipeline)
-                        }
-                        logHostedLayerDraw(layer: layer, encodedRows: encodedRows, of: rows, drawOriginPx: origin, bodilyMoved: origin != layer.originPx)
-                        continue
-                    }
-                    // A glyph hidden behind a float here must not bloom
-                    // through it, over the same rows the extract draws,
-                    // retained ones included.
-                    if let glowPipeline {
-                        encodeSurfaceLayerGlowRows(
-                            encoder: encoder,
-                            rows: 0..<(rows + retainedForLayerCount),
-                            resolve: resolveLayerRow,
-                            occludePipeline: shared.glowOccludePipeline,
-                            extractPipeline: glowPipeline
-                        )
-                        continue
-                    }
-                    let encodedRows = encodeSurfaceRowDraws(
-                        encoder: encoder, rows: 0..<(rows + retainedForLayerCount),
-                        resolve: resolveLayerRow,
-                        pipeline: pipeline,
-                        backgroundPipeline: shared.backgroundPipeline, glyphPipeline: shared.glyphPipeline,
-                        useTwoPass: use2Pass,
-                        unifiedBlurPipeline: shared.unifiedBlurPipeline
-                    )
-                    logHostedLayerDraw(layer: layer, encodedRows: encodedRows, of: rows, drawOriginPx: origin, bodilyMoved: origin != layer.originPx)
-                }
-                bindLayerTransform(encoder: encoder, viewportMetrics.layerTransform)
-                bindSingleSurfaceScrollOffset(encoder: encoder, offset: scrollOffsetSnapshot)
-                encoder.setScissorRect(MTLScissorRect(x: 0, y: 0,
-                    width: glow ? max(1, backTex.width / 2) : backTex.width,
-                    height: glow ? max(1, backTex.height / 2) : backTex.height))
-            }
-
-            // Nothing this frame draws into backTex: both reuse arms skip
-            // every root row, and drawHostedLayers is skipped with them (or has
-            // no layer to visit). With `.load` and `.store` the pass would
-            // still make the GPU resolve the whole attachment for no draw, so
-            // skip the encoder outright, as the main renderer's skipMainPass
-            // has always done. The cursor is composited onto the drawable in
-            // its own pass below, and the atlas read is released by the command
-            // buffer's completion handler either way.
-            let skipSurfacePass = frameDecision.skipsSurfacePass
-            if !skipSurfacePass {
+            if plan.encodesSurfacePass {
                 guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else {
                     // Encoder creation failed (rare). Commit the empty cmd anyway so
                     // the IOAccelerator region attached to it is reclaimed; otherwise
@@ -3000,86 +2595,14 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                     hasPresentedOnce = false
                     submitSurfaceFrameWithoutPresenting(cmd: cmd, release: releaseFrameState)
                     gpuSubmitted = true
-                    bailWithoutSubmit("render encoder creation failed")
+                    bailWithoutSubmit("render encoder creation failed", &f, finishedRedraw: &finishedRedraw)
                     return
                 }
-                // The atlas texture is also captured for the bloom extract
-                // pass and the cursor pass below.
-                beginSurfaceRowPass(
-                    encoder: enc,
-                    viewportMetrics: viewportMetrics,
-                    pipeline: pipeline,
-                    atlasTexture: atlasTex,
-                    sampler: sampler,
-                    backgroundAlpha: backgroundAlpha,
-                    fixedFloatBands: fixedFloatMask.bands,
-                    fixedFloatIntervals: fixedFloatMask.intervals,
-                    bindScrollOffsets: { bindSingleSurfaceScrollOffset(encoder: $0, offset: scrollOffsetSnapshot) }
+                encodeBackBufferPass(
+                    &f, enc: enc, plan: plan, committed: committed, rpd: rpd,
+                    pipeline: pipeline, sampler: sampler, atlasTex: atlasTex,
+                    backTex: backTex, view: view
                 )
-
-                // --- Row-mode rendering branches — match GridSurfaceRenderer structure ---
-                if rowMode && !reuseHostedContents && !reuseRootContents {
-                    if ZonvieCore.appLogEnabled {
-                        // Debug: log translationY for all rows to detect slot remap drift
-                        var nonZeroTranslations: [(Int, Float, Int, Int)] = []
-                        for row in 0..<safeRowCount {
-                            let slot = row < committed.rowLogicalToSlot.count ? committed.rowLogicalToSlot[row] : -1
-                            let src = (slot >= 0 && slot < committed.rowSlotSourceRows.count) ? committed.rowSlotSourceRows[slot] : -1
-                            if src != row {
-                                if let resolved = resolvedRowState(row) {
-                                    nonZeroTranslations.append((row, resolved.translationY, slot, src))
-                                }
-                            }
-                        }
-                        if !nonZeroTranslations.isEmpty {
-                            ZonvieCore.appLog("[ext_draw_debug] gridId=\(gridId) nonZeroTranslationY rows: \(nonZeroTranslations.map { "r\($0.0):ty=\($0.1):slot=\($0.2):src=\($0.3)" }.joined(separator: " "))")
-                        }
-                        ZonvieCore.appLog("[ext_draw_debug] gridId=\(gridId) safeRowCount=\(safeRowCount) dirtyRows=\(dirtyRows.count) useGpuScrollCopy=\(useGpuScrollCopy) use2Pass=\(use2Pass) canBlink=false loadAction=\(rpd.colorAttachments[0].loadAction.rawValue) vpH=\(vpHeight) snapRows=\(snapGridRows) drawableH=\(view.drawableSize.height) vpOriginY=\(viewportOriginPt.y)")
-                    }
-
-                    // Shared with GridSurfaceRenderer: the geometry every row
-                    // below is placed with. A decorated grid's padding stays
-                    // governed by the transparent render-pass clear outside the
-                    // viewport; the bands only cover the viewport itself.
-                    let rowGeometry = SurfaceRowGeometry(
-                        cellHeightPx: Int(cellHi),
-                        renderTarget: backTex,
-                        viewportMetrics: viewportMetrics,
-                        drawableSize: view.drawableSize
-                    )
-
-                    // Shared with GridSurfaceRenderer: WHICH rows this pass
-                    // draws is one decision; `use2Pass` says HOW.
-                    let rowPassPlan = frameDecision.rowPassPlan
-
-                    encodeSurfaceRootRowPass(
-                        encoder: enc,
-                        plan: rowPassPlan,
-                        useTwoPass: use2Pass,
-                        dirtyRows: dirtyRows,
-                        rowCount: safeRowCount,
-                        smoothRows: smoothRowRange,
-                        resolveRow: resolvedRowState,
-                        resolveSmoothRow: resolvedSmoothRowState,
-                        geometry: rowGeometry,
-                        scrollClearBand: scrollClearBand,
-                        pipeline: pipeline,
-                        shared: shared,
-                        bgRGB: surfaceBgRGB,
-                        gridId: gridId,
-                        damageBands: damageBands.bands
-                    )
-                }
-
-                // Hosted grids use the same row-slot resolution and pipelines as
-                // the root. The shared back texture is recomposed before effects.
-                if !reuseHostedContents { drawHostedLayers(enc) }
-
-                // Cursor is NOT drawn into backbuffer — it is composited onto the
-                // drawable after blit, so the persistent backbuffer stays cursor-free
-                // and GPU scroll-region copies don't shift stale cursor pixels.
-
-                enc.endEncoding()
             } else {
                 // Traced on the path that actually skipped, not where the flag
                 // is computed: the claim being made is that no surface pass was
@@ -3092,63 +2615,30 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             // the radius are read from differs, and this surface's viewport
             // does not start at the drawable's origin.
             let glowPassSucceeded = encodeSurfaceBloom(
-                enabled: glowEnabled,
+                enabled: f.glowEnabled,
                 shared: shared,
                 cmd: cmd,
                 backTex: backTex,
                 pixelFormat: view.colorPixelFormat,
-                viewportMetrics: viewportMetrics,
+                viewportMetrics: f.viewportMetrics,
                 drawableSize: view.drawableSize,
-                viewportOrigin: CGPoint(x: vpOriginX, y: vpOriginY),
+                viewportOrigin: CGPoint(x: f.vpOriginX, y: f.vpOriginY),
                 glowTextures: glowTextures,
                 intensity: core?.getGlowIntensity() ?? 0.8,
                 // One read, for both the chain's depth and the taps' reach.
                 radiusScale: core?.getGlowRadiusScale() ?? 1.0
             ) { enc, extractPipe in
-                    // Set up atlas and scroll offsets for extract pass.
-                    // The bloom helper binds the layer transform (vertex buffer 4).
-                    bindSurfaceGlowExtractState(
-                        encoder: enc,
-                        atlasTexture: atlasTex,
-                        sampler: self.shared.sampler!,
-                        backgroundAlpha: backgroundAlpha,
-                        bindScrollOffsets: { bindSingleSurfaceScrollOffset(encoder: $0, offset: scrollOffsetSnapshot) }
-                    )
-
-                    // Draw row vertices. The same range the main pass draws:
-                    // glow forces a `.clear`, so a retained row left out here
-                    // has no previous-frame light to fall back on and the band
-                    // a scroll vacated renders unlit for the whole ease. The
-                    // main renderer's extract covers its retained rows for the
-                    // same reason.
-                    if rowMode {
-                        encodeSurfaceResolvedRows(encoder: enc, rows: smoothRowRange, resolve: resolvedSmoothRowState)
-                    }
-
-                    drawHostedLayers(enc, glowPipeline: extractPipe)
-
-                    // Cursor vertices for cursor glow
-                    if committedFontIsCurrent,
-                       cursorBlinkStateSnapshot,
-                       committedCursor.vertexCount > 0,
-                       let cvb = committedCursor.vertexBuffer {
-                        // drawHostedLayers left the surface-wide offset bound.
-                        encodeSurfaceCursorGlowExtract(
-                            encoder: enc,
-                            vertexBuffer: cvb,
-                            vertexCount: committedCursor.vertexCount,
-                            layerOriginPx: cursorDrawOrigin,
-                            viewportMetrics: viewportMetrics,
-                            bindScrollOffsets: { bindSingleSurfaceScrollOffset(encoder: $0, offset: cursorOwnerOffset) }
-                        )
-                    }
-                    }
+                self.encodeGlowExtract(
+                    &f, enc: enc, extractPipe: extractPipe, committed: committed,
+                    committedCursor: committedCursor, pipeline: pipeline, atlasTex: atlasTex,
+                    backTex: backTex
+                )
+            }
 
             guard glowPassSucceeded else {
-                submitSurfaceFrameWithoutPresenting(cmd: cmd, release: releaseAbandonedFrame)
+                abandonSubmittedFrame("glow resource/encoder creation failed", cmd: cmd, release: releaseAbandonedFrame,
+                                      &f, finishedRedraw: &finishedRedraw)
                 gpuSubmitted = true
-                hasPresentedOnce = false
-                bailWithoutSubmit("glow resource/encoder creation failed", restoreScroll: false)
                 return
             }
 
@@ -3177,161 +2667,34 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                 // Rows + revision restored, scroll NOT restored: the scroll
                 // blit is already committed into backTex above; restoring it
                 // would shift those pixels a second time on the retry.
-                bailWithoutSubmit("no drawable (rendered to backTex but nothing to present)", restoreScroll: false)
+                bailWithoutSubmit("no drawable (rendered to backTex but nothing to present)", &f,
+                                  restoreScroll: false, finishedRedraw: &finishedRedraw)
                 return
             }
-            // User-supplied custom post-process shaders take over the
-            // backTex -> drawable copy when configured in `.afterBloom`
-            // mode. The shader samples backTex (which already contains
-            // main render + optional bloom) and writes directly to the
-            // drawable, replacing the normal blit. The chain itself is
-            // encoded by the same helper the main surface drives; only the
-            // uniforms differ, because this window's screen-space origin does.
-            // Shared with GridSurfaceRenderer: the chain-or-copy ladder is one
-            // function now. The uniforms closure below is the only part this
-            // surface does differently, and it runs only when the chain does.
-            //
-            // The plain copy used to take its pipeline, vertex buffer and
-            // sampler from `mainTerminalView?.renderer`, which meant an
-            // external surface could not present at ALL without the main one —
-            // the last hard reach-through in this function, and in the ordinary
-            // path, not an optional effect. They come from `shared` now, where
-            // stage 0 put them.
-            let presentation = encodeSurfaceBackBufferToDrawable(
-                cmd: cmd,
-                backTex: backTex,
-                drawableTexture: drawable.texture,
-                customShaderPipelines: surfaceCustomShaderPipelines(),
-                runsCustomShaderChain: shared.customShaderPostProcess == .afterBloom
-                    && mainTerminalView?.renderer != nil,
-                customShaderPong: customShaderPong,
-                pongSize: view.drawableSize,
-                copyPipeline: shared.copyPipeline,
-                copyVertexBuffer: shared.copyVertexBuffer,
-                sampler: shared.sampler,
-                bilinearSampler: shared.bilinearSampler,
-                makeUniforms: { [weak self] in
-                    guard let self, let renderer = self.mainTerminalView?.renderer else {
-                        return zonvie_shader_uniforms()
-                    }
-                    // Screen-space unification: use the MAIN window's drawable
-                    // as the shader's iResolution, and tell the shader where
-                    // this external view sits inside that coordinate space so
-                    // effects (stars, gradients, spotlights) line up across all
-                    // windows.
-                    let (screenRes, windowOffset) = screenSpaceParameters(
-                        mainView: self.mainTerminalView,
-                        selfView: self
-                    )
-                    // The cursor rect was evaluated with the committed snapshot
-                    // this frame draws, under the same hold; the uniforms read it.
-                    // The rect the shader gets beside the row and displacement
-                    // the body is drawn with THIS frame. Their difference is a
-                    // constant while the two describe the same commit; a rect
-                    // evaluated against a newer flush's cursor shows up as one
-                    // row step in it. Emitted on change only.
-                    if ZonvieCore.appLogEnabled, let offPx = cursorShaderOffsetPx {
-                        let y = self.shared.shaderCursor.snapshot().current.1
-                        let frame = (lastKnownCursorRowSnapshot, offPx, y)
-                        if frame != self.lastLoggedCursorFrame {
-                            self.lastLoggedCursorFrame = frame
-                            ZonvieCore.appLog("[ext_shader_cursor_frame] gridId=\(self.gridId) row=\(frame.0) offPx=\(offPx) y=\(y)")
-                        }
-                    }
-                    // This surface's own scale, because the rect the log line
-                    // carries is in ITS drawable pixels. Reading it off the
-                    // main renderer, which is what calling through it did,
-                    // reported the main window's — the same number only while
-                    // every window sits on one display.
-                    return self.shared.makeShaderUniforms(
-                        screenResolution: screenRes,
-                        windowOffset: windowOffset,
-                        windowSize: view.drawableSize,
-                        backingScale: self.backingScale,
-                        timing: self.shaderTiming,
-                        lastLoggedCursor: &self.lastLoggedShaderCursor
-                    )
-                }
-            )
+
+            let presentation = encodeBackBufferToDrawable(&f, cmd: cmd, backTex: backTex, drawable: drawable, view: view)
 
             guard presentation.encoded else {
                 // Back-buffer work is valid and must be submitted to release
                 // its Metal resources, but the drawable was not populated.
                 // Keep the consumed rows/revision pending for another draw.
-                submitSurfaceFrameWithoutPresenting(cmd: cmd, release: releaseAbandonedFrame)
+                abandonSubmittedFrame("final blit encoder creation failed", cmd: cmd, release: releaseAbandonedFrame,
+                                      &f, finishedRedraw: &finishedRedraw)
                 gpuSubmitted = true
-                hasPresentedOnce = false
-                bailWithoutSubmit("final blit encoder creation failed", restoreScroll: false)
                 return
             }
 
-            // --- Cursor overlay: composited on drawable (not backbuffer) ---
-            // Keeps persistent backbuffer cursor-free so GPU scroll copies
-            // don't shift stale cursor pixels (same as GridSurfaceRenderer).
-            if committedFontIsCurrent,
-               cursorBlinkStateSnapshot,
-               committedCursor.vertexCount > 0,
-               let cursorBuf = committedCursor.vertexBuffer {
-                // Shared with GridSurfaceRenderer. This surface binds the
-                // single offset of the grid that owns the cursor where the main
-                // one binds an array, and it attaches no perf samples.
-                let cursorEncoded = encodeSurfaceCursorOverlay(
-                    cmd: cmd,
-                    drawableTexture: drawable.texture,
-                    pipeline: pipeline,
-                    atlasTexture: atlasTex,
-                    sampler: sampler,
-                    viewportMetrics: viewportMetrics,
-                    cursorVertexBuffer: cursorBuf,
-                    cursorVertexCount: committedCursor.vertexCount,
-                    layerOriginPx: cursorDrawOrigin,
-                    backgroundAlpha: backgroundAlpha,
-                    fixedFloatBands: fixedFloatMask.bands,
-                    fixedFloatIntervals: fixedFloatMask.intervals,
-                    bindScrollOffsets: { cursorEnc in
-                        bindSingleSurfaceScrollOffset(encoder: cursorEnc, offset: cursorOwnerOffset)
-                    }
-                )
-                if !cursorEncoded {
-                    submitSurfaceFrameWithoutPresenting(cmd: cmd, release: releaseAbandonedFrame)
-                    gpuSubmitted = true
-                    hasPresentedOnce = false
-                    // Main/back-buffer and scroll work is now submitted, so
-                    // do not queue the pixel shift a second time. Restored rows
-                    // and revision state produce a complete retry.
-                    bailWithoutSubmit("cursor encoder creation failed", restoreScroll: false)
-                    return
-                }
+            if !encodeCursorOverlay(
+                &f, cmd: cmd, drawable: drawable, committedCursor: committedCursor,
+                pipeline: pipeline, sampler: sampler, atlasTex: atlasTex
+            ) {
+                abandonSubmittedFrame("cursor encoder creation failed", cmd: cmd, release: releaseAbandonedFrame,
+                                      &f, finishedRedraw: &finishedRedraw)
+                gpuSubmitted = true
+                return
             }
 
-            FrameTracer.tracePresented(drawable, seq: UInt32(truncatingIfNeeded: gridId))
-            FrameTracer.trace(.presentCall, seq: UInt32(truncatingIfNeeded: gridId))
-            cmd.present(drawable)
-            // `sem` and `tbLock` are the ones captured for `releaseFrameState`
-            // above, for the same reason: the signal has to fire even if the
-            // view is deallocated before the GPU finishes.
-            let traceSurfaceId = gridId
-            cmd.addCompletedHandler { [weak self] completed in
-                let failed = completed.status != .completed
-                tbLock.lock()
-                self?.completeSurfaceFrameReadLocked(rowSet: csi, cursorSlot: cci)
-                if failed { self?.gpuFrameFailed = true }
-                tbLock.unlock()
-                sem.signal()
-                // Paired with beginExternalRead() at atlas-bind time
-                // above. Uses the strongly-captured atlasReadRenderer, not
-                // [weak self] — see its declaration comment for why.
-                atlasReader.endExternalRead()
-                if failed {
-                    DispatchQueue.main.async { [weak self] in
-                        self?.requestRedraw()
-                    }
-                } else if ZonvieCore.appLogEnabled {
-                    // What a test waits on instead of sleeping for a frame.
-                    ZonvieCore.appLog("[trace] event=frame_done surface=\(traceSurfaceId)")
-                }
-            }
-            cmd.commit()
+            presentAndCommit(cmd: cmd, drawable: drawable, rowSet: csi, cursorSlot: cci, atlasReader: atlasReader)
             gpuSubmitted = true
 
             markScrollOffsetStatePresented()
@@ -3351,18 +2714,848 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         }
     }
 
+    // MARK: - draw(in:) phases
+    //
+    // Each takes the frame `inout`, so no phase captures another's locals and
+    // no closure context is made for them; GPU commands are encoded in the
+    // order draw(in:) calls these.
+
+    /// Phase 1: everything the frame reads from state the core thread
+    /// writes, taken under one hold of `lock`. Returns false, having released
+    /// what it took, when the frame must not draw.
+    private func snapshotCommittedFrame(_ f: inout ExternalSurfaceFrame, finishedRedraw: inout Bool) -> Bool {
+        // Settle this frame's scroll state BEFORE the latch below, which is
+        // where the main renderer settles its own (`onBeforeCommittedSnapshot`
+        // ahead of its committed snapshot). External windows reuse the main
+        // view's scroll offset storage but do not benefit from its onPreDraw
+        // hook each frame.
+        //
+        // Ordering is the point, not the work: servicing afterwards let a
+        // commit land in between and paired set N's rows and retained band
+        // with set N+1's offset correction — a one-row jump mid-gesture. It
+        // also ran `retention.clearPublished()` after the band had been
+        // snapshotted, so a settled root still drew its stale retained rows.
+        //
+        // Settled against THIS surface's commit, the way the main renderer
+        // settles against its own; shared with it. Returns with `lock` held.
+        //
+        // For the follower debts below: a follower follows only the root
+        // (followsRootScroll). Read after serviceFrame, which lands a
+        // pending grid_scroll and bumps the count, so it pairs with the
+        // offset updateScrollShaderOffset publishes.
+        var rootAnchorRowsUp = 0
+        let settled = settleSurfaceAgainstOwnCommit(
+            lock: lock,
+            commitRevision: { self.commitRevision },
+            service: {
+                self.core?.scrollModel.serviceFrame()
+                rootAnchorRowsUp = self.core?.scrollModel.anchorLandedRowsUpSnapshot(self.gridId) ?? 0
+                f.hasScrollOffset = self.updateScrollShaderOffset()
+            }
+        )
+        if !settled || rowCapacity.blocksDraw {
+            let terminal = rowCapacity.hardFailure
+            lock.unlock()
+            FrameTracer.trace(.drawSkipRowCapacity, seq: UInt32(truncatingIfNeeded: gridId))
+            inflightSemaphore.signal()
+            redrawScheduler.didDrawFrame()
+            finishedRedraw = true
+            // A hard failure is terminal and never cleared, so re-requesting
+            // a draw only spins without ever presenting.
+            if !terminal {
+                DispatchQueue.main.async { [weak self] in
+                    self?.requestRedraw()
+                }
+            }
+            return false
+        }
+        f.csi = committedSetIndex
+        // Read with `csi`, under the lock: a cursor-only commit refreshes
+        // the committed set's reference while a frame may be encoding it.
+        f.atlasTextureSnapshot = bufferSets[f.csi].atlasTextureSnapshot
+        // Latched with the committed set, not read later: commitFlush
+        // publishes the retention inside this same lock, so taking it
+        // afterwards can pair set N's vertices with set N+1's retained
+        // rows — the retained line drawn against pre-scroll content, which
+        // is the duplicate the publish-on-commit rule exists to prevent.
+        // (GridSurfaceRenderer already snapshots it under its lock.)
+        f.retained = retention.snapshotPublished()
+        f.commitRevision = commitRevision
+        f.committedExtent = committedExtent
+        f.fontIsCurrent = fontResetState.isCurrent(
+            committedGeneration: bufferSets[f.csi].fontGeneration
+        )
+        gpuInFlightCount[f.csi] += 1  // Prevent beginFlush from reusing this set
+        // surfaceInflightRowBuffers reports at most two in-flight sets; a
+        // third would escape the row-buffer alias guard.
+        assert(gpuInFlightCount.reduce(0) { $0 + ($1 > 0 ? 1 : 0) } <= 2, "more than two row sets in flight")
+        // The cursor rotates on its own index, so it is snapshotted and
+        // protected on its own: this frame may draw a cursor published
+        // after the row set it draws it over.
+        f.cci = committedCursorSetIndex
+        cursorGpuInFlightCount[f.cci] += 1
+        f.pendingScroll = pendingScrollAccum ?? bufferSets[f.csi].pendingScroll
+        pendingScrollAccum = nil
+        swap(&f.submittedDirtyRows, &submittedDirtyRowsScratch)
+        f.submittedDirtyRows.removeAll(keepingCapacity: true)
+        f.submittedDirtyRows.append(contentsOf: pendingDirtyRows)
+        pendingDirtyRows.removeAll()
+        f.lastKnownCursorRow = cursorOwner.committedRootRow
+        // The shader cursor's measured rect as of this commit. Taken under
+        // the same hold as the committed set, because commitFlush publishes
+        // it under that lock: the uniforms closure evaluates THIS
+        // value, not whatever a commit landing later in the frame put
+        // there — which was a rect a row step ahead of the rows drawn.
+        let cursorShaderRawSnapshot = shared.shaderCursor.rawSnapshot()
+        f.cursorBlink = blink.visibleLocked
+        // commitFlush replaces committedSurfaceLayers wholesale under this
+        // lock, so the root origin must be copied out here rather than read
+        // later in the frame.
+        f.rootLayerOrigin = committedSurfaceLayers.first?.originPx ?? simd_float2(0, 0)
+        f.layoutDamage = pendingLayoutDamage
+        pendingLayoutDamage = false
+        // One read of the committed owner, used by everything this frame
+        // places against it: the cursor body's origin, whether that origin
+        // follows the scroll, and the shader effect that has to land on the
+        // same cursor. Asking again later is how the body and the effect
+        // came to answer different flushes.
+        f.cursorOwner = cursorOwner.committed ?? gridId
+        // One resolve where this was three scans of the same list for
+        // three fields of the same entry — which is also what keyed the
+        // float ledger by the pair (float, its anchor).
+        let cursorPlacement = resolveSurfaceCursorPlacement(
+            ownerGridId: f.cursorOwner,
+            rootGridId: gridId,
+            layers: committedSurfaceLayers
+        )
+        f.cursorLayerOrigin = cursorPlacement.originPx
+        f.cursorLayerFollowsScroll = cursorPlacement.followsScroll
+        f.cursorLayerAnchorGrid = cursorPlacement.anchorGrid
+        layerSnapshot.removeAll(keepingCapacity: true)
+        // Latched HERE, with the placements it describes. Read anywhere
+        // else it is a commit out of step with them: the counter is copied
+        // before the flush that publishes a placement and this snapshot is
+        // taken after it, which is the skew the main surface had.
+        placementRowsUpSnapshot.removeAll(keepingCapacity: true)
+        for (layerGridId, rows) in layerPlacementRowsUp {
+            placementRowsUpSnapshot[layerGridId] = rows
+        }
+        for layer in committedSurfaceLayers where layer.gridId != gridId {
+            if let sets = gridBuffers.existingSets(for: layer.gridId) {
+                // This surface keeps no per-layer draw state, so every
+                // entry owes everything.
+                layerSnapshot.append(SurfaceLayerFrame(layer: layer, set: sets[f.csi], state: nil))
+            }
+        }
+        // The displacements this frame draws with, latched with the rows
+        // and the cursor rect they belong to. Only this thread writes
+        // them, so reading them here rather than at the passes below
+        // changes nothing about their value — only that the shader cursor
+        // can be evaluated against them now, under the same hold, which
+        // is the point the main renderer evaluates at too.
+        // More fixed floats than the mask can hold drops the whole scroll
+        // transform for the frame, as the main surface does: a partial
+        // mask lets shifted content bleed through an omitted float, and
+        // clearing the mask alone left every offset applied unmasked.
+        let fixedFloatOverflow = SurfaceFixedFloatMask.overflows(layers: committedSurfaceLayers, rootGridId: gridId)
+        drewWithoutScrollTransform = fixedFloatOverflow
+        f.scrollOffset = scrollOffsetLatch.isActive && !fixedFloatOverflow ? scrollOffsetData : nil
+        f.hostedScrollOffsets = fixedFloatOverflow ? [] : hostedScrollOffsetData  // Value-type copy
+        // And no retained rows: they are drawn only beside an offset that
+        // places them, and without one they land unshifted and unclipped.
+        if fixedFloatOverflow { f.hasScrollOffset = false }
+        // The frame's one debt read per follower. Seeds: this draw is the
+        // frame that first shows the float following, so it defines the zero.
+        followerDebtRowsSnapshot.removeAll(keepingCapacity: true)
+        for layer in committedSurfaceLayers where layer.gridId != gridId
+            && followsRootScrollNow(
+                anchorGrid: layer.anchorGrid, followsScroll: layer.followsScroll,
+                ownOffset: surfaceScrollOffset(gridId: layer.gridId, offsets: f.hostedScrollOffsets),
+                rootOffset: f.scrollOffset) {
+            followerDebtRowsSnapshot[layer.gridId] = floatDebtLedger.rows(
+                gridId: layer.gridId,
+                anchorGridId: gridId,
+                anchorRowsUp: rootAnchorRowsUp,
+                placementRowsUp: placementRowsUpSnapshot[layer.gridId] ?? 0,
+                seeding: true,
+                surfaceId: gridId,
+                log: ZonvieCore.appLogEnabled ? { ZonvieCore.appLog($0) } : nil
+            )
+        }
+        // What displaces the cursor's own grid, resolved exactly as
+        // encodeHostedLayers resolves a layer's: its own offset when it is
+        // scrolling in its own right, the root's when it merely follows,
+        // and nothing at all when it stands still. The body and the cursor
+        // have to answer the same offset or they are drawn a row apart.
+        let cursorOwnOffset = surfaceScrollOffset(gridId: f.cursorOwner, offsets: f.hostedScrollOffsets)
+        let cursorFollowsRoot = f.cursorOwner != gridId
+            && followsRootScrollNow(anchorGrid: f.cursorLayerAnchorGrid, followsScroll: f.cursorLayerFollowsScroll,
+                                    ownOffset: cursorOwnOffset, rootOffset: f.scrollOffset)
+        f.cursorOwnerOffset = f.cursorOwner == gridId
+            ? f.scrollOffset
+            : (cursorOwnOffset ?? (cursorFollowsRoot ? f.scrollOffset : nil))
+        // Shared with GridSurfaceRenderer. The height is the one every
+        // NDC above was built against, latched beside them rather than
+        // recomputed on a cell size the core may have moved since. A
+        // follower's effect carries its debt, as its body does and as the
+        // main surface folds it into offset_y.
+        var cursorShaderOffset = f.cursorOwnerOffset
+        if cursorFollowsRoot, var followed = cursorShaderOffset, scrollOffsetViewportHeight > 0 {
+            let debtPx = -Float(followerDebtRowsSnapshot[f.cursorOwner] ?? 0) * Float(shared.cellHeightPx)
+            followed.offset_y -= debtPx * 2 / scrollOffsetViewportHeight
+            cursorShaderOffset = followed
+        }
+        f.cursorShaderOffsetPx = surfaceShaderCursorOffsetPx(
+            rawGridId: cursorShaderRawSnapshot.gridId,
+            ownerGridId: f.cursorOwner,
+            offset: cursorShaderOffset,
+            viewportHeightPx: scrollOffsetViewportHeight
+        )
+        if shared.shaderCursor.evaluate(scrollOffsetPx: f.cursorShaderOffsetPx, raw: cursorShaderRawSnapshot) {
+            shaderCursorMovedThisFrame = true
+        }
+        lock.unlock()
+        return true
+    }
+
+    /// Restores state consumed by the snapshot and schedules a retry when a
+    /// later resource acquisition fails (back buffer / command buffer /
+    /// drawable). Restoring the rows alone is NOT enough: by the time the
+    /// loss sites run, lastDrawnRevision has already been overwritten, so a
+    /// retry draw would compute hasNewCommit == false and take the idle
+    /// early-exit, re-consuming and discarding the restored rows. Rolling
+    /// lastDrawnRevision (and blink.lastRendered) back makes the retry
+    /// draw see the commit as new again.
+    /// restoreScroll: pass false when the scroll blit has ALREADY been
+    /// committed into backTex (the drawable-nil site) — re-queueing the
+    /// scroll there would double-shift the already-shifted pixels.
+    ///
+    /// Restores EXACTLY that: the rows it submitted, the flags it
+    /// cleared, the scroll it took. GridSurfaceRenderer restores a
+    /// superset instead — every row dirty and every layer needing a
+    /// full redraw. Two policies for one job, unmeasured against each
+    /// other because the path runs only when a draw gives up, which no
+    /// scenario provokes.
+    private func bailWithoutSubmit(
+        _ reason: String, _ f: inout ExternalSurfaceFrame, restoreScroll: Bool = true, finishedRedraw: inout Bool
+    ) {
+        ZonvieCore.appLog("[WARNING][ExternalGridView] draw bailed (\(reason)); restoring dirty state for retry gridId=\(gridId)")
+        lock.lock()
+        // Element-wise: IndexSet(submittedDirtyRows) would allocate on
+        // a bail path that already failed to acquire what it needed.
+        for r in f.submittedDirtyRows { pendingDirtyRows.insert(r) }
+        if f.layoutDamage { pendingLayoutDamage = true }
+        if restoreScroll, let scroll = f.pendingScroll {
+            if let existing = pendingScrollAccum,
+               existing.rowStart == scroll.rowStart,
+               existing.rowEnd == scroll.rowEnd {
+                // A concurrent flush installed a NEW accum for the same
+                // region while this draw was in progress — merge the
+                // deltas rather than dropping either side, using the
+                // same merge logic as applyRowScroll's accumulation.
+                pendingScrollAccum = SurfaceRowScroll(
+                    rowStart: existing.rowStart, rowEnd: existing.rowEnd,
+                    colStart: existing.colStart, colEnd: existing.colEnd,
+                    rowsDelta: clampRowsDelta(existing.rowsDelta &+ scroll.rowsDelta),
+                    totalRows: existing.totalRows, totalCols: existing.totalCols
+                )
+            } else if pendingScrollAccum == nil {
+                pendingScrollAccum = scroll
+            }
+            // else: a concurrent flush installed an accum for a
+            // DIFFERENT region — keep the newer one. The restored dirty
+            // rows plus the revision rollback force a redraw that heals
+            // the un-applied older shift via row regeneration.
+        }
+        lock.unlock()
+        lastDrawnRevision = f.prevDrawnRevision
+        blink.lastRendered = f.prevRenderedBlinkState
+        finishedRedraw = true
+        redrawScheduler.didDrawFrame()
+        DispatchQueue.main.async { [weak self] in
+            self?.requestRedraw()
+        }
+    }
+
+    /// A bail after the back-buffer work was encoded: submit it to
+    /// release its resources, refuse to `.load` backTex next frame, and
+    /// keep the scroll unrestored since its blit is already in backTex.
+    /// The caller marks the frame submitted.
+    private func abandonSubmittedFrame(
+        _ reason: String, cmd: MTLCommandBuffer, release: @escaping () -> Void,
+        _ f: inout ExternalSurfaceFrame, finishedRedraw: inout Bool
+    ) {
+        submitSurfaceFrameWithoutPresenting(cmd: cmd, release: release)
+        hasPresentedOnce = false
+        bailWithoutSubmit(reason, &f, restoreScroll: false, finishedRedraw: &finishedRedraw)
+    }
+
+    /// The root scroll's GPU blit, when this frame may take one, and the rows
+    /// it leaves the root pass to redraw.
+    private func encodeRootScrollBlit(
+        _ f: inout ExternalSurfaceFrame, cmd: MTLCommandBuffer, backTex: MTLTexture, view: MTKView
+    ) {
+        guard f.mayGpuScrollCopy, let scroll = f.pendingScroll else { return }
+        let scrollCopy = encodePendingScrollCopy(
+            commandBuffer: cmd,
+            backTexture: backTex,
+            drawableWidthPx: Int(f.vpWidth > 0 ? f.vpWidth : view.drawableSize.width),
+            rowHeightPx: Int(f.cellHi),
+            scroll: scroll
+        )
+        if let scrollCopy {
+            f.useGpuScrollCopy = true
+            f.scrollClearBand = (
+                clearTopPx: scrollCopy.clearTopPx,
+                clearBottomPx: scrollCopy.clearBottomPx
+            )
+            f.dirtyRows.append(contentsOf: scrollCopy.dirtyRows)
+            // A hosted layer's pixels sit inside the rectangle this blit
+            // moved: the copy is the surface's full width and cannot tell
+            // them from the root's. They landed `rowsDelta` rows against
+            // the scroll, so the root rows they were dragged into hold
+            // layer pixels now — redraw those from the root's vertices,
+            // and the rows they came from as well, since a layer off the
+            // cell grid straddles a row boundary at both ends. Each layer
+            // then puts itself back on top: `encodeHostedLayers` redraws
+            // every row of it while a scroll is pending.
+            appendRowsDraggedByLayers(
+                into: &f.dirtyRows,
+                plan: scrollCopy,
+                rowsDelta: scroll.rowsDelta,
+                cellWidthPx: Int(f.cellWi),
+                rowHeightPx: Int(f.cellHi)
+            )
+        } else {
+            // The blit never ran (scratch texture or blit encoder
+            // creation failed, or a degenerate copy height — see
+            // encodePendingScrollCopy's guard clauses), so the back
+            // texture's pixels were never shifted for this scroll.
+            // submittedDirtyRows only covers the vacated band on the
+            // assumption the blit succeeded; every other row in the
+            // scroll region would otherwise keep its stale,
+            // un-shifted content forever (the core never re-sends
+            // rows it only expects the frontend to visually shift).
+            // Mark the whole scroll region dirty so the per-row
+            // scissor draw below fully overwrites it from the
+            // already-remapped row slots' vertex data.
+            // Keep expansion linear in the scroll-region height; the
+            // combined rows are canonicalized below.
+            if let stale = RowScrollBlitPlan.dirtyRowsWithoutBlit(
+                rowStart: scroll.rowStart,
+                rowEnd: scroll.rowEnd,
+                textureHeightPx: backTex.height,
+                rowHeightPx: Int(f.cellHi)
+            ) {
+                f.dirtyRows.append(contentsOf: stale)
+            }
+        }
+    }
+
+    /// The root's dirty rows, canonicalized and widened to the core's
+    /// damage bands.
+    private func collectDamageBands(_ f: inout ExternalSurfaceFrame, backTex: MTLTexture) {
+        // Always, not only for a scroll copy. Three consumers below draw
+        // one row per entry, so a duplicate is a redundant draw, and the
+        // hosted-layer band loop turns each entry into a scissor+encode —
+        // where duplicates and out-of-order entries cost the most. The
+        // compaction only shortens the array in place, so this adds no
+        // heap work to the frame.
+        surfaceSortAndDeduplicateRows(&f.dirtyRows)
+        // The core's damage bands (SurfaceDamageBands): the root and every
+        // hosted layer repaint the rows the bands reach, clipped to the
+        // band, so a partial frame equals a full one inside each band.
+        damageBands.reset()
+        if f.rowMode && !f.dirtyRows.isEmpty && Int(f.cellHi) > 0 {
+            damageBands.addRows(f.dirtyRows, originYPx: 0, rowHeightPx: Int(f.cellHi))
+            damageBands.resolve(rowHeightPx: Int(f.cellHi), surfaceHeightPx: backTex.height)
+            damageBands.layerRows(originYPx: 0, rowCount: f.safeRowCount, rowHeightPx: Int(f.cellHi), into: &f.dirtyRows)
+        }
+        if let scroll = f.pendingScroll {
+            ZonvieCore.appLog("[ext_scroll_draw] gridId=\(gridId) delta=\(scroll.rowsDelta) rows=\(scroll.rowStart)..<\(scroll.rowEnd) may=\(f.mayGpuScrollCopy) used=\(f.useGpuScrollCopy) newCommit=\(f.hasNewCommit) layout=\(f.layoutDamage) font=\(f.fontIsCurrent) presented=\(hasPresentedOnce) smooth=\(f.smoothScrolling) size=\(f.drawableSizeChanged) submitted=\(f.submittedDirtyRows.count) dirty=\(f.dirtyRows.count) rev=\(f.commitRevision)")
+        }
+    }
+
+    /// The render pass into the back texture: the root's rows, then the
+    /// hosted layers, as the plan asks. Ends the encoder.
+    private func encodeBackBufferPass(
+        _ f: inout ExternalSurfaceFrame,
+        enc: MTLRenderCommandEncoder,
+        plan: SurfaceFramePlan,
+        committed: SurfaceBufferSet,
+        rpd: MTLRenderPassDescriptor,
+        pipeline: MTLRenderPipelineState,
+        sampler: MTLSamplerState,
+        atlasTex: MTLTexture,
+        backTex: MTLTexture,
+        view: MTKView
+    ) {
+        // The atlas texture is also captured for the bloom extract
+        // pass and the cursor pass below.
+        beginSurfaceRowPass(
+            encoder: enc,
+            viewportMetrics: f.viewportMetrics,
+            pipeline: pipeline,
+            atlasTexture: atlasTex,
+            sampler: sampler,
+            backgroundAlpha: f.backgroundAlpha,
+            fixedFloatBands: fixedFloatMask.bands,
+            fixedFloatIntervals: fixedFloatMask.intervals,
+            bindScrollOffsets: { bindSingleSurfaceScrollOffset(encoder: $0, offset: f.scrollOffset) }
+        )
+
+        // --- Row-mode rendering branches — match GridSurfaceRenderer structure ---
+        if plan.encodesRootRows {
+            let cellHi = Float(f.cellHi)
+            func resolvedRowState(_ logicalRow: Int) -> (vc: Int, vb: MTLBuffer, translationY: Float)? {
+                guard logicalRow < f.safeRowCount else { return nil }
+                // The resolver this surface's hosted layers use: the root is a
+                // grid of this surface like they are.
+                return resolveSurfaceGridRow(committed, row: logicalRow, cellHeightPx: cellHi)
+            }
+            if ZonvieCore.appLogEnabled {
+                // Debug: log translationY for all rows to detect slot remap drift
+                var nonZeroTranslations: [(Int, Float, Int, Int)] = []
+                for row in 0..<f.safeRowCount {
+                    let slot = row < committed.rowLogicalToSlot.count ? committed.rowLogicalToSlot[row] : -1
+                    let src = (slot >= 0 && slot < committed.rowSlotSourceRows.count) ? committed.rowSlotSourceRows[slot] : -1
+                    if src != row {
+                        if let resolved = resolvedRowState(row) {
+                            nonZeroTranslations.append((row, resolved.translationY, slot, src))
+                        }
+                    }
+                }
+                if !nonZeroTranslations.isEmpty {
+                    ZonvieCore.appLog("[ext_draw_debug] gridId=\(gridId) nonZeroTranslationY rows: \(nonZeroTranslations.map { "r\($0.0):ty=\($0.1):slot=\($0.2):src=\($0.3)" }.joined(separator: " "))")
+                }
+                ZonvieCore.appLog("[ext_draw_debug] gridId=\(gridId) safeRowCount=\(f.safeRowCount) dirtyRows=\(f.dirtyRows.count) useGpuScrollCopy=\(f.useGpuScrollCopy) use2Pass=\(f.use2Pass) canBlink=false loadAction=\(rpd.colorAttachments[0].loadAction.rawValue) vpH=\(f.vpHeight) snapRows=\(f.snapGridRows) drawableH=\(view.drawableSize.height) vpOriginY=\(viewportOriginPt.y)")
+            }
+
+            // Shared with GridSurfaceRenderer: the geometry every row
+            // below is placed with. A decorated grid's padding stays
+            // governed by the transparent render-pass clear outside the
+            // viewport; the bands only cover the viewport itself.
+            let rowGeometry = SurfaceRowGeometry(
+                cellHeightPx: Int(f.cellHi),
+                renderTarget: backTex,
+                viewportMetrics: f.viewportMetrics,
+                drawableSize: view.drawableSize
+            )
+
+            // Shared with GridSurfaceRenderer; this surface's root is its own grid.
+            func resolvedSmoothRowState(_ logicalRow: Int) -> (vc: Int, vb: MTLBuffer, translationY: Float)? {
+                resolveSurfaceSmoothRow(
+                    logicalRow: logicalRow,
+                    retainedRowBase: f.safeRowCount,
+                    retainedRows: f.retainedRows,
+                    rootGridId: gridId,
+                    cellHeightPx: Int(f.cellHi),
+                    resolveRow: resolvedRowState
+                )
+            }
+
+            // Shared with GridSurfaceRenderer: WHICH rows this pass
+            // draws is one decision; `use2Pass` says HOW.
+            encodeSurfaceRootRowPass(
+                encoder: enc,
+                plan: plan.rowPassPlan,
+                useTwoPass: f.use2Pass,
+                dirtyRows: f.dirtyRows,
+                rowCount: f.safeRowCount,
+                smoothRows: f.smoothRowRange,
+                resolveRow: resolvedRowState,
+                resolveSmoothRow: resolvedSmoothRowState,
+                geometry: rowGeometry,
+                scrollClearBand: f.scrollClearBand,
+                pipeline: pipeline,
+                shared: shared,
+                bgRGB: surfaceBgRGB,
+                gridId: gridId,
+                damageBands: damageBands.bands
+            )
+        }
+
+        // Hosted grids use the same row-slot resolution and pipelines as
+        // the root. The shared back texture is recomposed before effects.
+        if plan.encodesHostedLayers {
+            encodeHostedLayers(&f, encoder: enc, pipeline: pipeline, backTex: backTex)
+        }
+
+        // Cursor is NOT drawn into backbuffer — it is composited onto the
+        // drawable after blit, so the persistent backbuffer stays cursor-free
+        // and GPU scroll-region copies don't shift stale cursor pixels.
+
+        enc.endEncoding()
+    }
+
+    /// The hosted layers, into the surface pass or, with `glowPipeline`, the
+    /// bloom extract. `glowPipeline` non-nil IS the glow pass. The caller
+    /// binds it from the bloom helper, so passing it in keeps that proof
+    /// instead of reaching back through `mainTerminalView` for a pipeline
+    /// the enclosing scope already holds.
+    private func encodeHostedLayers(
+        _ f: inout ExternalSurfaceFrame,
+        encoder: MTLRenderCommandEncoder,
+        glowPipeline: MTLRenderPipelineState? = nil,
+        pipeline: MTLRenderPipelineState,
+        backTex: MTLTexture
+    ) {
+        let glow = glowPipeline != nil
+        guard f.fontIsCurrent else { return }
+        let cellWi = Int(f.cellWi)
+        let cellHi = Int(f.cellHi)
+        let extent = simd_float2(f.viewportMetrics.fragmentWidth, f.viewportMetrics.fragmentHeight)
+        for entry in layerSnapshot {
+            let layer = entry.layer
+            guard let set = entry.set else { continue }
+            let rows = min(layer.rows, set.rowLogicalToSlot.count)
+            guard rows > 0 else { continue }
+            // The shader displaces the rows of a layer with an offset of
+            // its own, clipped to its content bounds; a follower moves
+            // bodily — the main window's per-row offset vs `move_all`
+            // split. Either way clip and geometry share one space.
+            let layerOffset = surfaceScrollOffset(
+                gridId: layer.gridId, offsets: f.hostedScrollOffsets)
+            let origin = hostedDrawOriginPx(
+                originPx: layer.originPx,
+                gridId: layer.gridId,
+                anchorGrid: layer.anchorGrid,
+                followsScroll: layer.followsScroll,
+                ownOffset: layerOffset,
+                rootOffset: f.scrollOffset,
+                viewportHeightPx: extent.y,
+                cellHeightPx: Float(f.ch)
+            )
+            guard let scissor = makeSurfaceLayerScissor(
+                originPx: origin,
+                viewportOriginPx: simd_float2(Float(f.vpOriginX), Float(f.vpOriginY)),
+                cols: layer.cols, rows: rows,
+                cellWidthPx: cellWi, cellHeightPx: cellHi,
+                scale: glow ? 0.5 : 1,
+                targetWidth: glow ? max(1, backTex.width / 2) : backTex.width,
+                targetHeight: glow ? max(1, backTex.height / 2) : backTex.height
+            ) else { continue }
+            encoder.setScissorRect(scissor)
+            bindLayerTransform(encoder: encoder, LayerTransform(originPx: origin, extentPx: extent))
+            bindSingleSurfaceScrollOffset(encoder: encoder, offset: layerOffset)
+            // This layer's rows, then the rows its own smooth scroll
+            // retained, both in its grid-local space; the same
+            // resolution the main renderer's layer pass uses.
+            let retainedForLayerCount = collectSurfaceLayerRetainedRows(
+                gridId: layer.gridId,
+                retained: f.retained,
+                hasScrollOffset: layerOffset != nil,
+                cellHeightPx: Float(cellHi),
+                into: &retainedIndexScratch
+            )
+            let scratch = retainedIndexScratch
+            func resolveLayerRow(_ row: Int) -> (vc: Int, vb: MTLBuffer, translationY: Float)? {
+                resolveSurfaceLayerRow(
+                    row,
+                    set: set,
+                    rowCount: rows,
+                    retained: f.retained,
+                    retainedIndices: scratch,
+                    cellHeightPx: Float(cellHi)
+                )
+            }
+            if f.partialHostedContents && !glow {
+                // Recompose each damage band back-to-front. Every
+                // layer is clipped to the band the root erased, so
+                // unchanged pixels are neither cleared nor blended.
+                var encodedRows = 0
+                for band in damageBands.bands {
+                    let top = max(scissor.y, Int(band.top_px))
+                    let bottom = min(scissor.y + scissor.height, Int(band.bottom_px))
+                    guard top < bottom else { continue }
+                    encoder.setScissorRect(MTLScissorRect(x: scissor.x, y: top,
+                        width: scissor.width, height: bottom - top))
+                    guard let bandRows = SurfaceDamageBands.rows(
+                        in: band, originYPx: Int(origin.y.rounded(.down)),
+                        rowCount: rows, rowHeightPx: cellHi
+                    ) else { continue }
+                    encodedRows += encodeSurfaceRowDraws(encoder: encoder, rows: bandRows,
+                        resolve: { resolveSurfaceGridRow(set, row: $0, cellHeightPx: Float(cellHi)) },
+                        pipeline: pipeline, backgroundPipeline: shared.backgroundPipeline,
+                        glyphPipeline: shared.glyphPipeline, useTwoPass: f.use2Pass,
+                        unifiedBlurPipeline: shared.unifiedBlurPipeline)
+                }
+                logHostedLayerDraw(layer: layer, encodedRows: encodedRows, of: rows, drawOriginPx: origin, bodilyMoved: origin != layer.originPx)
+                continue
+            }
+            // A glyph hidden behind a float here must not bloom
+            // through it, over the same rows the extract draws,
+            // retained ones included.
+            if let glowPipeline {
+                encodeSurfaceLayerGlowRows(
+                    encoder: encoder,
+                    rows: 0..<(rows + retainedForLayerCount),
+                    resolve: resolveLayerRow,
+                    occludePipeline: shared.glowOccludePipeline,
+                    extractPipeline: glowPipeline
+                )
+                continue
+            }
+            let encodedRows = encodeSurfaceRowDraws(
+                encoder: encoder, rows: 0..<(rows + retainedForLayerCount),
+                resolve: resolveLayerRow,
+                pipeline: pipeline,
+                backgroundPipeline: shared.backgroundPipeline, glyphPipeline: shared.glyphPipeline,
+                useTwoPass: f.use2Pass,
+                unifiedBlurPipeline: shared.unifiedBlurPipeline
+            )
+            logHostedLayerDraw(layer: layer, encodedRows: encodedRows, of: rows, drawOriginPx: origin, bodilyMoved: origin != layer.originPx)
+        }
+        bindLayerTransform(encoder: encoder, f.viewportMetrics.layerTransform)
+        bindSingleSurfaceScrollOffset(encoder: encoder, offset: f.scrollOffset)
+        encoder.setScissorRect(MTLScissorRect(x: 0, y: 0,
+            width: glow ? max(1, backTex.width / 2) : backTex.width,
+            height: glow ? max(1, backTex.height / 2) : backTex.height))
+    }
+
+    /// The bloom extract's vertices: the root's rows, the hosted layers, and
+    /// the cursor.
+    private func encodeGlowExtract(
+        _ f: inout ExternalSurfaceFrame,
+        enc: MTLRenderCommandEncoder,
+        extractPipe: MTLRenderPipelineState,
+        committed: SurfaceBufferSet,
+        committedCursor: SurfaceCursorSlot,
+        pipeline: MTLRenderPipelineState,
+        atlasTex: MTLTexture,
+        backTex: MTLTexture
+    ) {
+        // Set up atlas and scroll offsets for extract pass.
+        // The bloom helper binds the layer transform (vertex buffer 4).
+        bindSurfaceGlowExtractState(
+            encoder: enc,
+            atlasTexture: atlasTex,
+            sampler: shared.sampler!,
+            backgroundAlpha: f.backgroundAlpha,
+            bindScrollOffsets: { bindSingleSurfaceScrollOffset(encoder: $0, offset: f.scrollOffset) }
+        )
+
+        // Draw row vertices. The same range the main pass draws:
+        // glow forces a `.clear`, so a retained row left out here
+        // has no previous-frame light to fall back on and the band
+        // a scroll vacated renders unlit for the whole ease. The
+        // main renderer's extract covers its retained rows for the
+        // same reason.
+        if f.rowMode {
+            let cellHi = Float(f.cellHi)
+            func resolvedRowState(_ logicalRow: Int) -> (vc: Int, vb: MTLBuffer, translationY: Float)? {
+                guard logicalRow < f.safeRowCount else { return nil }
+                return resolveSurfaceGridRow(committed, row: logicalRow, cellHeightPx: cellHi)
+            }
+            func resolvedSmoothRowState(_ logicalRow: Int) -> (vc: Int, vb: MTLBuffer, translationY: Float)? {
+                resolveSurfaceSmoothRow(
+                    logicalRow: logicalRow,
+                    retainedRowBase: f.safeRowCount,
+                    retainedRows: f.retainedRows,
+                    rootGridId: gridId,
+                    cellHeightPx: Int(f.cellHi),
+                    resolveRow: resolvedRowState
+                )
+            }
+            encodeSurfaceResolvedRows(encoder: enc, rows: f.smoothRowRange, resolve: resolvedSmoothRowState)
+        }
+
+        encodeHostedLayers(&f, encoder: enc, glowPipeline: extractPipe, pipeline: pipeline, backTex: backTex)
+
+        // Cursor vertices for cursor glow
+        if f.fontIsCurrent,
+           f.cursorBlink,
+           committedCursor.vertexCount > 0,
+           let cvb = committedCursor.vertexBuffer {
+            // encodeHostedLayers left the surface-wide offset bound.
+            encodeSurfaceCursorGlowExtract(
+                encoder: enc,
+                vertexBuffer: cvb,
+                vertexCount: committedCursor.vertexCount,
+                layerOriginPx: f.cursorDrawOrigin,
+                viewportMetrics: f.viewportMetrics,
+                bindScrollOffsets: { bindSingleSurfaceScrollOffset(encoder: $0, offset: f.cursorOwnerOffset) }
+            )
+        }
+    }
+
+    /// The back texture onto the drawable, through the custom shader chain
+    /// or the plain copy.
+    ///
+    /// User-supplied custom post-process shaders take over the
+    /// backTex -> drawable copy when configured in `.afterBloom`
+    /// mode. The shader samples backTex (which already contains
+    /// main render + optional bloom) and writes directly to the
+    /// drawable, replacing the normal blit. The chain itself is
+    /// encoded by the same helper the main surface drives; only the
+    /// uniforms differ, because this window's screen-space origin does.
+    /// Shared with GridSurfaceRenderer: the chain-or-copy ladder is one
+    /// function now. The uniforms closure below is the only part this
+    /// surface does differently, and it runs only when the chain does.
+    ///
+    /// The plain copy used to take its pipeline, vertex buffer and
+    /// sampler from `mainTerminalView?.renderer`, which meant an
+    /// external surface could not present at ALL without the main one —
+    /// the last hard reach-through in this function, and in the ordinary
+    /// path, not an optional effect. They come from `shared` now, where
+    /// stage 0 put them.
+    private func encodeBackBufferToDrawable(
+        _ f: inout ExternalSurfaceFrame,
+        cmd: MTLCommandBuffer,
+        backTex: MTLTexture,
+        drawable: CAMetalDrawable,
+        view: MTKView
+    ) -> SurfaceDrawablePresentation {
+        // Cleared here, past every bail, as on the main surface.
+        shaderCursorMovedThisFrame = false
+        let cursorShaderOffsetPx = f.cursorShaderOffsetPx
+        let lastKnownCursorRowSnapshot = f.lastKnownCursorRow
+        return encodeSurfaceBackBufferToDrawable(
+            cmd: cmd,
+            backTex: backTex,
+            drawableTexture: drawable.texture,
+            customShaderPipelines: surfaceCustomShaderPipelines(),
+            runsCustomShaderChain: shared.customShaderPostProcess == .afterBloom
+                && mainTerminalView?.renderer != nil,
+            customShaderPong: customShaderPong,
+            pongSize: view.drawableSize,
+            copyPipeline: shared.copyPipeline,
+            copyVertexBuffer: shared.copyVertexBuffer,
+            sampler: shared.sampler,
+            bilinearSampler: shared.bilinearSampler,
+            makeUniforms: { [weak self] in
+                guard let self, let renderer = self.mainTerminalView?.renderer else {
+                    return zonvie_shader_uniforms()
+                }
+                // Screen-space unification: use the MAIN window's drawable
+                // as the shader's iResolution, and tell the shader where
+                // this external view sits inside that coordinate space so
+                // effects (stars, gradients, spotlights) line up across all
+                // windows.
+                let (screenRes, windowOffset) = screenSpaceParameters(
+                    mainView: self.mainTerminalView,
+                    selfView: self
+                )
+                // The cursor rect was evaluated with the committed snapshot
+                // this frame draws, under the same hold; the uniforms read it.
+                // The rect the shader gets beside the row and displacement
+                // the body is drawn with THIS frame. Their difference is a
+                // constant while the two describe the same commit; a rect
+                // evaluated against a newer flush's cursor shows up as one
+                // row step in it. Emitted on change only.
+                if ZonvieCore.appLogEnabled, let offPx = cursorShaderOffsetPx {
+                    let y = self.shared.shaderCursor.snapshot().current.1
+                    let frame = (lastKnownCursorRowSnapshot, offPx, y)
+                    if frame != self.lastLoggedCursorFrame {
+                        self.lastLoggedCursorFrame = frame
+                        ZonvieCore.appLog("[ext_shader_cursor_frame] gridId=\(self.gridId) row=\(frame.0) offPx=\(offPx) y=\(y)")
+                    }
+                }
+                // This surface's own scale, because the rect the log line
+                // carries is in ITS drawable pixels. Reading it off the
+                // main renderer, which is what calling through it did,
+                // reported the main window's — the same number only while
+                // every window sits on one display.
+                return self.shared.makeShaderUniforms(
+                    screenResolution: screenRes,
+                    windowOffset: windowOffset,
+                    windowSize: view.drawableSize,
+                    backingScale: self.backingScale,
+                    timing: self.shaderTiming,
+                    lastLoggedCursor: &self.lastLoggedShaderCursor
+                )
+            }
+        )
+    }
+
+    /// --- Cursor overlay: composited on drawable (not backbuffer) ---
+    /// Keeps persistent backbuffer cursor-free so GPU scroll copies
+    /// don't shift stale cursor pixels (same as GridSurfaceRenderer).
+    /// Returns false only when a cursor was owed and its encoder could not
+    /// be made.
+    private func encodeCursorOverlay(
+        _ f: inout ExternalSurfaceFrame,
+        cmd: MTLCommandBuffer,
+        drawable: CAMetalDrawable,
+        committedCursor: SurfaceCursorSlot,
+        pipeline: MTLRenderPipelineState,
+        sampler: MTLSamplerState,
+        atlasTex: MTLTexture
+    ) -> Bool {
+        guard f.fontIsCurrent,
+              f.cursorBlink,
+              committedCursor.vertexCount > 0,
+              let cursorBuf = committedCursor.vertexBuffer else { return true }
+        // Shared with GridSurfaceRenderer. This surface binds the
+        // single offset of the grid that owns the cursor where the main
+        // one binds an array, and it attaches no perf samples.
+        return encodeSurfaceCursorOverlay(
+            cmd: cmd,
+            drawableTexture: drawable.texture,
+            pipeline: pipeline,
+            atlasTexture: atlasTex,
+            sampler: sampler,
+            viewportMetrics: f.viewportMetrics,
+            cursorVertexBuffer: cursorBuf,
+            cursorVertexCount: committedCursor.vertexCount,
+            layerOriginPx: f.cursorDrawOrigin,
+            backgroundAlpha: f.backgroundAlpha,
+            fixedFloatBands: fixedFloatMask.bands,
+            fixedFloatIntervals: fixedFloatMask.intervals,
+            bindScrollOffsets: { cursorEnc in
+                bindSingleSurfaceScrollOffset(encoder: cursorEnc, offset: f.cursorOwnerOffset)
+            }
+        )
+    }
+
+    /// Present the drawable and commit, with the completion handler that
+    /// releases the frame's row set, cursor slot, in-flight slot and atlas
+    /// read.
+    private func presentAndCommit(
+        cmd: MTLCommandBuffer,
+        drawable: CAMetalDrawable,
+        rowSet csi: Int,
+        cursorSlot cci: Int,
+        atlasReader: SharedRenderResources
+    ) {
+        FrameTracer.tracePresented(drawable, seq: UInt32(truncatingIfNeeded: gridId))
+        FrameTracer.trace(.presentCall, seq: UInt32(truncatingIfNeeded: gridId))
+        cmd.present(drawable)
+        // The same semaphore and lock draw captured for its
+        // `releaseFrameState`, for the same reason: the signal has to fire
+        // even if the view is deallocated before the GPU finishes.
+        let sem = inflightSemaphore
+        let tbLock = lock
+        let traceSurfaceId = gridId
+        cmd.addCompletedHandler { [weak self] completed in
+            let failed = completed.status != .completed
+            tbLock.lock()
+            self?.completeSurfaceFrameReadLocked(rowSet: csi, cursorSlot: cci)
+            if failed { self?.gpuFrameFailed = true }
+            tbLock.unlock()
+            sem.signal()
+            // Paired with beginExternalRead() at atlas-bind time
+            // above. Uses the strongly-captured atlasReadRenderer, not
+            // [weak self] — see its declaration comment for why.
+            atlasReader.endExternalRead()
+            if failed {
+                DispatchQueue.main.async { [weak self] in
+                    self?.requestRedraw()
+                }
+            } else if ZonvieCore.appLogEnabled {
+                // What a test waits on instead of sleeping for a frame.
+                ZonvieCore.appLog("[trace] event=frame_done surface=\(traceSurfaceId)")
+            }
+        }
+        cmd.commit()
+    }
+
     // MARK: - Smooth Scroll
 
     /// Drain the ease seeds this surface's steps committed. Spent by the main
     /// view's tick, which owns the per-grid offsets they feed.
     func takeSmoothScrollSeeds() -> [(gridId: Int64, rowsDelta: Int)] {
-        guard GridSurfaceRenderer.smoothScrollEnabled else { return [] }
-        lock.lock()
-        defer { lock.unlock() }
-        guard !smoothScrollSeeds.isEmpty else { return [] }
-        let taken = smoothScrollSeeds
-        smoothScrollSeeds.removeAll(keepingCapacity: true)
-        return taken
+        drainSurfaceSmoothScrollSeeds(&smoothScrollSeeds, lock: lock)
     }
 
     /// Update scroll offset shader uniform for visual sub-cell scrolling.
@@ -3919,3 +4112,72 @@ extension ExternalGridView {
     }
 }
 
+
+/// One external-surface frame, passed `inout` (by address) through every
+/// phase of `ExternalGridView.draw(in:)`: the committed state taken under
+/// `lock`, what draw derives from it, and what an encoder leaves for the
+/// passes after it. No escaping closure captures it, so it stays on draw's
+/// stack.
+fileprivate struct ExternalSurfaceFrame {
+    // Taken under `lock` by `snapshotCommittedFrame`.
+    var csi = 0
+    var cci = 0
+    var atlasTextureSnapshot: MTLTexture?
+    var commitRevision: UInt64 = 0
+    var pendingScroll: SurfaceRowScroll?
+    /// Swapped with `submittedDirtyRowsScratch`, so a frame allocates no row list.
+    var submittedDirtyRows: [Int] = []
+    var committedExtent = SurfaceCommittedExtent()
+    var lastKnownCursorRow = 0
+    var cursorBlink = false
+    var fontIsCurrent = false
+    /// The root's offset, nil when it is not displaced this frame.
+    var scrollOffset: GridSurfaceRenderer.ScrollOffset?
+    var hostedScrollOffsets: [GridSurfaceRenderer.ScrollOffset] = []
+    var cursorOwnerOffset: GridSurfaceRenderer.ScrollOffset?
+    var cursorShaderOffsetPx: Float?
+    var retained: [RetainedScrollRow] = []
+    var rootLayerOrigin = simd_float2(0, 0)
+    var cursorOwner: Int64 = 0
+    var cursorLayerOrigin = simd_float2(0, 0)
+    var cursorLayerFollowsScroll = false
+    var cursorLayerAnchorGrid: Int64 = 0
+    var layoutDamage = false
+    var hasScrollOffset = false
+
+    // Derived by draw from the snapshot.
+    // What bailWithoutSubmit rolls back.
+    var prevDrawnRevision: UInt64 = 0
+    var prevRenderedBlinkState = false
+    var rowMode = false
+    var snapGridRows: UInt32 = 0
+    var blinkStateChanged = false
+    var drawableSizeChanged = false
+    var hasNewCommit = false
+    var hasPendingScroll = false
+    var scrollOffsetChanged = false
+    var smoothScrolling = false
+    var ch: Float = 0
+    var cellWi: UInt32 = 1
+    var cellHi: UInt32 = 1
+    var vpWidth: Double = 0
+    var vpHeight: Double = 0
+    var vpOriginX: Double = 0
+    var vpOriginY: Double = 0
+    var viewportMetrics = SurfaceViewportMetrics(viewportWidth: 0, viewportHeight: 0, drawableSize: .zero)
+    var glowEnabled = false
+    var use2Pass = false
+    var mayGpuScrollCopy = false
+    var safeRowCount = 0
+    var retainedRows: [RetainedScrollRow] = []
+    var smoothRowRange = 0..<0
+    var backgroundAlpha: Float = 1
+    var partialHostedContents = false
+    var cursorDrawOrigin = simd_float2(0, 0)
+
+    // Left by the encoders for the passes after them.
+    /// Swapped with `dirtyRowsScratch`.
+    var dirtyRows: [Int] = []
+    var useGpuScrollCopy = false
+    var scrollClearBand: (clearTopPx: Int, clearBottomPx: Int)?
+}

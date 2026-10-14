@@ -40,6 +40,9 @@
 		ACF001312F2000010072639A /* SharedRenderResources.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACF001302F2000010072639A /* SharedRenderResources.swift */; };
 		ACF001332F2000010072639A /* SurfaceDrawGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACF001322F2000010072639A /* SurfaceDrawGate.swift */; };
 		ACF001352F2000010072639A /* SurfaceFrameDecision.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACF001342F2000010072639A /* SurfaceFrameDecision.swift */; };
+		ACF001732F2000010072639A /* SurfaceRowCapacityRequire.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACF001722F2000010072639A /* SurfaceRowCapacityRequire.swift */; };
+		ACF001712F2000010072639A /* SurfaceDamageBands.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACF001702F2000010072639A /* SurfaceDamageBands.swift */; };
+		ACF001752F2000010072639A /* SurfaceFramePlan.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACF001742F2000010072639A /* SurfaceFramePlan.swift */; };
 		ACF0013B2F2000010072639A /* VertexRowUpdate.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACF0013A2F2000010072639A /* VertexRowUpdate.swift */; };
 		ACF001402F2000010072639A /* SurfaceDrawLoop.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACF001412F2000010072639A /* SurfaceDrawLoop.swift */; };
 		ACF002012F2000020072639A /* FlushRetryBackoff.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACF002002F2000020072639A /* FlushRetryBackoff.swift */; };
@@ -84,6 +87,9 @@
 		ACF001302F2000010072639A /* SharedRenderResources.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedRenderResources.swift; sourceTree = "<group>"; };
 		ACF001322F2000010072639A /* SurfaceDrawGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SurfaceDrawGate.swift; sourceTree = "<group>"; };
 		ACF001342F2000010072639A /* SurfaceFrameDecision.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SurfaceFrameDecision.swift; sourceTree = "<group>"; };
+		ACF001722F2000010072639A /* SurfaceRowCapacityRequire.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SurfaceRowCapacityRequire.swift; sourceTree = "<group>"; };
+		ACF001702F2000010072639A /* SurfaceDamageBands.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SurfaceDamageBands.swift; sourceTree = "<group>"; };
+		ACF001742F2000010072639A /* SurfaceFramePlan.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SurfaceFramePlan.swift; sourceTree = "<group>"; };
 		ACF0013A2F2000010072639A /* VertexRowUpdate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VertexRowUpdate.swift; sourceTree = "<group>"; };
 		ACF001412F2000010072639A /* SurfaceDrawLoop.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SurfaceDrawLoop.swift; sourceTree = "<group>"; };
 		ACF002002F2000020072639A /* FlushRetryBackoff.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FlushRetryBackoff.swift; sourceTree = "<group>"; };
@@ -186,6 +192,9 @@
 				ACF001302F2000010072639A /* SharedRenderResources.swift */,
 				ACF001322F2000010072639A /* SurfaceDrawGate.swift */,
 				ACF001342F2000010072639A /* SurfaceFrameDecision.swift */,
+				ACF001722F2000010072639A /* SurfaceRowCapacityRequire.swift */,
+				ACF001702F2000010072639A /* SurfaceDamageBands.swift */,
+				ACF001742F2000010072639A /* SurfaceFramePlan.swift */,
 				ACF0013A2F2000010072639A /* VertexRowUpdate.swift */,
 				ACF001412F2000010072639A /* SurfaceDrawLoop.swift */,
 				ACF003002F2000030072639A /* FrameTracer.swift */,
@@ -320,6 +329,9 @@
 				ACF001312F2000010072639A /* SharedRenderResources.swift in Sources */,
 				ACF001332F2000010072639A /* SurfaceDrawGate.swift in Sources */,
 				ACF001352F2000010072639A /* SurfaceFrameDecision.swift in Sources */,
+				ACF001732F2000010072639A /* SurfaceRowCapacityRequire.swift in Sources */,
+				ACF001712F2000010072639A /* SurfaceDamageBands.swift in Sources */,
+				ACF001752F2000010072639A /* SurfaceFramePlan.swift in Sources */,
 				ACF0013B2F2000010072639A /* VertexRowUpdate.swift in Sources */,
 				ACF001402F2000010072639A /* SurfaceDrawLoop.swift in Sources */,
 				ACF002012F2000020072639A /* FlushRetryBackoff.swift in Sources */,

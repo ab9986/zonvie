@@ -108,6 +108,136 @@ fn flushCommitMode(o: FlushOutcome) FlushCommitMode {
     return .abort_full;
 }
 
+/// What onFlush's closing defer does, decided from the outcome alone.
+const FlushFinishPlan = struct {
+    mode: FlushCommitMode,
+    /// Nothing aborted: release destroyed grids, commit owed rows, layouts,
+    /// atlas maintenance and scroll state.
+    commit: bool,
+    /// on_flush_begin rejected the bracket, so nothing was published and the
+    /// mirrors are as stale as they were.
+    keep_mirror_stale: bool,
+    /// An abort after the frontend saw this attempt's sends: they are owed
+    /// again and sent row shifts are unwound.
+    rollback_sent: bool,
+};
+
+fn planFlushFinish(o: FlushOutcome) FlushFinishPlan {
+    const commit = !o.aborted and !o.atlas_corrupted;
+    return .{
+        .mode = flushCommitMode(o),
+        .commit = commit,
+        .keep_mirror_stale = o.aborted_at_begin,
+        .rollback_sent = !commit and !o.aborted_at_begin,
+    };
+}
+
+fn applyFlushFinish(core: *Core, plan: FlushFinishPlan) void {
+    const mirror_stale_before = core.display_mirror_stale;
+    finishVertexBudgetTransactionRestoring(core, plan.mode);
+    if (plan.keep_mirror_stale) core.display_mirror_stale = mirror_stale_before;
+    if (plan.commit) {
+        for (core.grid.destroyed_pending.items) |grid_id| {
+            traceRender(core, "event=destroy_release grid={d}\n", .{grid_id});
+            core.removeGlyphMirror(grid_id);
+        }
+        core.grid.destroyed_pending.clearRetainingCapacity();
+        core.grid.commitOwed();
+        commitSurfaceLayouts(core);
+        core.finishAtlasMaintenance();
+        core.grid.clearScrolledGrids();
+        var sg_it = core.grid.sub_grids.valueIterator();
+        while (sg_it.next()) |sg| sg.clearScrollState();
+        return;
+    }
+    // A transaction-local edge, not persistent atlas state. A callback abort
+    // can return before the normal reset checks consume it.
+    core.atlas_reset_during_flush = false;
+    if (plan.rollback_sent) {
+        // Everything this attempt sent is owed again, on top of what changed
+        // after it was sent; the frontend kept its committed frame, so
+        // nothing else is.
+        core.grid.returnOwed();
+        core.cursor_owner.force_recheck = true;
+        discardStagedSurfaceLayouts(core);
+    }
+    // A due maintenance reprobe may already have invalidated its negative
+    // entries before a later consumer rejected the flush. Re-arm the shared
+    // one-shot timer so idle Neovim cannot leave those now-uncached visible
+    // cells waiting forever.
+    if ((core.atlas_negative_recovery_armed and core.atlas_negative_retry_at == null) or
+        (core.transient_glyph_recovery_armed and core.transient_glyph_retry_at == null))
+    {
+        const retry_at = scheduleMsgRetryDeadline(core, clock.nowNs());
+        core.rearmAtlasMaintenanceAfterAbort(retry_at);
+    }
+    if (plan.rollback_sent) {
+        var sg_it = core.grid.sub_grids.iterator();
+        while (sg_it.next()) |entry| {
+            const sg = entry.value_ptr;
+            if (!sg.row_shift_sent) continue;
+            // The frontend dropped the shift with the bracket, so the retry
+            // sends it again; the mirror moved with the first send and moves
+            // back here, or the retry would move it twice.
+            if (sg.last_scroll_op) |op| {
+                if (gridScrollFastPathRegion(op, sg.rows, sg.cols, sg.rows, sg.cols)) |region| {
+                    core.shiftGlyphMirror(entry.key_ptr.*, region.row_start, region.row_end, -op.rows);
+                }
+            }
+            sg.row_shift_sent = false;
+            sg.row_scroll_notify_pending = true;
+        }
+    }
+}
+
+/// Deadlines an aborted flush found elapsed. Its own timeout checks never ran,
+/// so each one moves onto a single bounded retry deadline instead of letting
+/// the frontend timer drive another full flush at once under sustained
+/// backpressure/OOM.
+const AbortRetimePlan = struct {
+    throttle: bool,
+    show_hide: bool,
+    history_hide: bool,
+    atlas_retry: bool,
+    transient_retry: bool,
+    /// A history dispatch failure always arms this; left out, it alone keeps
+    /// nextMsgTimeoutNs at zero and the frontend spins a 0ms timer.
+    history_retry: bool,
+
+    fn any(self: AbortRetimePlan) bool {
+        return self.throttle or self.show_hide or self.history_hide or self.atlas_retry or
+            self.transient_retry or self.history_retry;
+    }
+};
+
+fn planAbortRetime(core: *const Core, now: i128) AbortRetimePlan {
+    var throttle_due = false;
+    if (core.msg_show_pending_since) |pending_since| {
+        throttle_due = now - pending_since >= core.msg_show_throttle_ns;
+        const retry_due = if (core.msg_show_retry_at) |retry_at| now >= retry_at else true;
+        throttle_due = throttle_due and retry_due;
+    }
+    return .{
+        .throttle = throttle_due,
+        .show_hide = if (core.msg_show_auto_hide_at) |hide_at| now >= hide_at else false,
+        .history_hide = if (core.msg_history_auto_hide_at) |hide_at| now >= hide_at else false,
+        .atlas_retry = if (core.atlas_negative_retry_at) |retry_at| now >= retry_at else false,
+        .transient_retry = if (core.transient_glyph_retry_at) |retry_at| now >= retry_at else false,
+        .history_retry = if (core.msg_history_retry_at) |retry_at| now >= retry_at else false,
+    };
+}
+
+fn applyAbortRetime(core: *Core, plan: AbortRetimePlan, now: i128) void {
+    if (!plan.any()) return;
+    const retry_at = scheduleMsgRetryDeadline(core, now);
+    if (plan.throttle) core.msg_show_retry_at = retry_at;
+    if (plan.show_hide) core.msg_show_auto_hide_at = retry_at;
+    if (plan.history_hide) core.msg_history_auto_hide_at = retry_at;
+    if (plan.atlas_retry) core.atlas_negative_retry_at = retry_at;
+    if (plan.transient_retry) core.transient_glyph_retry_at = retry_at;
+    if (plan.history_retry) core.msg_history_retry_at = retry_at;
+}
+
 /// Vertex budget and shaping buffer errors.
 const VertexBudgetError = error{
     VertexBudgetExceededPerCallback,   // One row exceeds MAX_VERTICES_PER_CALLBACK
@@ -147,6 +277,7 @@ fn vertexBudgetExceededAggregate(core: *Core) VertexBudgetError {
 /// (allocation failure) leaves the abort retryable.
 fn abortFlushForRowError(core: *Core, err: anyerror) void {
     core.flush_aborted = true;
+    if (err == error.OutOfMemory) core.reportCallbackError(.oom, "row_vertices");
     if (Core.isHardRenderFailure(err)) {
         core.flush_retryable = false;
         core.failHardRender(err);
@@ -1920,6 +2051,180 @@ fn emitGridRows(
     return res;
 }
 
+/// Glyph quad geometry and submission for one glyph run of generateRowVertices.
+const GlyphQuadEmitter = struct {
+    core: *Core,
+    out: *std.ArrayListUnmanaged(c_api.Vertex),
+    max_vertices: usize,
+    fg: [4]f32,
+    grid_id: i64,
+    base_y: f32,
+    row_top: f32,
+    cell_h: f32,
+    /// Scroll and glow flags shared by every glyph quad of the run.
+    deco: u32,
+    timing: bool,
+    emit_ns: *i64,
+
+    const Quad = struct { gx0: f32, gx1: f32, gy0: f32, gy1: f32, uv: [4][2]f32 };
+
+    /// `offsets` is the shaper's (x, y) offset in px. `trim_scalar` names the
+    /// box-drawing scalar whose span is trimmed to the row; 0 trims nothing.
+    fn quad(e: *const GlyphQuadEmitter, ge: c_api.GlyphEntry, pen_x: f32, offsets: ?[2]f32, trim_scalar: u32) Quad {
+        const baseline_y: f32 = e.base_y + ge.ascent_px;
+        const gx0: f32 = if (offsets) |o| pen_x + ge.bbox_origin_px[0] + o[0] else pen_x + ge.bbox_origin_px[0];
+        const top_y: f32 = if (offsets) |o| baseline_y + o[1] else baseline_y;
+        const raw_gy0: f32 = top_y - (ge.bbox_origin_px[1] + ge.bbox_size_px[1]);
+        const span = vertexgen.trimBoxDrawingSpanY(
+            trim_scalar,
+            .{ .y0 = raw_gy0, .y1 = raw_gy0 + ge.bbox_size_px[1], .v0 = ge.uv_min[1], .v1 = ge.uv_max[1] },
+            e.row_top,
+            e.row_top + e.cell_h,
+        );
+        return .{
+            .gx0 = gx0,
+            .gx1 = gx0 + ge.bbox_size_px[0],
+            .gy0 = span.y0,
+            .gy1 = span.y1,
+            .uv = .{
+                .{ ge.uv_min[0], span.v0 },
+                .{ ge.uv_max[0], span.v0 },
+                .{ ge.uv_min[0], span.v1 },
+                .{ ge.uv_max[0], span.v1 },
+            },
+        };
+    }
+
+    fn push(e: *const GlyphQuadEmitter, q: Quad, color_emoji: bool) !void {
+        const deco: u32 = e.deco | (if (color_emoji) c_api.DECO_COLOR_EMOJI else 0);
+        const t_emit: i128 = if (e.timing) clock.nowNs() else 0;
+        try ensureRowQuadCapacity(e.core, e.out, e.max_vertices, 1);
+        VH.pushGlyphQuadAssumeCapacity(e.out, q.gx0, q.gy0, q.gx1, q.gy1, q.uv[0], q.uv[1], q.uv[2], q.uv[3], e.fg, e.grid_id, deco);
+        if (e.timing) e.emit_ns.* += @intCast(@max(0, clock.nowNs() - t_emit));
+    }
+
+    /// Emits nothing for an empty bitmap.
+    fn emit(e: *const GlyphQuadEmitter, ge: c_api.GlyphEntry, pen_x: f32, offsets: ?[2]f32, trim_scalar: u32) !void {
+        if (ge.bbox_size_px[0] <= 0 or ge.bbox_size_px[1] <= 0) return;
+        try e.push(e.quad(ge, pen_x, offsets, trim_scalar), ge.bytes_per_pixel >= 4);
+    }
+};
+
+/// Phase 2 glyph for the cell cluster at `src_col` headed by `scalar`, through
+/// the non-ASCII cluster cache. `set_emoji` hands the rasterizer the whole
+/// cluster on a miss. Null on a miss; the caller checks `flush_aborted`.
+fn resolveClusterGlyph(
+    core: *Core,
+    rc: *const RenderCells,
+    row: u32,
+    src_col: u32,
+    scalar: u32,
+    c_style: u32,
+    style_index: u32,
+    set_emoji: bool,
+    cache: ?[]c_api.GlyphEntry,
+    keys: ?[]u64,
+    timing: bool,
+    ensure_ns: *i64,
+) ?c_api.GlyphEntry {
+    const extras = getOverflowForCell(core, rc, row, src_col);
+    const key = clusterCacheKey(scalar, style_index, extras);
+    const hash = clusterCacheHash(scalar, style_index, extras);
+    const cacheable = cache != null and keys != null and keys.?.len > 0;
+    if (cacheable) {
+        const probe = nvim_core.glyphCacheProbe(keys.?, key, hash);
+        if (probe.hit) |hit_idx| return cache.?[hit_idx];
+    }
+    if (set_emoji) setEmojiClusterFromOverflow(core, rc, row, src_col, scalar);
+    defer core.emoji_cluster_len = 0;
+    const t_ens: i128 = if (timing) clock.nowNs() else 0;
+    const entry_opt = core.ensureGlyphPhase2(scalar, c_style);
+    if (timing) ensure_ns.* += @intCast(@max(0, clock.nowNs() - t_ens));
+    const entry = entry_opt orelse return null;
+    if (cacheable) {
+        const probe = nvim_core.glyphCacheProbe(keys.?, key, hash);
+        cache.?[probe.insert] = entry;
+        keys.?[probe.insert] = key;
+    }
+    return entry;
+}
+
+/// Legacy (pre-Phase-2) atlas callback for one cell: the styled callback when
+/// the cell is bold/italic and the frontend has one, else the base callback.
+fn ensureLegacyGlyph(
+    core: *Core,
+    ensure_base: ?c_api.AtlasEnsureGlyphFn,
+    ensure_styled: ?c_api.AtlasEnsureGlyphStyledFn,
+    scalar: u32,
+    cell_style_flags: u8,
+    ge: *c_api.GlyphEntry,
+) bool {
+    if (cell_style_flags & (STYLE_BOLD | STYLE_ITALIC) != 0 and ensure_styled != null) {
+        const cs: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+            @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+        return ensure_styled.?(core.ctx, scalar, cs, ge) != 0;
+    }
+    if (ensure_base) |ensure| return ensure(core.ctx, scalar, ge) != 0;
+    return false;
+}
+
+/// Fill core.shaping_scalars / shaping_col_widths / shaping_src_cols for the
+/// cells [run_start, end) of row `r`: wide continuations are skipped, and each
+/// cell's overflow extras follow its base scalar with width 0.
+fn collectRunScalars(core: *Core, rc: *const RenderCells, r: u32, run_start: u32, end: u32, cols: u32, run_grid_id: i64, may_have_overflow: bool) !void {
+    const run_len = end - run_start;
+    core.shaping_scalars.clearRetainingCapacity();
+    core.shaping_col_widths.clearRetainingCapacity();
+    core.shaping_src_cols.clearRetainingCapacity();
+    var shaping_scalar_capacity: usize = run_len;
+    if (may_have_overflow) {
+        const possible_clusters = @min(run_len, core.grid.overflowCountForGrid(run_grid_id));
+        shaping_scalar_capacity +|= possible_clusters *| grid_mod.OverflowExtras.capacity;
+    }
+    try ensureShapingScratch(core, shaping_scalar_capacity);
+    // SIMD fast path: no continuation cells and no cluster
+    // tails. A zero immediately after this style/color run is
+    // still the wide continuation of its final scalar, so the
+    // row-aware collector below must assign that scalar width 2.
+    const run_ends_at_wide_continuation = end < cols and
+        rc.scalars.items[@intCast(end)] == 0;
+    if (!may_have_overflow and !run_ends_at_wide_continuation and
+        simdAllNonZero(rc.scalars.items, @intCast(run_start), @intCast(end)))
+    {
+        @memcpy(core.shaping_scalars.items.ptr[0..run_len], rc.scalars.items[@intCast(run_start)..@intCast(end)]);
+        core.shaping_scalars.items.len = run_len;
+        @memset(core.shaping_col_widths.items.ptr[0..run_len], 1);
+        core.shaping_col_widths.items.len = run_len;
+        // src_cols: sequential from run_start
+        simdFillSequentialFrom(core.shaping_src_cols.items.ptr, run_len, run_start);
+        core.shaping_src_cols.items.len = run_len;
+        return;
+    }
+    var si: u32 = run_start;
+    while (si < end) : (si += 1) {
+        const s = rc.scalars.items[@intCast(si)];
+        if (s == 0) {
+            continue;
+        }
+        core.shaping_scalars.appendAssumeCapacity(s);
+        // A continuation can begin a different style/color
+        // run. Cell width is row geometry, so inspect the
+        // complete row rather than truncating at this run.
+        const col_w: u32 = if (si + 1 < cols and rc.scalars.items[@intCast(si + 1)] == 0) 2 else 1;
+        core.shaping_col_widths.appendAssumeCapacity(col_w);
+        core.shaping_src_cols.appendAssumeCapacity(si);
+        if (may_have_overflow) {
+            if (getOverflowForCell(core, rc, r, si)) |extras| {
+                for (extras) |extra| {
+                    core.shaping_scalars.appendAssumeCapacity(extra);
+                    core.shaping_col_widths.appendAssumeCapacity(0);
+                    core.shaping_src_cols.appendAssumeCapacity(si);
+                }
+            }
+        }
+    }
+}
+
 /// Unified 5-pass row vertex generation shared by global grid (row_mode) and
 /// external grid paths.  Caller must pre-populate `core.row_cells` (including
 /// `deco_base_flags`) before calling.  Returns stats including glyph miss flag.
@@ -2159,69 +2464,29 @@ pub fn generateRowVertices(
                 const fg = VH.rgb(run_fg);
                 const glyph_scroll_flag: u32 = run_deco;
                 const run_has_glow = run_glow != 0;
+                const quads: GlyphQuadEmitter = .{
+                    .core = core,
+                    .out = out,
+                    .max_vertices = p.max_vertices,
+                    .fg = fg,
+                    .grid_id = run_grid_id,
+                    .base_y = baseY,
+                    .row_top = row_top,
+                    .cell_h = cellH,
+                    .deco = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0),
+                    .timing = log_glyph_timing,
+                    .emit_ns = &quad_emit_ns_acc,
+                };
 
                 if (has_shaping) {
                     // --- Text-run shaping path ---
-                    const run_len = end - run_start;
                     const first_style = rc.style_flags_arr.items[@intCast(run_start)];
                     const c_style: u32 = @as(u32, if (first_style & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
                         @as(u32, if (first_style & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
                     const style_index: u32 = @as(u32, if (first_style & STYLE_BOLD != 0) @as(u32, 1) else 0) +
                         @as(u32, if (first_style & STYLE_ITALIC != 0) @as(u32, 2) else 0);
 
-                    // Collect scalars (skip wide char continuations) and track column widths.
-                    // Also track the composited column for each scalar so we can look up
-                    // cell overflow (e.g., VS16) during vertex generation.
-                    core.shaping_scalars.clearRetainingCapacity();
-                    core.shaping_col_widths.clearRetainingCapacity();
-                    core.shaping_src_cols.clearRetainingCapacity();
-                    var shaping_scalar_capacity: usize = run_len;
-                    if (may_have_overflow) {
-                        const possible_clusters = @min(run_len, core.grid.overflowCountForGrid(run_grid_id));
-                        shaping_scalar_capacity +|= possible_clusters *| 15;
-                    }
-                    try ensureShapingScratch(core, shaping_scalar_capacity);
-                    // SIMD fast path: no continuation cells and no cluster
-                    // tails. A zero immediately after this style/color run is
-                    // still the wide continuation of its final scalar, so the
-                    // row-aware collector below must assign that scalar width 2.
-                    const run_ends_at_wide_continuation = end < cols and
-                        rc.scalars.items[@intCast(end)] == 0;
-                    if (!may_have_overflow and !run_ends_at_wide_continuation and
-                        simdAllNonZero(rc.scalars.items, @intCast(run_start), @intCast(end)))
-                    {
-                        @memcpy(core.shaping_scalars.items.ptr[0..run_len], rc.scalars.items[@intCast(run_start)..@intCast(end)]);
-                        core.shaping_scalars.items.len = run_len;
-                        @memset(core.shaping_col_widths.items.ptr[0..run_len], 1);
-                        core.shaping_col_widths.items.len = run_len;
-                        // src_cols: sequential from run_start
-                        simdFillSequentialFrom(core.shaping_src_cols.items.ptr, run_len, run_start);
-                        core.shaping_src_cols.items.len = run_len;
-                    } else {
-                        var si: u32 = run_start;
-                        while (si < end) : (si += 1) {
-                            const s = rc.scalars.items[@intCast(si)];
-                            if (s == 0) {
-                                continue;
-                            }
-                            core.shaping_scalars.appendAssumeCapacity(s);
-                            // A continuation can begin a different style/color
-                            // run. Cell width is row geometry, so inspect the
-                            // complete row rather than truncating at this run.
-                            const col_w: u32 = if (si + 1 < cols and rc.scalars.items[@intCast(si + 1)] == 0) 2 else 1;
-                            core.shaping_col_widths.appendAssumeCapacity(col_w);
-                            core.shaping_src_cols.appendAssumeCapacity(si);
-                            if (may_have_overflow) {
-                                if (getOverflowForCell(core, rc, r, si)) |extras| {
-                                    for (extras) |extra| {
-                                        core.shaping_scalars.appendAssumeCapacity(extra);
-                                        core.shaping_col_widths.appendAssumeCapacity(0);
-                                        core.shaping_src_cols.appendAssumeCapacity(si);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    try collectRunScalars(core, rc, r, run_start, end, cols, run_grid_id, may_have_overflow);
 
                     const scalar_count = core.shaping_scalars.items.len;
                     if (scalar_count == 0) {
@@ -2363,6 +2628,7 @@ pub fn generateRowVertices(
                                     // The second call was given the exact capacity
                                     // it requested. Truncation would publish
                                     // malformed clusters and hide a contract bug.
+                                    core.reportCallbackError(.shape_failed, "shape_text_run");
                                     return error.ShapeCallbackInvalidCount;
                                 }
                             } else {
@@ -2372,6 +2638,7 @@ pub fn generateRowVertices(
                             if (!shape_callback_fallback and
                                 !shapeClustersValid(bufs.clusters.items, final_glyph_count, scalar_count))
                             {
+                                core.reportCallbackError(.shape_failed, "shape_text_run");
                                 final_glyph_count = try setShapingScalarFallback(bufs, core.shaping_col_widths.items[0..scalar_count], core.alloc);
                                 shape_callback_fallback = true;
                             }
@@ -2485,23 +2752,10 @@ pub fn generateRowVertices(
                             // Emit quad. x_off/y_off are 0 for ASCII fast path,
                             // so positioning collapses to bbox-relative only.
                             if (ge.bbox_size_px[0] > 0 and ge.bbox_size_px[1] > 0) {
-                                const baselineY: f32 = baseY + ge.ascent_px;
-                                const gx0: f32 = penX + ge.bbox_origin_px[0];
-                                const gx1: f32 = gx0 + ge.bbox_size_px[0];
-                                const gy0: f32 = baselineY - (ge.bbox_origin_px[1] + ge.bbox_size_px[1]);
-                                const gy1: f32 = gy0 + ge.bbox_size_px[1];
-                                const uv0: [2]f32 = .{ ge.uv_min[0], ge.uv_min[1] };
-                                const uv1: [2]f32 = .{ ge.uv_max[0], ge.uv_min[1] };
-                                const uv2: [2]f32 = .{ ge.uv_min[0], ge.uv_max[1] };
-                                const uv3: [2]f32 = .{ ge.uv_max[0], ge.uv_max[1] };
                                 // ASCII is never emoji and the fast path is never
                                 // entered for color emoji bitmaps, so DECO_COLOR_EMOJI
                                 // is unconditionally off.
-                                const deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0);
-                                const t_emit: i128 = if (log_glyph_timing) clock.nowNs() else 0;
-                                try ensureRowQuadCapacity(core, out, p.max_vertices, 1);
-                                VH.pushGlyphQuadAssumeCapacity(out, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, run_grid_id, deco);
-                                if (log_glyph_timing) quad_emit_ns_acc += @intCast(@max(0, clock.nowNs() - t_emit));
+                                try quads.push(quads.quad(ge, penX, null, 0), false);
                             }
 
                             penX += cell_advance;
@@ -2651,55 +2905,8 @@ pub fn generateRowVertices(
                                 // and rasterizer-input tests at the end of this
                                 // file, and on the glass by the test/gui
                                 // scenario visual/emoji_cluster_cache.
-                                const fb_extras = getOverflowForCell(core, rc, r, fb_src_col);
-                                const fb_cache_key = clusterCacheKey(fb_scalar, style_index, fb_extras);
-                                const fb_cache_hash = clusterCacheHash(fb_scalar, style_index, fb_extras);
-                                const fb_cacheable = glyph_cache_non_ascii != null and
-                                    glyph_keys_non_ascii != null and
-                                    GLYPH_CACHE_NON_ASCII_SIZE > 0;
-                                var fb_ge_opt: ?c_api.GlyphEntry = null;
-                                if (fb_cacheable) {
-                                    const probe = nvim_core.glyphCacheProbe(glyph_keys_non_ascii.?, fb_cache_key, fb_cache_hash);
-                                    if (probe.hit) |hit_idx| fb_ge_opt = glyph_cache_non_ascii.?[hit_idx];
-                                }
-                                const fb_t_ens: i128 = if (log_glyph_timing) clock.nowNs() else 0;
-                                if (fb_ge_opt == null) {
-                                    fb_ge_opt = core.ensureGlyphPhase2(fb_scalar, c_style);
-                                    if (fb_cacheable) {
-                                        if (fb_ge_opt) |entry| {
-                                            const probe = nvim_core.glyphCacheProbe(glyph_keys_non_ascii.?, fb_cache_key, fb_cache_hash);
-                                            glyph_cache_non_ascii.?[probe.insert] = entry;
-                                            glyph_keys_non_ascii.?[probe.insert] = fb_cache_key;
-                                        }
-                                    }
-                                }
-                                if (log_glyph_timing) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - fb_t_ens));
-                                if (fb_ge_opt) |fb_ge| {
-                                    if (fb_ge.bbox_size_px[0] > 0 and fb_ge.bbox_size_px[1] > 0) {
-                                        const fb_baselineY: f32 = baseY + fb_ge.ascent_px;
-                                        const fb_gx0: f32 = fallback_base_x + fb_ge.bbox_origin_px[0];
-                                        const fb_gx1: f32 = fb_gx0 + fb_ge.bbox_size_px[0];
-                                        const fb_raw_gy0: f32 = fb_baselineY - (fb_ge.bbox_origin_px[1] + fb_ge.bbox_size_px[1]);
-                                        const fb_span = vertexgen.trimBoxDrawingSpanY(
-                                            fb_scalar,
-                                            .{ .y0 = fb_raw_gy0, .y1 = fb_raw_gy0 + fb_ge.bbox_size_px[1], .v0 = fb_ge.uv_min[1], .v1 = fb_ge.uv_max[1] },
-                                            row_top,
-                                            row_top + cellH,
-                                        );
-                                        const fb_gy0: f32 = fb_span.y0;
-                                        const fb_gy1: f32 = fb_span.y1;
-
-                                        const fb_uv0: [2]f32 = .{ fb_ge.uv_min[0], fb_span.v0 };
-                                        const fb_uv1: [2]f32 = .{ fb_ge.uv_max[0], fb_span.v0 };
-                                        const fb_uv2: [2]f32 = .{ fb_ge.uv_min[0], fb_span.v1 };
-                                        const fb_uv3: [2]f32 = .{ fb_ge.uv_max[0], fb_span.v1 };
-
-                                        const fb_glyph_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0) | (if (fb_ge.bytes_per_pixel >= 4) c_api.DECO_COLOR_EMOJI else 0);
-                                        const fb_t_emit: i128 = if (log_glyph_timing) clock.nowNs() else 0;
-                                        try ensureRowQuadCapacity(core, out, p.max_vertices, 1);
-                                        VH.pushGlyphQuadAssumeCapacity(out, fb_gx0, fb_gy0, fb_gx1, fb_gy1, fb_uv0, fb_uv1, fb_uv2, fb_uv3, fg, run_grid_id, fb_glyph_deco);
-                                        if (log_glyph_timing) quad_emit_ns_acc += @intCast(@max(0, clock.nowNs() - fb_t_emit));
-                                    }
+                                if (resolveClusterGlyph(core, rc, r, fb_src_col, fb_scalar, c_style, style_index, false, glyph_cache_non_ascii, glyph_keys_non_ascii, log_glyph_timing, &atlas_ensure_ns_acc)) |fb_ge| {
+                                    try quads.emit(fb_ge, fallback_base_x, null, fb_scalar);
                                 } else {
                                     if (core.flush_aborted) return error.FlushAborted;
                                     stats.had_glyph_miss = true;
@@ -2787,49 +2994,15 @@ pub fn generateRowVertices(
                         const glyph_empty = glyph_ok and (ge.bbox_size_px[0] <= 0 or ge.bbox_size_px[1] <= 0);
                         if ((!glyph_ok or glyph_empty) and (next_cluster == this_cluster + 1 or cluster_is_emoji)) {
                             if (first_scalar != 0 and first_scalar != 0x20) {
-                                // Build cache key that includes the full cluster content
-                                // (base scalar + overflow extras) so different emoji clusters
-                                // with the same first scalar (e.g., 👩‍💻 vs 👩‍🔬) get distinct entries.
-                                const overflow_extras = getOverflowForCell(core, rc, r, src_col);
-                                const fb_key = clusterCacheKey(first_scalar, style_index, overflow_extras);
-                                const fb_hash = clusterCacheHash(first_scalar, style_index, overflow_extras);
-
-                                // No single-scalar restriction: the key folds in
-                                // the cell's overflow extras, which is exactly
-                                // what buildEmojiCluster hands the rasterizer
-                                // below, so a multi-scalar cluster keys as
-                                // precisely as a single-scalar one.
-                                const fb_cached = if (glyph_cache_non_ascii != null and glyph_keys_non_ascii != null and GLYPH_CACHE_NON_ASCII_SIZE > 0) blk: {
-                                    const probe = nvim_core.glyphCacheProbe(glyph_keys_non_ascii.?, fb_key, fb_hash);
-                                    if (probe.hit) |hit_idx| {
-                                        ge = glyph_cache_non_ascii.?[hit_idx];
-                                        break :blk true;
-                                    }
-                                    break :blk false;
-                                } else false;
-
-                                if (fb_cached) {
+                                // The cache key folds in the cell's overflow
+                                // extras, exactly what buildEmojiCluster hands
+                                // the rasterizer, so clusters sharing a first
+                                // scalar (e.g., 👩‍💻 vs 👩‍🔬) get distinct entries.
+                                if (resolveClusterGlyph(core, rc, r, src_col, first_scalar, c_style, style_index, cluster_is_emoji, glyph_cache_non_ascii, glyph_keys_non_ascii, false, &atlas_ensure_ns_acc)) |fb_ge| {
+                                    ge = fb_ge;
                                     glyph_ok = true;
-                                } else {
-                                    // Set cluster context for emoji so the frontend rasterizer
-                                    // uses color emoji path. Uses overflow map for VS16 sequences.
-                                    if (cluster_is_emoji) {
-                                        setEmojiClusterFromOverflow(core, rc, r, src_col, first_scalar);
-                                    }
-                                    defer core.emoji_cluster_len = 0;
-
-                                    if (core.ensureGlyphPhase2(first_scalar, c_style)) |fb_ge| {
-                                        ge = fb_ge;
-                                        glyph_ok = true;
-                                        // Store in non-ASCII cache for subsequent rows
-                                        if (glyph_cache_non_ascii != null and glyph_keys_non_ascii != null and GLYPH_CACHE_NON_ASCII_SIZE > 0) {
-                                            const probe = nvim_core.glyphCacheProbe(glyph_keys_non_ascii.?, fb_key, fb_hash);
-                                            glyph_cache_non_ascii.?[probe.insert] = fb_ge;
-                                            glyph_keys_non_ascii.?[probe.insert] = fb_key;
-                                        }
-                                    } else if (core.flush_aborted) {
-                                        return error.FlushAborted;
-                                    }
+                                } else if (core.flush_aborted) {
+                                    return error.FlushAborted;
                                 }
                             }
                         }
@@ -2859,29 +3032,7 @@ pub fn generateRowVertices(
                                 const mc_ge_opt = core.ensureGlyphPhase2(mc_scalar, c_style);
                                 if (log_glyph_timing) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - mc_t_ens));
                                 if (mc_ge_opt) |mc_ge| {
-                                    if (mc_ge.bbox_size_px[0] > 0 and mc_ge.bbox_size_px[1] > 0) {
-                                        const mc_baselineY: f32 = baseY + mc_ge.ascent_px;
-                                        const mc_gx0: f32 = mc_base_x + mc_ge.bbox_origin_px[0];
-                                        const mc_gx1: f32 = mc_gx0 + mc_ge.bbox_size_px[0];
-                                        const mc_raw_gy0: f32 = mc_baselineY - (mc_ge.bbox_origin_px[1] + mc_ge.bbox_size_px[1]);
-                                        const mc_span = vertexgen.trimBoxDrawingSpanY(
-                                            mc_scalar,
-                                            .{ .y0 = mc_raw_gy0, .y1 = mc_raw_gy0 + mc_ge.bbox_size_px[1], .v0 = mc_ge.uv_min[1], .v1 = mc_ge.uv_max[1] },
-                                            row_top,
-                                            row_top + cellH,
-                                        );
-                                        const mc_gy0: f32 = mc_span.y0;
-                                        const mc_gy1: f32 = mc_span.y1;
-                                        const mc_uv0: [2]f32 = .{ mc_ge.uv_min[0], mc_span.v0 };
-                                        const mc_uv1: [2]f32 = .{ mc_ge.uv_max[0], mc_span.v0 };
-                                        const mc_uv2: [2]f32 = .{ mc_ge.uv_min[0], mc_span.v1 };
-                                        const mc_uv3: [2]f32 = .{ mc_ge.uv_max[0], mc_span.v1 };
-                                        const mc_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0) | (if (mc_ge.bytes_per_pixel >= 4) c_api.DECO_COLOR_EMOJI else 0);
-                                        const mc_t_emit: i128 = if (log_glyph_timing) clock.nowNs() else 0;
-                                        try ensureRowQuadCapacity(core, out, p.max_vertices, 1);
-                                        VH.pushGlyphQuadAssumeCapacity(out, mc_gx0, mc_gy0, mc_gx1, mc_gy1, mc_uv0, mc_uv1, mc_uv2, mc_uv3, fg, run_grid_id, mc_deco);
-                                        if (log_glyph_timing) quad_emit_ns_acc += @intCast(@max(0, clock.nowNs() - mc_t_emit));
-                                    }
+                                    try quads.emit(mc_ge, mc_base_x, null, mc_scalar);
                                 } else {
                                     if (core.flush_aborted) return error.FlushAborted;
                                     stats.had_glyph_miss = true;
@@ -2910,24 +3061,9 @@ pub fn generateRowVertices(
                         if (glyph_ok and ge.bbox_size_px[0] > 0 and ge.bbox_size_px[1] > 0) {
                             const x_off_px = vertexgen.fixed26_6ToPx(bufs.x_off.items[gi]);
                             const y_off_px = vertexgen.fixed26_6ToPx(bufs.y_off.items[gi]);
-                            const baselineY: f32 = baseY + ge.ascent_px;
-
-                            const gx0: f32 = penX + ge.bbox_origin_px[0] + x_off_px;
-                            const gx1: f32 = gx0 + ge.bbox_size_px[0];
-                            const raw_gy0: f32 = (baselineY + y_off_px) - (ge.bbox_origin_px[1] + ge.bbox_size_px[1]);
-                            const span = vertexgen.trimBoxDrawingSpanY(
-                                if (next_cluster == this_cluster + 1) first_scalar else 0,
-                                .{ .y0 = raw_gy0, .y1 = raw_gy0 + ge.bbox_size_px[1], .v0 = ge.uv_min[1], .v1 = ge.uv_max[1] },
-                                row_top,
-                                row_top + cellH,
-                            );
-                            const gy0: f32 = span.y0;
-                            const gy1: f32 = span.y1;
-
-                            const uv0: [2]f32 = .{ ge.uv_min[0], span.v0 };
-                            const uv1: [2]f32 = .{ ge.uv_max[0], span.v0 };
-                            const uv2: [2]f32 = .{ ge.uv_min[0], span.v1 };
-                            const uv3: [2]f32 = .{ ge.uv_max[0], span.v1 };
+                            const q = quads.quad(ge, penX, .{ x_off_px, y_off_px }, if (next_cluster == this_cluster + 1) first_scalar else 0);
+                            const gx0 = q.gx0;
+                            const gx1 = q.gx1;
 
                             // Retroactive suppression: if this glyph extends backward
                             // by >= 0.75*cellW, zero out preceding quads that have a
@@ -2974,11 +3110,7 @@ pub fn generateRowVertices(
 
                             // Record quad for potential retroactive suppression by later glyphs
                             const vert_start = out.items.len;
-                            const glyph_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0) | (if (ge.bytes_per_pixel >= 4) c_api.DECO_COLOR_EMOJI else 0);
-                            const sg_t_emit: i128 = if (log_glyph_timing) clock.nowNs() else 0;
-                            try ensureRowQuadCapacity(core, out, p.max_vertices, 1);
-                            VH.pushGlyphQuadAssumeCapacity(out, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, run_grid_id, glyph_deco);
-                            if (log_glyph_timing) quad_emit_ns_acc += @intCast(@max(0, clock.nowNs() - sg_t_emit));
+                            try quads.push(q, ge.bytes_per_pixel >= 4);
 
                             recent_quads[recent_quad_total % RECENT_CAP] = .{
                                 .vert_start = vert_start,
@@ -3033,7 +3165,6 @@ pub fn generateRowVertices(
                         }
 
                         var ge: c_api.GlyphEntry = undefined;
-                        const style_mask = cell_style_flags & (STYLE_BOLD | STYLE_ITALIC);
                         const style_index: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) @as(u32, 1) else 0) +
                             @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) @as(u32, 2) else 0);
                         const glyph_ok = blk: {
@@ -3059,13 +3190,7 @@ pub fn generateRowVertices(
                                         break :blk true;
                                     }
                                     const a_t_ens: i128 = if (log_glyph_timing) clock.nowNs() else 0;
-                                    const ok = if (style_mask != 0 and ensure_styled != null) cb: {
-                                        const cs: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                            @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
-                                        break :cb ensure_styled.?(core.ctx, scalar, cs, &ge) != 0;
-                                    } else if (ensure_base) |ensure| cb: {
-                                        break :cb ensure(core.ctx, scalar, &ge) != 0;
-                                    } else false;
+                                    const ok = ensureLegacyGlyph(core, ensure_base, ensure_styled, scalar, cell_style_flags, &ge);
                                     if (log_glyph_timing) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - a_t_ens));
                                     if (ok) {
                                         glyph_cache_ascii.?[cache_key] = ge;
@@ -3083,13 +3208,7 @@ pub fn generateRowVertices(
                                     break :blk true;
                                 }
                                 const na_t_ens: i128 = if (log_glyph_timing) clock.nowNs() else 0;
-                                const ok = if (style_mask != 0 and ensure_styled != null) cb: {
-                                    const cs: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                        @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
-                                    break :cb ensure_styled.?(core.ctx, scalar, cs, &ge) != 0;
-                                } else if (ensure_base) |ensure| cb: {
-                                    break :cb ensure(core.ctx, scalar, &ge) != 0;
-                                } else false;
+                                const ok = ensureLegacyGlyph(core, ensure_base, ensure_styled, scalar, cell_style_flags, &ge);
                                 if (log_glyph_timing) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - na_t_ens));
                                 if (ok) {
                                     glyph_cache_non_ascii.?[probe.insert] = ge;
@@ -3098,13 +3217,7 @@ pub fn generateRowVertices(
                                 break :blk ok;
                             }
                             const lf_t_ens: i128 = if (log_glyph_timing) clock.nowNs() else 0;
-                            const ok = if (style_mask != 0 and ensure_styled != null) cb: {
-                                const cs: u32 = @as(u32, if (cell_style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                    @as(u32, if (cell_style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
-                                break :cb ensure_styled.?(core.ctx, scalar, cs, &ge) != 0;
-                            } else if (ensure_base) |ensure| cb: {
-                                break :cb ensure(core.ctx, scalar, &ge) != 0;
-                            } else false;
+                            const ok = ensureLegacyGlyph(core, ensure_base, ensure_styled, scalar, cell_style_flags, &ge);
                             if (log_glyph_timing) atlas_ensure_ns_acc += @intCast(@max(0, clock.nowNs() - lf_t_ens));
                             break :blk ok;
                         };
@@ -3122,31 +3235,7 @@ pub fn generateRowVertices(
                             continue;
                         }
 
-                        const baselineY: f32 = baseY + ge.ascent_px;
-                        const gx0: f32 = penX + ge.bbox_origin_px[0];
-                        const gx1: f32 = gx0 + ge.bbox_size_px[0];
-                        const raw_gy0: f32 = (baselineY) - (ge.bbox_origin_px[1] + ge.bbox_size_px[1]);
-                        const span = vertexgen.trimBoxDrawingSpanY(
-                            scalar,
-                            .{ .y0 = raw_gy0, .y1 = raw_gy0 + ge.bbox_size_px[1], .v0 = ge.uv_min[1], .v1 = ge.uv_max[1] },
-                            row_top,
-                            row_top + cellH,
-                        );
-                        const gy0: f32 = span.y0;
-                        const gy1: f32 = span.y1;
-
-                        const uv0: [2]f32 = .{ ge.uv_min[0], span.v0 };
-                        const uv1: [2]f32 = .{ ge.uv_max[0], span.v0 };
-                        const uv2: [2]f32 = .{ ge.uv_min[0], span.v1 };
-                        const uv3: [2]f32 = .{ ge.uv_max[0], span.v1 };
-
-                        if (ge.bbox_size_px[0] > 0 and ge.bbox_size_px[1] > 0) {
-                            const pc_glyph_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0) | (if (ge.bytes_per_pixel >= 4) c_api.DECO_COLOR_EMOJI else 0);
-                            const pc_t_emit: i128 = if (log_glyph_timing) clock.nowNs() else 0;
-                            try ensureRowQuadCapacity(core, out, p.max_vertices, 1);
-                            VH.pushGlyphQuadAssumeCapacity(out, gx0, gy0, gx1, gy1, uv0, uv1, uv2, uv3, fg, run_grid_id, pc_glyph_deco);
-                            if (log_glyph_timing) quad_emit_ns_acc += @intCast(@max(0, clock.nowNs() - pc_t_emit));
-                        }
+                        try quads.emit(ge, penX, null, scalar);
 
                         penX += cellW;
                     }
@@ -3305,16 +3394,10 @@ fn dispatchGridRowScroll(
 ) bool {
     if (grid_id < 2) return false;
     const surface_id = placedSurfaceForGrid(&core.grid, grid_id) orelse return false;
-    // An external grid has no frontend surface to remap into until its open
-    // callback has seeded one; a layer of the main surface always has one.
-    if (core.grid.external_grids.contains(grid_id) and
-        !core.known_external_grids.contains(grid_id)) return false;
-    // Nor has a layer drawn ON such a grid. notifyExternalWindowChanges
-    // withholds the open for a pending grid still under 2 rows or columns, and
-    // publishSurfaceLayouts withholds its layout to match; a shift sent for
-    // something placed on that surface reaches a frontend with no storage for
-    // it, and both answer by failing the whole flush until the resize lands.
-    if (surface_id != 1 and !core.known_external_grids.contains(surface_id)) return false;
+    // An external grid is its own surface. Before its open the frontend has
+    // no rows to shift: it drops or defers the hint, and the rows this flush
+    // resends would land on rows that never moved.
+    if (!frontendHasSurface(core, surface_id)) return false;
     const sg = core.grid.sub_grids.getPtr(grid_id) orelse return false;
     if (sg.scroll_fast_path_blocked) return false;
 
@@ -3496,82 +3579,14 @@ pub const FlushCtx = struct {
                 ctx.core.invalidateMirroredFrameState();
                 ctx.core.flush_atlas_corrupted = true;
             }
-            const vertex_budget_committed = !ctx.core.flush_aborted and !ctx.core.flush_atlas_corrupted;
-            traceRender(ctx.core, "event=end outcome={s} retryable={} destroyed_pending={d} metadata_bytes={d} metadata_limit_bytes={d}\n", .{ if (vertex_budget_committed) "commit" else "abort", ctx.core.flush_retryable, ctx.core.grid.destroyed_pending.items.len, ctx.core.layout_budget.live_bytes.load(.monotonic), c_api.render_layout.Budget.limit_bytes });
-            // on_flush_begin runs before any core vertex/atlas mutation. Its
-            // backpressure rejection leaves the existing accounting valid,
-            // so closing this untouched budget transaction must not invalidate
-            // every row ledger and force a full resend.
-            // A frontend publication refusal keeps the committed frame intact,
-            // so both the begin rejection and a late on_flush_end refusal can
-            // hold their accounting instead of invalidating every row ledger.
-            // A hard failure (atlas corruption, budget violation) still takes
-            // the full-invalidation path.
-            // A begin rejection keeps the budget (nothing was consumed) but
-            // publishes nothing, so the mirrors are as stale as they were.
-            const mirror_stale_before = ctx.core.display_mirror_stale;
-            const flush_mode = flushCommitMode(.{
+            const plan = planFlushFinish(.{
                 .aborted = ctx.core.flush_aborted,
                 .atlas_corrupted = ctx.core.flush_atlas_corrupted,
                 .retryable = ctx.core.flush_retryable,
                 .aborted_at_begin = aborted_at_flush_begin,
             });
-            finishVertexBudgetTransactionRestoring(ctx.core, flush_mode);
-            if (aborted_at_flush_begin) ctx.core.display_mirror_stale = mirror_stale_before;
-            if (vertex_budget_committed) {
-                for (ctx.core.grid.destroyed_pending.items) |grid_id| {
-                    traceRender(ctx.core, "event=destroy_release grid={d}\n", .{grid_id});
-                    ctx.core.removeGlyphMirror(grid_id);
-                }
-                ctx.core.grid.destroyed_pending.clearRetainingCapacity();
-                ctx.core.grid.commitOwed();
-                commitSurfaceLayouts(ctx.core);
-                ctx.core.finishAtlasMaintenance();
-                ctx.core.grid.clearScrolledGrids();
-                var sg_it = ctx.core.grid.sub_grids.valueIterator();
-                while (sg_it.next()) |sg| sg.clearScrollState();
-            } else {
-                // This is a transaction-local edge, not persistent atlas
-                // state. A callback abort can return before the normal reset
-                // checks consume it.
-                ctx.core.atlas_reset_during_flush = false;
-                if (!aborted_at_flush_begin) {
-                    // Everything this attempt sent is owed again, on top of
-                    // what changed after it was sent; the frontend kept its
-                    // committed frame, so nothing else is.
-                    ctx.core.grid.returnOwed();
-                    ctx.core.cursor_owner.force_recheck = true;
-                    discardStagedSurfaceLayouts(ctx.core);
-                }
-                // A due maintenance reprobe may already have invalidated its
-                // negative entries before a later consumer rejected the flush.
-                // Re-arm the shared one-shot timer so idle Neovim cannot leave
-                // those now-uncached visible cells waiting forever.
-                if ((ctx.core.atlas_negative_recovery_armed and ctx.core.atlas_negative_retry_at == null) or
-                    (ctx.core.transient_glyph_recovery_armed and ctx.core.transient_glyph_retry_at == null))
-                {
-                    const retry_at = scheduleMsgRetryDeadline(ctx.core, clock.nowNs());
-                    ctx.core.rearmAtlasMaintenanceAfterAbort(retry_at);
-                }
-                if (!aborted_at_flush_begin) {
-                    var sg_it = ctx.core.grid.sub_grids.iterator();
-                    while (sg_it.next()) |entry| {
-                        const sg = entry.value_ptr;
-                        if (!sg.row_shift_sent) continue;
-                        // The frontend dropped the shift with the bracket, so
-                        // the retry sends it again; the mirror moved with the
-                        // first send and moves back here, or the retry would
-                        // move it twice.
-                        if (sg.last_scroll_op) |op| {
-                            if (gridScrollFastPathRegion(op, sg.rows, sg.cols, sg.rows, sg.cols)) |region| {
-                                ctx.core.shiftGlyphMirror(entry.key_ptr.*, region.row_start, region.row_end, -op.rows);
-                            }
-                        }
-                        sg.row_shift_sent = false;
-                        sg.row_scroll_notify_pending = true;
-                    }
-                }
-            }
+            traceRender(ctx.core, "event=end outcome={s} retryable={} destroyed_pending={d} metadata_bytes={d} metadata_limit_bytes={d}\n", .{ if (plan.commit) "commit" else "abort", ctx.core.flush_retryable, ctx.core.grid.destroyed_pending.items.len, ctx.core.layout_budget.live_bytes.load(.monotonic), c_api.render_layout.Budget.limit_bytes });
+            applyFlushFinish(ctx.core, plan);
         }
 
         // Ensure on_flush_end is called on all exit paths (atomic commit point)
@@ -3590,35 +3605,9 @@ pub const FlushCtx = struct {
         // for the retry flush so smooth-scroll offsets stay in sync with vertices.
         if (ctx.core.flush_aborted) {
             // The message timeout checks below are unreachable when beginFlush
-            // rejects the transaction. Move every elapsed deadline onto one
-            // bounded retry deadline so the frontend timer does not immediately
-            // drive another full flush under sustained backpressure/OOM.
+            // rejects the transaction; see planAbortRetime.
             const now = clock.nowNs();
-            var throttle_due = false;
-            if (ctx.core.msg_show_pending_since) |pending_since| {
-                throttle_due = now - pending_since >= ctx.core.msg_show_throttle_ns;
-                const retry_due = if (ctx.core.msg_show_retry_at) |retry_at| now >= retry_at else true;
-                throttle_due = throttle_due and retry_due;
-            }
-            const show_hide_due = if (ctx.core.msg_show_auto_hide_at) |hide_at| now >= hide_at else false;
-            const history_hide_due = if (ctx.core.msg_history_auto_hide_at) |hide_at| now >= hide_at else false;
-            const atlas_retry_due = if (ctx.core.atlas_negative_retry_at) |retry_at| now >= retry_at else false;
-            const transient_retry_due = if (ctx.core.transient_glyph_retry_at) |retry_at| now >= retry_at else false;
-            // Included since a history dispatch failure now always arms this,
-            // making an elapsed deadline common: left out, it alone keeps
-            // nextMsgTimeoutNs at zero and the frontend spins a 0ms timer.
-            const history_retry_due = if (ctx.core.msg_history_retry_at) |retry_at| now >= retry_at else false;
-            if (throttle_due or show_hide_due or history_hide_due or atlas_retry_due or
-                transient_retry_due or history_retry_due)
-            {
-                const retry_at = scheduleMsgRetryDeadline(ctx.core, now);
-                if (throttle_due) ctx.core.msg_show_retry_at = retry_at;
-                if (show_hide_due) ctx.core.msg_show_auto_hide_at = retry_at;
-                if (history_hide_due) ctx.core.msg_history_auto_hide_at = retry_at;
-                if (atlas_retry_due) ctx.core.atlas_negative_retry_at = retry_at;
-                if (transient_retry_due) ctx.core.transient_glyph_retry_at = retry_at;
-                if (history_retry_due) ctx.core.msg_history_retry_at = retry_at;
-            }
+            applyAbortRetime(ctx.core, planAbortRetime(ctx.core, now), now);
             return;
         }
 
@@ -4341,6 +4330,9 @@ fn collectEmitGrids(self: *Core) void {
     self.emit_grid_ids.clearRetainingCapacity();
     var ext_it = self.grid.external_grids.keyIterator();
     while (ext_it.next()) |grid_id_ptr| {
+        // zonvie_core.h: a zero-cell sub-grid gets no on_vertices_row.
+        const ext_sg = self.grid.sub_grids.get(grid_id_ptr.*) orelse continue;
+        if (ext_sg.rows == 0 or ext_sg.cols == 0) continue;
         self.emit_grid_ids.append(self.alloc, &self.layout_budget, grid_id_ptr.*) catch |err| {
             failSurfaceLayout(self, err);
             return;
@@ -4456,6 +4448,21 @@ pub fn notifySurfaceLayouts(self: *Core) void {
     }
 }
 
+/// Whether the frontend has been told about surface `surface_id`: grid 1
+/// always, an external root once its on_external_window completed.
+/// externalSurfaceOpenable decides when that happens; layouts, row shifts and
+/// cursor ownership all wait on this answer.
+fn frontendHasSurface(self: *const Core, surface_id: i64) bool {
+    return surface_id == 1 or self.known_external_grids.contains(surface_id);
+}
+
+/// zonvie_core.h on_external_window: not while either dimension is 0, nor
+/// below 2x2 for an ext_windows grid awaiting its first resize.
+fn externalSurfaceOpenable(rows: u32, cols: u32, awaiting_resize: bool) bool {
+    if (rows == 0 or cols == 0) return false;
+    return !awaiting_resize or (rows >= 2 and cols >= 2);
+}
+
 fn publishSurfaceLayouts(self: *Core) void {
     if (self.flush_aborted) return;
 
@@ -4463,11 +4470,8 @@ fn publishSurfaceLayouts(self: *Core) void {
         if (!emitSurfaceLayout(self, 1)) return;
         var ext_it = self.grid.external_grids.keyIterator();
         while (ext_it.next()) |grid_id| {
-            // notifyExternalWindowChanges withholds on_external_window for a
-            // grid still awaiting its initial resize, so no frontend surface
-            // exists to receive a layout: both abort the flush for an
-            // unregistered surface, and the retry re-emits the same layout.
-            if (self.grid.pending_ext_window_grids.contains(grid_id.*)) continue;
+            // zonvie_core.h on_surface_layout: never before on_external_window.
+            if (!frontendHasSurface(self, grid_id.*)) continue;
             if (!emitSurfaceLayout(self, grid_id.*)) return;
         }
         // Surfaces that no longer exist cannot be re-sent stale signatures.
@@ -4511,10 +4515,12 @@ pub fn notifyExternalWindowChanges(self: *Core) void {
             cols = sg.cols;
         }
 
-        // Skip 0x0 grids - wait until grid_resize provides valid dimensions
-        if (rows == 0 or cols == 0) continue;
-
-        const is_new = !self.known_external_grids.contains(grid_id);
+        const is_new = !frontendHasSurface(self, grid_id);
+        // An open window is updated at any shape except 0x0, which waits for
+        // the next grid_resize.
+        if (is_new) {
+            if (!externalSurfaceOpenable(rows, cols, self.grid.pending_ext_window_grids.contains(grid_id))) continue;
+        } else if (rows == 0 or cols == 0) continue;
 
         // Check if position or size changed for existing grids (e.g. popupmenu
         // re-show with different anchor after popupmenu_select).
@@ -4532,14 +4538,8 @@ pub fn notifyExternalWindowChanges(self: *Core) void {
         if (!is_new and !pos_changed) continue;
 
         if (is_new) {
-            // For ext_windows grids awaiting initial resize response from Neovim,
-            // defer window creation until the grid has a reasonable size.
             // The pending entry is dropped only after the callback completes
             // below, so an aborted open still waits for a 2x2 grid on retry.
-            if (self.grid.pending_ext_window_grids.contains(grid_id)) {
-                if (rows < 2 or cols < 2) continue;
-            }
-
             // Reserve the known-map entry before invoking the frontend, so OOM
             // is a clean pre-callback abort rather than an opened window that
             // was never recorded (duplicate opens, lost closes on retry).
@@ -4998,7 +4998,7 @@ fn sendExternalGridVertices(
     // already be true here (opening ext_cmdline from a focused float), so that
     // broader gate does not cover this case.
     const cursor_grid_pending = self.grid.external_grids.contains(cursor_grid) and
-        !self.known_external_grids.contains(cursor_grid);
+        !frontendHasSurface(self, cursor_grid);
     defer {
         // A per-grid callback below (e.g. Windows external row-buffer OOM) may
         // call zonvie_core_abort_flush mid-loop, and the frontend cancels the
@@ -5847,6 +5847,15 @@ pub fn sendPopupmenuShow(self: *Core) bool {
     if (max_kind_w > 0) width += 1 + max_kind_w; // gap + kind
     if (max_menu_w > 0) width += 1 + max_menu_w; // gap + menu
     width = @min(width, self.grid.cmdlineMaxCols());
+    // Before the first grid_resize there is no screen to place it on, and
+    // the two pads below would not fit.
+    if (width < 2) {
+        self.log.write("[popupmenu] no screen width yet\n", .{});
+        return false;
+    }
+    // Every column ends at the right pad, which the width cap can move left
+    // of a column's natural end.
+    const content_end: u32 = width - 1;
 
     // Limit height to reasonable number
     const max_height: u32 = 15;
@@ -5890,14 +5899,14 @@ pub fn sendPopupmenuShow(self: *Core) bool {
 
         // Column layout: | 1 pad | word (max_word_w) | 1 gap | kind (max_kind_w) | 1 gap | menu (max_menu_w) | 1 pad |
         var col: u32 = 1; // left padding
-        col = writeUtf8ToGrid(self, pum_grid_id, row, col, item.word, width - 1, hl_id, .two_spaces) catch |e| {
+        col = writeUtf8ToGrid(self, pum_grid_id, row, col, item.word, content_end, hl_id, .two_spaces) catch |e| {
             abortClusterUpdate(self, "popupmenu", e);
             return false;
         };
 
         if (max_kind_w > 0) {
             col = 1 + max_word_w + 1; // jump to kind column start
-            col = writeUtf8ToGrid(self, pum_grid_id, row, col, item.kind, col + max_kind_w, hl_id, .two_spaces) catch |e| {
+            col = writeUtf8ToGrid(self, pum_grid_id, row, col, item.kind, @min(col + max_kind_w, content_end), hl_id, .two_spaces) catch |e| {
                 abortClusterUpdate(self, "popupmenu", e);
                 return false;
             };
@@ -5905,7 +5914,7 @@ pub fn sendPopupmenuShow(self: *Core) bool {
 
         if (max_menu_w > 0) {
             col = 1 + max_word_w + (if (max_kind_w > 0) 1 + max_kind_w else @as(u32, 0)) + 1; // jump to menu column start
-            _ = writeUtf8ToGrid(self, pum_grid_id, row, col, item.menu, col + max_menu_w, hl_id, .two_spaces) catch |e| {
+            _ = writeUtf8ToGrid(self, pum_grid_id, row, col, item.menu, @min(col + max_menu_w, content_end), hl_id, .two_spaces) catch |e| {
                 abortClusterUpdate(self, "popupmenu", e);
                 return false;
             };
@@ -5936,6 +5945,10 @@ pub fn sendPopupmenuShow(self: *Core) bool {
 /// Write `text` into (row, start_col..col_limit) through CellWriter, TABs
 /// by `tab`. Returns the column after the last written cell.
 fn writeUtf8ToGrid(self: *Core, grid_id: i64, row: u32, start_col: u32, text: []const u8, col_limit: u32, hl_id: u32, tab: TabRule) !u32 {
+    // CellWriter's whole-cluster rule holds only inside the grid: putCell
+    // drops a cell past the last column, so a wide cluster could keep its
+    // base and lose its placeholder.
+    if (self.grid.bufForConst(grid_id)) |buf| std.debug.assert(col_limit <= buf.cols);
     var w: CellWriter = .{ .grid = &self.grid, .grid_id = grid_id, .row = row, .col = start_col, .limit = col_limit, .tab = tab };
     _ = try w.text(text, hl_id);
     return w.col;
@@ -7657,7 +7670,7 @@ fn ensureCachedPhase2Glyph(
             var y_off: [8]i32 = undefined;
             // The whole cluster: a font that composes e + U+0301 into one
             // glyph gives the cursor the same picture as the row.
-            var cluster: [16]u32 = undefined;
+            var cluster: [1 + grid_mod.OverflowExtras.capacity]u32 = undefined;
             cluster[0] = scalar;
             @memcpy(cluster[1..][0..extras.len], extras);
             const glyph_count = shape(
@@ -7767,7 +7780,7 @@ pub const EmojiCluster = struct {
     /// Byte offset past the end of the cluster in the source string.
     end_byte: usize,
     /// Extra codepoints (after the first). Valid up to codepoint_count - 1.
-    extras: [15]u32,
+    extras: [grid_mod.OverflowExtras.capacity]u32,
     extras_len: u32,
 };
 
@@ -8257,6 +8270,36 @@ test "the popupmenu grid is capped at the screen width, as Neovim's own popupmen
     try std.testing.expect(panelCols(&core, pgid) <= 40);
 }
 
+test "a capped popupmenu keeps a wide cluster whole and its right pad blank" {
+    // Natural width 22 (pad, word 10, gap, kind 3, gap, menu 5, pad) is capped
+    // to 20; the menu column starts at 16, so "あ" would land on the right pad
+    // at 19 with its placeholder past the grid. CellWriter writes a cluster
+    // whole or not at all.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(24, 80);
+    core.grid.screen_cols = 20;
+
+    var items = [_]grid_mod.PopupmenuItem{.{ .word = "a", .kind = "xyz", .menu = "abc\u{3042}" }};
+    const pgid = grid_mod.POPUPMENU_GRID_ID;
+    try core.grid.setPopupmenuShow(&items, 0, 0, 0, 1);
+    try std.testing.expect(sendPopupmenuShow(&core));
+
+    try std.testing.expectEqual(@as(u32, 20), panelCols(&core, pgid));
+    const menu_want = [_]u32{ 'a', 'b', 'c', ' ' };
+    for (menu_want, 16..) |cp, col| try std.testing.expectEqual(cp, core.grid.getCellGrid(pgid, 0, @intCast(col)).cp);
+}
+
+test "a popupmenu before the first grid_resize is refused, not drawn" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.grid.screen_cols = 0;
+
+    var items = [_]grid_mod.PopupmenuItem{.{ .word = "w" }};
+    try core.grid.setPopupmenuShow(&items, 0, 0, 0, 1);
+    try std.testing.expect(!sendPopupmenuShow(&core));
+}
+
 test "the popupmenu window moves only when the selection leaves it" {
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
@@ -8337,7 +8380,7 @@ pub fn scanEmojiCluster(text: []const u8, start: usize) EmojiCluster {
         .extras_len = 0,
     };
 
-    var extras: [15]u32 = undefined;
+    var extras: [grid_mod.OverflowExtras.capacity]u32 = undefined;
     var extras_len: u32 = 0;
     var prev_cp: u32 = first_cp;
 
@@ -15590,6 +15633,7 @@ test "surface layout publishes one root layer per surface and only when it chang
     // An external grid becomes its own surface with its own root layer.
     try core.grid.resizeGrid(2, 3, 6);
     try std.testing.expect(try core.grid.setWinExternalPos(2, 42));
+    notifyExternalWindowChanges(&core);
     notifySurfaceLayouts(&core);
     try std.testing.expectEqual(@as(u32, 3), state.calls);
     try std.testing.expectEqual(@as(i64, 2), state.last_surface);
@@ -15678,6 +15722,93 @@ test "a surface layout waits for the external window that receives it" {
     try std.testing.expectEqual(@as(u32, 1), state.opens);
     notifySurfaceLayouts(&core);
     try std.testing.expect(state.saw_layout_for_2);
+}
+
+test "a zero-cell external grid never opened gets no surface layout" {
+    // zonvie_core.h: on_external_window is not fired while rows or cols is 0,
+    // and on_surface_layout never precedes it for a surface.
+    const State = struct {
+        opens: u32 = 0,
+        saw_layout_for_2: bool = false,
+        fn onLayout(ctx: ?*anyopaque, surface_id: i64, layers: [*c]const c_api.Layer, count: usize, rows: u32, cols: u32) callconv(.c) void {
+            _ = layers;
+            _ = count;
+            _ = rows;
+            _ = cols;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (surface_id == 2) self.saw_layout_for_2 = true;
+        }
+        fn onOpen(ctx: ?*anyopaque, grid_id: i64, win: i64, rows: u32, cols: u32, start_row: i32, start_col: i32) callconv(.c) void {
+            _ = grid_id;
+            _ = win;
+            _ = rows;
+            _ = cols;
+            _ = start_row;
+            _ = start_col;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.opens += 1;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(4, 8);
+
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_surface_layout = State.onLayout;
+    core.cb.on_external_window = State.onOpen;
+
+    try core.grid.resizeGrid(2, 3, 0);
+    try std.testing.expect(try core.grid.setWinExternalPos(2, 42));
+
+    notifyExternalWindowChanges(&core);
+    notifySurfaceLayouts(&core);
+    try std.testing.expectEqual(@as(u32, 0), state.opens);
+    try std.testing.expect(!state.saw_layout_for_2);
+}
+
+test "an open external grid at a zero-cell shape gets no on_vertices_row" {
+    // zonvie_core.h on_vertices_row: only grid 1 receives the zero-cell
+    // transition; a sub-grid at a zero-cell shape gets no callback at all.
+    const State = struct {
+        grid2_calls: u32 = 0,
+        fn onRow(ctx: ?*anyopaque, grid_id: i64, row_start: u32, row_count: u32, verts: ?[*]const c_api.Vertex, vert_count: usize, flags: u32, total_rows: u32, total_cols: u32) callconv(.c) void {
+            _ = row_start;
+            _ = row_count;
+            _ = verts;
+            _ = vert_count;
+            _ = flags;
+            _ = total_rows;
+            _ = total_cols;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (grid_id == 2) self.grid2_calls += 1;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 2, 1);
+    try core.grid.resizeGrid(2, 2, 1);
+    try std.testing.expect(try core.grid.setWinExternalPos(2, 42));
+    try core.known_external_grids.put(core.alloc, 2, .{ .win = 42, .start_row = 0, .start_col = 0, .rows = 2, .cols = 1 });
+    core.grid.cursor_visible = false;
+    core.drawable_w_px = 1;
+    core.drawable_h_px = 2;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+
+    try core.grid.resizeGrid(2, 2, 0);
+    // Every grid re-decides its cursor layer, which sends a clear to any
+    // grid that is emitted.
+    core.cursor_owner.force_recheck = true;
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(2, 1);
+    try std.testing.expectEqual(@as(u32, 0), state.grid2_calls);
 }
 
 test "hiding an external grid drops its initial-size gate entry" {
@@ -16087,6 +16218,7 @@ test "an external surface publishes its root and anchored float layers" {
     try core.grid.resizeGrid(3, 2, 4);
     try core.grid.setWinFloatPos(3, 43, 2, 3, 50, 0, 2, true);
 
+    notifyExternalWindowChanges(&core);
     notifySurfaceLayouts(&core);
     try std.testing.expect(state.seen_ext);
     try std.testing.expectEqual(@as(usize, 2), state.count);
@@ -16146,6 +16278,7 @@ test "surface migration resends unchanged nested grids but same-surface movement
     try core.grid.resizeGrid(4, 4, 8);
     try core.grid.setWinFloatPos(3, 30, 1, 1, 50, 0, 1, true);
     try core.grid.setWinFloatPos(4, 40, 2, 2, 60, 0, 3, true);
+    notifyExternalWindowChanges(&core);
     notifySurfaceLayouts(&core);
     core.grid.sub_grids.getPtr(3).?.clearDirty();
     core.grid.sub_grids.getPtr(4).?.clearDirty();
@@ -19037,4 +19170,171 @@ fn runFlushModel(seed: u64, cursor_visible: bool) !void {
     try std.testing.expect(ext_steps != 0);
     try std.testing.expect(split3_moved_steps != 0);
     try std.testing.expect(split3_promoted_steps != 0);
+}
+
+/// A shaper that breaks one rule of zonvie_shape_text_run_fn (zonvie_core.h).
+const BadShaper = struct {
+    const Mode = enum { over_cap_on_retry, bad_clusters };
+    mode: Mode,
+    error_codes: [8]u32 = undefined,
+    error_count: usize = 0,
+    by_id_calls: u32 = 0,
+    scalar_rasters: [8]u32 = undefined,
+    scalar_raster_count: usize = 0,
+
+    fn shape(ctx: ?*anyopaque, _: [*]const u32, scalar_count: usize, _: u32, out_glyph_ids: [*]u32, out_clusters: [*]u32, out_x_advance: [*]i32, out_x_offset: [*]i32, out_y_offset: [*]i32, out_cap: usize) callconv(.c) usize {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        // Fill only what out_cap allows; the count returned is what breaks the rule.
+        const n = @min(scalar_count, out_cap);
+        for (0..n) |i| {
+            out_glyph_ids[i] = 999;
+            // bad_clusters: clusters[0] != 0.
+            out_clusters[i] = if (self.mode == .bad_clusters) @intCast(@min(i + 1, scalar_count - 1)) else @intCast(i);
+            out_x_advance[i] = 64;
+            out_x_offset[i] = 0;
+            out_y_offset[i] = 0;
+        }
+        return switch (self.mode) {
+            // Ask for more than out_cap, then exceed the capacity granted.
+            .over_cap_on_retry => out_cap + 1,
+            .bad_clusters => n,
+        };
+    }
+
+    fn rasterById(ctx: ?*anyopaque, _: u32, _: u32, out: *c_api.GlyphBitmap) callconv(.c) c_int {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.by_id_calls += 1;
+        out.* = .{ .pixels = null, .width = 1, .height = 1, .pitch = 1, .bearing_x = 0, .bearing_y = 1, .advance_26_6 = 64, .ascent_px = 1, .descent_px = 0, .bytes_per_pixel = 1 };
+        return 1;
+    }
+
+    fn rasterScalar(ctx: ?*anyopaque, scalar: u32, _: u32, out: *c_api.GlyphBitmap) callconv(.c) c_int {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        if (self.scalar_raster_count < self.scalar_rasters.len) {
+            self.scalar_rasters[self.scalar_raster_count] = scalar;
+            self.scalar_raster_count += 1;
+        }
+        out.* = .{ .pixels = null, .width = 1, .height = 1, .pitch = 1, .bearing_x = 0, .bearing_y = 1, .advance_26_6 = 64, .ascent_px = 1, .descent_px = 0, .bytes_per_pixel = 1 };
+        return 1;
+    }
+
+    fn callbackError(ctx: ?*anyopaque, code: u32, _: [*]const u8, _: usize) callconv(.c) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        if (self.error_count < self.error_codes.len) {
+            self.error_codes[self.error_count] = code;
+            self.error_count += 1;
+        }
+    }
+
+    fn upload(_: ?*anyopaque, _: u32, _: u32, _: u32, _: u32, _: *const c_api.GlyphBitmap) callconv(.c) void {}
+    fn create(_: ?*anyopaque, _: u32, _: u32) callconv(.c) void {}
+    fn onRow(_: ?*anyopaque, _: i64, _: u32, _: u32, _: ?[*]const c_api.Vertex, _: usize, _: u32, _: u32, _: u32) callconv(.c) void {}
+
+    /// Grid 1 of one row holding two non-ASCII scalars, so the run is shaped.
+    fn run(self: *@This(), core: *Core) !void {
+        core.cell_w_px = 8;
+        core.cell_h_px = 16;
+        core.drawable_w_px = 32;
+        core.drawable_h_px = 16;
+        try core.grid.resizeGrid(1, 1, 4);
+        core.grid.putCell(0, 0, 0xE9, 0);
+        core.grid.putCell(0, 1, 0xEA, 0);
+        core.ctx = self;
+        core.cb.on_vertices_row = onRow;
+        core.cb.on_shape_text_run = shape;
+        core.cb.on_rasterize_glyph_by_id = rasterById;
+        core.cb.on_rasterize_glyph = rasterScalar;
+        core.cb.on_atlas_upload = upload;
+        core.cb.on_atlas_create = create;
+        core.cb.on_callback_error = callbackError;
+        try core.initGlyphCache();
+        var flush_ctx = FlushCtx{ .core = core };
+        try flush_ctx.onFlush(1, 4);
+    }
+
+    /// ZONVIE_CALLBACK_ERROR_SHAPE_FAILED in zonvie_core.h.
+    const SHAPE_FAILED: u32 = 4;
+
+    fn reportedShapeFailed(self: *const @This()) bool {
+        return std.mem.indexOfScalar(u32, self.error_codes[0..self.error_count], SHAPE_FAILED) != null;
+    }
+};
+
+test "a shaper exceeding the retry capacity ends the session and reports SHAPE_FAILED" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var state = BadShaper{ .mode = .over_cap_on_retry };
+    state.run(&core) catch {};
+    try std.testing.expect(state.reportedShapeFailed());
+    // Header: a larger count on the retry ends the session.
+    try std.testing.expect(core.redraw_recovery_failed.load(.seq_cst));
+    try std.testing.expect(!core.flush_retryable);
+}
+
+test "a shaper with invalid clusters is drawn one glyph per scalar and reports SHAPE_FAILED" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var state = BadShaper{ .mode = .bad_clusters };
+    try state.run(&core);
+    try std.testing.expect(state.reportedShapeFailed());
+    try std.testing.expect(!core.redraw_recovery_failed.load(.seq_cst));
+    // Drawn as for 0: each scalar resolved on its own, no shaped glyph id used.
+    try std.testing.expectEqual(@as(u32, 0), state.by_id_calls);
+    const rastered = state.scalar_rasters[0..state.scalar_raster_count];
+    try std.testing.expect(std.mem.indexOfScalar(u32, rastered, 0xE9) != null);
+    try std.testing.expect(std.mem.indexOfScalar(u32, rastered, 0xEA) != null);
+}
+
+test "planFlushFinish: only an unaborted, intact flush commits; a begin rejection unwinds nothing" {
+    const ok = planFlushFinish(.{ .aborted = false, .atlas_corrupted = false, .retryable = true, .aborted_at_begin = false });
+    try std.testing.expect(ok.commit and !ok.rollback_sent and !ok.keep_mirror_stale);
+    try std.testing.expectEqual(FlushCommitMode.success, ok.mode);
+
+    // on_flush_begin refused: nothing was sent, so nothing is owed back.
+    const begin = planFlushFinish(.{ .aborted = true, .atlas_corrupted = false, .retryable = true, .aborted_at_begin = true });
+    try std.testing.expect(!begin.commit and !begin.rollback_sent and begin.keep_mirror_stale);
+
+    // A later refusal owes back everything it sent.
+    const late = planFlushFinish(.{ .aborted = true, .atlas_corrupted = false, .retryable = true, .aborted_at_begin = false });
+    try std.testing.expect(!late.commit and late.rollback_sent and !late.keep_mirror_stale);
+    try std.testing.expectEqual(FlushCommitMode.refusal_atlas_valid, late.mode);
+
+    // Atlas corruption never commits, even without an abort.
+    const corrupt = planFlushFinish(.{ .aborted = false, .atlas_corrupted = true, .retryable = true, .aborted_at_begin = false });
+    try std.testing.expect(!corrupt.commit and corrupt.rollback_sent);
+    try std.testing.expectEqual(FlushCommitMode.abort_full, corrupt.mode);
+}
+
+test "planAbortRetime moves elapsed deadlines only, and the throttle only once its retry is due" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    const now: i128 = 1_000_000_000;
+
+    try std.testing.expect(!planAbortRetime(&core, now).any());
+
+    core.msg_show_auto_hide_at = now;
+    core.msg_history_auto_hide_at = now + 1;
+    core.atlas_negative_retry_at = now - 1;
+    core.transient_glyph_retry_at = now + 1;
+    core.msg_history_retry_at = now;
+    core.msg_show_pending_since = now - core.msg_show_throttle_ns;
+    core.msg_show_retry_at = now + 1;
+    var plan = planAbortRetime(&core, now);
+    try std.testing.expect(plan.show_hide and plan.atlas_retry and plan.history_retry);
+    try std.testing.expect(!plan.history_hide and !plan.transient_retry and !plan.throttle);
+
+    core.msg_show_retry_at = null;
+    plan = planAbortRetime(&core, now);
+    try std.testing.expect(plan.throttle);
+    core.msg_show_pending_since = now - core.msg_show_throttle_ns + 1;
+    plan = planAbortRetime(&core, now);
+    try std.testing.expect(!plan.throttle);
+
+    // Applying moves exactly the due deadlines onto one later deadline.
+    const before_hist_hide = core.msg_history_auto_hide_at;
+    applyAbortRetime(&core, plan, now);
+    try std.testing.expect(core.msg_show_auto_hide_at.? > now);
+    try std.testing.expectEqual(core.msg_show_auto_hide_at, core.atlas_negative_retry_at);
+    try std.testing.expectEqual(core.msg_show_auto_hide_at, core.msg_history_retry_at);
+    try std.testing.expectEqual(before_hist_hide, core.msg_history_auto_hide_at);
 }

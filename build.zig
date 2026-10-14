@@ -283,6 +283,8 @@ pub fn build(b: *std.Build) !void {
             exe_name: []const u8,
             sources: []const []const u8,
             tsan: bool = false,
+            /// C header imported into the module, for sources that call the core.
+            objc_header: ?[]const u8 = null,
         };
         const swift_tests = [_]SwiftTest{
             // External-grid font reset intersection test. It uses barriers to
@@ -376,6 +378,34 @@ pub fn build(b: *std.Build) !void {
                     "macos/Tests/RowScrollBlitPlanTests.swift",
                 },
             },
+            // The Swift sides of shared rules: SurfaceFrameDecision's bridge
+            // to the core's terms and decision, layer-placement damage, and
+            // the row-capacity ledger's merge. The core calls are stubbed in
+            // the test, so this checks the bridge, not the core's answer.
+            .{
+                .exe_name = "surface-frame-pure-tests",
+                .sources = &.{
+                    "macos/Sources/Rendering/MetalTypes.swift",
+                    "macos/Sources/Rendering/SurfaceDrawGate.swift",
+                    "macos/Sources/Rendering/SurfaceFrameDecision.swift",
+                    "macos/Sources/Rendering/SurfaceDamageBands.swift",
+                    "macos/Sources/Rendering/SurfaceRowCapacityRequire.swift",
+                    "macos/Tests/SurfaceFramePureTests.swift",
+                },
+                .objc_header = "include/zonvie_frontend.h",
+            },
+            // Which passes a surface frame encodes: render pass, load action,
+            // root rows, hosted layers, and a main-surface layer's redraw-all.
+            .{
+                .exe_name = "surface-frame-plan-tests",
+                .sources = &.{
+                    "macos/Sources/Rendering/SurfaceDrawGate.swift",
+                    "macos/Sources/Rendering/SurfaceFrameDecision.swift",
+                    "macos/Sources/Rendering/SurfaceFramePlan.swift",
+                    "macos/Tests/SurfaceFramePlanTests.swift",
+                },
+                .objc_header = "include/zonvie_frontend.h",
+            },
         };
         for (swift_tests) |t| {
             const compile = b.addSystemCommand(&.{ "xcrun", "swiftc" });
@@ -384,6 +414,10 @@ pub fn build(b: *std.Build) !void {
                 "-module-cache-path",
                 "/tmp/zonvie-swift-module-cache",
             });
+            if (t.objc_header) |h| {
+                compile.addArg("-import-objc-header");
+                compile.addFileArg(b.path(h));
+            }
             for (t.sources) |src| compile.addFileArg(b.path(src));
             compile.addArg("-o");
             const exe = compile.addOutputFileArg(t.exe_name);

@@ -77,9 +77,9 @@ test "externalizing selects the tab by its 1-based number" {
 // on_vertices_row
 
 /// Which layer one on_vertices_row callback updates (zonvie_core.h): MAIN
-/// replaces the row, CURSOR without MAIN is cursor-only and leaves the row,
-/// neither leaves both layers as they were. Both set never occurs; the core
-/// sets the flags from an enum, and a consumer that sees it keeps MAIN.
+/// replaces the row, CURSOR without MAIN is cursor-only and leaves the row.
+/// The core sets exactly one, from an enum; `none` (neither set) and MAIN for
+/// both set are only the decode of a word the core never sends.
 pub const RowUpdate = enum(u8) { none = 0, main = 1, cursor_only = 2 };
 
 /// The on_vertices_row flag bits (ZONVIE_VERT_UPDATE_*); c_api re-exports them.

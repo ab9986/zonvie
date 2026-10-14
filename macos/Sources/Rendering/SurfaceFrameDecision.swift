@@ -44,7 +44,7 @@ struct SurfaceFrameTerms {
     /// The committed rows were generated with the font metrics in force now.
     var fontIsCurrent = true
 
-    /// The layout moved under this surface. External only.
+    /// The layout moved under this surface, or its background colour changed.
     var hasLayoutDamage = false
 
     /// A damaged pixel rectangle no row expresses. Main only.
@@ -131,7 +131,11 @@ struct SurfaceFrameDecision {
         case UInt32(ZONVIE_ROW_PASS_DIRTY_ROWS_ONLY): plan = .dirtyRowsOnly
         case UInt32(ZONVIE_ROW_PASS_DIRTY_ROWS_AFTER_SCROLL_BLIT): plan = .dirtyRowsAfterScrollBlit
         case UInt32(ZONVIE_ROW_PASS_ALL_ROWS_WITH_RETAINED): plan = .allRowsWithRetained
-        default: plan = .allRows
+        case UInt32(ZONVIE_ROW_PASS_ALL_ROWS): plan = .allRows
+        default:
+            // ABI drift. Redrawing every row is correct for any frame.
+            assertionFailure("unknown row_pass_plan \(d.row_pass_plan)")
+            plan = .allRows
         }
         return SurfaceFrameDecision(
             reusesRootContents: d.reuses_root_contents,

@@ -1091,9 +1091,7 @@ pub const PaintPolicyInputs = struct {
     cursor_grid_changed: bool,
     glow_enabled: bool,
     opacity: f32,
-    /// Whether `back_tex` still holds a usable previous frame. The main driver
-    /// tracks this per app; an external window has no equivalent yet and
-    /// passes true, which is what its previous `!force_full_rows` meant.
+    /// Whether `back_tex` still holds a usable previous frame.
     back_tex_valid: bool,
 };
 
@@ -1103,9 +1101,8 @@ pub const PaintPolicy = struct {
 };
 
 /// The cursor vertices a frame draws: all of them while the blink phase shows
-/// the cursor, none while it hides it. The main driver's flat path answered
-/// this inline and the decorated external path did not ask, so an ext-cmdline
-/// cursor never blinked.
+/// the cursor, none while it hides it. The one blink rule: the cursor overlay
+/// and the decorated external path both ask it.
 pub fn cursorVertsForFrame(comptime V: type, cursor: []const V, blink_visible: bool) []const V {
     return if (blink_visible) cursor else &.{};
 }
@@ -1151,10 +1148,11 @@ pub const SeedPresentFacts = struct {
 };
 
 pub const PresentGateInputs = struct {
-    /// The row layout this paint snapshotted is still current.
-    layout_ok: bool = true,
+    /// The row layout this paint snapshotted is still current. No default:
+    /// every driver must answer it.
+    layout_ok: bool,
     /// The committed set's metrics generation is still current.
-    metrics_ok: bool = true,
+    metrics_ok: bool,
     /// Rows, layers or the cursor overlay never reached back_tex.
     frame_incomplete: bool = false,
     force_full_rows: bool,
@@ -1211,6 +1209,70 @@ pub fn presentGate(in: PresentGateInputs) PresentGate {
     else
         .present;
     return .{ .verdict = verdict, .full = full, .back_tex_valid = back_tex_valid };
+}
+
+/// The external row driver's gate inputs: no seed, and an incomplete draw
+/// already refused by the draw's error. A partial frame over a back_tex that
+/// holds no valid previous frame is incomplete too.
+pub fn externalPresentGateInputs(
+    layout_ok: bool,
+    metrics_ok: bool,
+    back_tex_valid: bool,
+    force_full_rows: bool,
+    present_rects_overflowed: bool,
+    custom_shader: bool,
+    present_rects: usize,
+) PresentGateInputs {
+    return .{
+        .layout_ok = layout_ok,
+        .metrics_ok = metrics_ok,
+        .frame_incomplete = !back_tex_valid and !force_full_rows,
+        .force_full_rows = force_full_rows,
+        .present_rects_overflowed = present_rects_overflowed,
+        .custom_shader = custom_shader,
+        .preserve_back = true,
+        .rows = 0,
+        .rows_to_draw = 0,
+        .skipped_empty = 0,
+        .present_rects = present_rects,
+    };
+}
+
+/// The main row driver's facts. Every field is required: main always has a
+/// seed and always answers whether the frame reached back_tex.
+pub const MainPresentFacts = struct {
+    layout_ok: bool,
+    metrics_ok: bool,
+    frame_incomplete: bool,
+    force_full_rows: bool,
+    preserve_back: bool,
+    rows: usize,
+    rows_to_draw: usize,
+    skipped_empty: u32,
+    custom_shader: bool,
+    present_rects: usize,
+    present_rects_overflowed: bool,
+    seed: SeedPresentFacts,
+};
+
+/// The main row driver's gate inputs: its seed, and chrome whose hover
+/// damage yields no rect, so an empty list presents the whole surface.
+pub fn mainPresentGateInputs(f: MainPresentFacts) PresentGateInputs {
+    return .{
+        .layout_ok = f.layout_ok,
+        .metrics_ok = f.metrics_ok,
+        .frame_incomplete = f.frame_incomplete,
+        .force_full_rows = f.force_full_rows,
+        .preserve_back = f.preserve_back,
+        .rows = f.rows,
+        .rows_to_draw = f.rows_to_draw,
+        .skipped_empty = f.skipped_empty,
+        .custom_shader = f.custom_shader,
+        .present_rects = f.present_rects,
+        .present_rects_overflowed = f.present_rects_overflowed,
+        .seed = f.seed,
+        .empty_damage_presents_all = true,
+    };
 }
 
 fn seedAllowsPresent(in: PresentGateInputs, s: SeedPresentFacts) bool {
@@ -1337,6 +1399,44 @@ pub fn cursorRowScissor(
         .right = @min(content_right, x_offset + layer_x_px + w),
         .bottom = top + row_h_px,
     };
+}
+
+/// The cursor overlay's present damage, for both drivers: for each of `rows`
+/// (the previously painted cursor row and the current one, grid-local to the
+/// cursor's layer) the full-height band its scissor can clear, and the current
+/// cursor's pixel box, which may overhang its row. Bands span the content
+/// width, a superset of cursorRowScissor's layer-bounded scissor. Clipped to
+/// `clip_w` x `clip_h`; an empty rect is null, never handed on.
+pub fn cursorDamageRects(
+    comptime Rect: type,
+    rows: [2]?u32,
+    bounds: ?core.cursor_rect.Rect,
+    x_offset: i32,
+    y_offset: i32,
+    content_right: i32,
+    layer_y_px: i32,
+    row_h_px: i32,
+    clip_w: i32,
+    clip_h: i32,
+) [3]?Rect {
+    var out: [3]?Rect = .{ null, null, null };
+    for (rows, 0..) |row_opt, i| {
+        const row = row_opt orelse continue;
+        const sc = cursorRowScissor(Rect, x_offset, y_offset, content_right, 0, layer_y_px, null, row, row_h_px);
+        const rc: Rect = .{
+            .left = @max(0, sc.left),
+            .top = @max(0, sc.top),
+            .right = @min(clip_w, sc.right),
+            .bottom = @min(clip_h, sc.bottom),
+        };
+        if (rc.right > rc.left and rc.bottom > rc.top) out[i] = rc;
+    }
+    if (bounds) |b| {
+        if (core.cursor_rect.inflateClip(b, clip_w, clip_h)) |ir| {
+            out[2] =.{ .left = ir.left, .top = ir.top, .right = ir.right, .bottom = ir.bottom };
+        }
+    }
+    return out;
 }
 
 /// The grid whose Neovim window a move INTO the main window lands on: the

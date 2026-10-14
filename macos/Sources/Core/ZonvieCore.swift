@@ -1530,6 +1530,7 @@ final class ZonvieCore {
                 case .externalLayer(let host):
                     guard core.beginExternalFlushIfNeeded(host) else { return }
                     host.applyLayerRowScroll(gridId: gid, rowStart: Int(rowStart), rowEnd: Int(rowEnd),
+                        colStart: Int(colStart), colEnd: Int(colEnd),
                         rowsDelta: Int(rowsDelta), totalRows: Int(totalRows), totalCols: Int(totalCols))
 
                 case .externalRoot(let view):

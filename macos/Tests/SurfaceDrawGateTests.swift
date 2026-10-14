@@ -15,21 +15,15 @@ private enum SurfaceDrawGateTests {
     private static var failures = 0
     private static var skipSeen = 0
     private static var drawSeen = 0
-    private static var forceSeen = 0
-    private static var noForceSeen = 0
 
-    private static func check(_ actual: Bool, _ expected: Bool, _ what: @autoclosure () -> String) {
+    /// A skip/draw decision of the idle gate. Only these feed the vacuity
+    /// guard in main(): other checks' true/false says nothing about the gate.
+    private static func checkGate(_ actual: Bool, _ expected: Bool, _ what: @autoclosure () -> String) {
         if actual { skipSeen += 1 } else { drawSeen += 1 }
-        if actual != expected {
-            failures += 1
-            if failures <= 10 {
-                print("FAIL \(what()): shared=\(actual) original=\(expected)")
-            }
-        }
+        check(actual, expected, what())
     }
 
-    private static func checkForce(_ actual: Bool, _ expected: Bool, _ what: @autoclosure () -> String) {
-        if actual { forceSeen += 1 } else { noForceSeen += 1 }
+    private static func check(_ actual: Bool, _ expected: Bool, _ what: @autoclosure () -> String) {
         if actual != expected {
             failures += 1
             if failures <= 10 {
@@ -76,7 +70,7 @@ private enum SurfaceDrawGateTests {
                 shaderAnimates: anim
             ).skipsFrame
 
-            check(shared, original, "main mask=\(mask)")
+            checkGate(shared, original, "main mask=\(mask)")
         }
     }
 
@@ -114,7 +108,7 @@ private enum SurfaceDrawGateTests {
                 drawableSizeChanged: sizeChg
             ).skipsFrame
 
-            check(shared, original, "external mask=\(mask)")
+            checkGate(shared, original, "external mask=\(mask)")
         }
     }
 
@@ -165,9 +159,9 @@ private enum SurfaceDrawGateTests {
                 shaderAnimates: anim,
                 shaderCursorMoved: shaderCur
             ).skipsBlinkWithNoCursor(cursorVertexCount: noCursor ? 0 : 1)
-            check(mainShared, mainOriginal && !shaderCur, "main blink mask=\(mask)")
+            checkGate(mainShared, mainOriginal && !shaderCur, "main blink mask=\(mask)")
         }
-        for mask in 0..<(1 << 11) {
+        for mask in 0..<(1 << 12) {
             let rowMode = bit(mask, 0)
             let presented = bit(mask, 1)
             let blink = bit(mask, 2)
@@ -179,9 +173,11 @@ private enum SurfaceDrawGateTests {
             let smooth = bit(mask, 8)
             let rect = bit(mask, 9)
             let noCursor = bit(mask, 10)
+            let anim = bit(mask, 11)
             let externalOriginal = blink && !rect && !dirty && !pendingScroll
                 && !sizeChg && !scrollOff && !smooth && presented
                 && !newCommit && noCursor
+                && !anim
             let externalShared = SurfaceIdleTerms(
                 hasPresentedOnce: presented,
                 rowModeSatisfied: rowMode,
@@ -192,115 +188,10 @@ private enum SurfaceDrawGateTests {
                 scrollOffsetChanged: scrollOff,
                 isSmoothScrolling: smooth,
                 blinkStateChanged: blink,
-                drawableSizeChanged: sizeChg
+                drawableSizeChanged: sizeChg,
+                shaderAnimates: anim
             ).skipsBlinkWithNoCursor(cursorVertexCount: noCursor ? 0 : 1)
-            check(externalShared, externalOriginal && rowMode, "external blink mask=\(mask)")
-        }
-    }
-
-    /// GridSurfaceRenderer.draw:
-    ///
-    ///     let shouldReusePreviousContents = !glowEnabled
-    ///         && (useGpuScrollCopy || canDirtyOnlyWithBlur
-    ///             || (!smoothScrolling && (dirtyRectPxOpt != nil || hasAnyDirtyInRowMode)))
-    ///     forceReusePreviousContents: !glowEnabled
-    ///         && (useGpuScrollCopy || canDirtyOnlyWithBlur)
-    private static func verifyMainLoadAction() {
-        for mask in 0..<(1 << 6) {
-            let glow = bit(mask, 0)
-            let gpuScroll = bit(mask, 1)
-            let dirtyBlur = bit(mask, 2)
-            let smooth = bit(mask, 3)
-            let rect = bit(mask, 4)
-            let rowDirty = bit(mask, 5)
-
-            let originalReuse = !glow
-                && (gpuScroll || dirtyBlur
-                    || (!smooth && (rect || rowDirty)))
-            let originalForce = !glow && (gpuScroll || dirtyBlur)
-
-            let terms = SurfaceLoadActionTerms(
-                glowEnabled: glow,
-                useGpuScrollCopy: gpuScroll,
-                canDirtyOnlyWithBlur: dirtyBlur,
-                hasDirtyRect: rect,
-                hasDirtyRowsInRowMode: rowDirty,
-                isSmoothScrolling: smooth
-            )
-
-            check(terms.reusesPreviousContents, originalReuse, "main load mask=\(mask)")
-            checkForce(terms.forcesReusePreviousContents, originalForce, "main force mask=\(mask)")
-        }
-    }
-
-    /// ExternalGridView.draw:
-    ///
-    ///     let shouldReusePreviousContents = committedFontIsCurrent
-    ///         && !layoutDamageSnapshot
-    ///         && (layerDrawSnapshot.isEmpty || reuseHostedContents || partialHostedContents)
-    ///         && !isDecoratedSurface
-    ///         && !glowEnabled
-    ///         && (partialHostedContents || reuseHostedContents || reuseRootContents
-    ///             || useGpuScrollCopy || cursorOnlyFrame
-    ///             || canDirtyOnlyWithBlur || (!smoothScrolling && hasAnyDirtyInRowMode))
-    ///     forceReusePreviousContents: committedFontIsCurrent && !layoutDamageSnapshot
-    ///         && !isDecoratedSurface && !glowEnabled
-    ///         && (reuseHostedContents || reuseRootContents
-    ///             || useGpuScrollCopy || canDirtyOnlyWithBlur)
-    ///
-    /// `layerDrawSnapshot.isEmpty` is enumerated as `layersOutsideDirtySet`,
-    /// the role that guard plays: hosted content this surface's dirty rows do
-    /// not describe. It is NOT "hosts layers" — the main surface hosts them and
-    /// passes false, because its layer work is inside its dirty-row term.
-    private static func verifyExternalLoadAction() {
-        for mask in 0..<(1 << 13) {
-            let glow = bit(mask, 0)
-            let fontCurrent = bit(mask, 1)
-            let layoutDamage = bit(mask, 2)
-            let decorated = bit(mask, 3)
-            let hasLayers = bit(mask, 4)
-            let gpuScroll = bit(mask, 5)
-            let dirtyBlur = bit(mask, 6)
-            let cursorOnly = bit(mask, 7)
-            let reuseHosted = bit(mask, 8)
-            let reuseRoot = bit(mask, 9)
-            let partialHosted = bit(mask, 10)
-            let smooth = bit(mask, 11)
-            let rowDirty = bit(mask, 12)
-
-            // No cursor-only arm: a cursor-only frame is reuseRoot or
-            // reuseHosted now, and the arm that stood alone granted reuse
-            // during a smooth scroll, which the main surface never does.
-            let originalReuse = fontCurrent
-                && !layoutDamage
-                && (!hasLayers || reuseHosted || partialHosted)
-                && !decorated
-                && !glow
-                && (partialHosted || reuseHosted || reuseRoot
-                    || gpuScroll
-                    || dirtyBlur || (!smooth && rowDirty))
-            _ = cursorOnly
-            let originalForce = fontCurrent && !layoutDamage
-                && !decorated && !glow
-                && (reuseHosted || reuseRoot || gpuScroll || dirtyBlur)
-
-            let terms = SurfaceLoadActionTerms(
-                glowEnabled: glow,
-                fontIsCurrent: fontCurrent,
-                hasLayoutDamage: layoutDamage,
-                isDecoratedSurface: decorated,
-                layersOutsideDirtySet: hasLayers,
-                useGpuScrollCopy: gpuScroll,
-                canDirtyOnlyWithBlur: dirtyBlur,
-                reuseHostedContents: reuseHosted,
-                reuseRootContents: reuseRoot,
-                partialHostedContents: partialHosted,
-                hasDirtyRowsInRowMode: rowDirty,
-                isSmoothScrolling: smooth
-            )
-
-            check(terms.reusesPreviousContents, originalReuse, "external load mask=\(mask)")
-            checkForce(terms.forcesReusePreviousContents, originalForce, "external force mask=\(mask)")
+            checkGate(externalShared, externalOriginal && rowMode, "external blink mask=\(mask)")
         }
     }
 
@@ -360,140 +251,6 @@ private enum SurfaceDrawGateTests {
         if a.idleFrames != 0 {
             failures += 1
             print("FAIL: a rendered frame left the run at \(a.idleFrames)")
-        }
-    }
-
-    private static var planSeen: Set<String> = []
-    private static var planChecks = 0
-
-    private static func checkPlan(
-        _ actual: SurfaceRowPassPlan,
-        _ expected: SurfaceRowPassPlan,
-        _ what: @autoclosure () -> String
-    ) {
-        planSeen.insert("\(actual)")
-        planChecks += 1
-        if actual != expected {
-            failures += 1
-            if failures <= 10 {
-                print("FAIL \(what()): shared=\(actual) original=\(expected)")
-            }
-        }
-    }
-
-    /// GridSurfaceRenderer.draw's row ladder:
-    ///
-    ///     if use2Pass {
-    ///         if canDirtyOnlyWithBlur        -> dirty rows, banded, 2-pass
-    ///         else                           -> smoothRowRange, 2-pass
-    ///     } else if smoothScrolling          -> smoothRowRange, 1-pass
-    ///     else if !glowEnabled && (!dirtyRows.isEmpty || anyLayerWork)
-    ///             && !drawableSizeChanged && loadAction == .load
-    ///                                        -> dirty rows, scissored
-    ///     else                               -> 0..<safeRowCount
-    ///
-    /// The main surface has no root scroll blit — grid 1 is the ext_multigrid
-    /// container — so that term is false throughout.
-    private static func verifyMainRowPass() {
-        for mask in 0..<(1 << 7) {
-            let use2Pass = bit(mask, 0)
-            let dirtyBlur = bit(mask, 1)
-            let smooth = bit(mask, 2)
-            let glow = bit(mask, 3)
-            let rowDirty = bit(mask, 4)
-            let sizeChg = bit(mask, 5)
-            let loaded = bit(mask, 6)
-
-            let original: SurfaceRowPassPlan
-            if use2Pass {
-                if dirtyBlur && loaded {
-                    // On this surface canDirtyOnlyWithBlur implies .load; the
-                    // conjunct is stated so the two ladders read alike.
-                    original = .dirtyRowsOnly
-                } else {
-                    original = .allRowsWithRetained
-                }
-            } else if smooth {
-                original = .allRowsWithRetained
-            } else if !glow && rowDirty && !sizeChg && loaded {
-                original = .dirtyRowsOnly
-            } else {
-                original = .allRows
-            }
-
-            let shared = SurfaceRowPassTerms(
-                useTwoPass: use2Pass,
-                isSmoothScrolling: smooth,
-                canDirtyOnlyWithBlur: dirtyBlur,
-                loadedPreviousContents: loaded,
-                hasDirtyRows: rowDirty,
-                glowEnabled: glow,
-                drawableSizeChanged: sizeChg
-            ).plan
-
-            checkPlan(shared, original, "main row pass mask=\(mask)")
-        }
-    }
-
-    /// ExternalGridView.draw's row ladder:
-    ///
-    ///     if use2Pass {
-    ///         if useGpuScrollCopy                          -> vacated band + dirty
-    ///         else if canDirtyOnlyWithBlur && load == .load -> dirty rows
-    ///         else                                         -> smoothRowRange
-    ///     } else if smoothScrolling                        -> smoothRowRange
-    ///     else if useGpuScrollCopy                         -> vacated band + dirty
-    ///     else if !isDecoratedSurface && !glowEnabled && !dirtyRows.isEmpty
-    ///             && !drawableSizeChanged && load == .load -> dirty rows
-    ///     else                                             -> 0..<safeRowCount
-    private static func verifyExternalRowPass() {
-        for mask in 0..<(1 << 8) {
-            let use2Pass = bit(mask, 0)
-            let gpuScroll = bit(mask, 1)
-            let dirtyBlur = bit(mask, 2)
-            let smooth = bit(mask, 3)
-            let glow = bit(mask, 4)
-            let rowDirty = bit(mask, 5)
-            let sizeChg = bit(mask, 6)
-            let loaded = bit(mask, 7)
-            // Decorated surfaces always clear, so `loaded` is false for them;
-            // enumerating the pair independently would assert on states that
-            // cannot occur. Both are enumerated, tied the way the surface ties
-            // them.
-            let decorated = !loaded && bit(mask, 2)
-
-            let original: SurfaceRowPassPlan
-            if use2Pass {
-                if gpuScroll {
-                    original = .dirtyRowsAfterScrollBlit
-                } else if dirtyBlur && loaded {
-                    original = .dirtyRowsOnly
-                } else {
-                    original = .allRowsWithRetained
-                }
-            } else if smooth {
-                original = .allRowsWithRetained
-            } else if gpuScroll {
-                original = .dirtyRowsAfterScrollBlit
-            } else if !decorated && !glow && rowDirty && !sizeChg && loaded {
-                original = .dirtyRowsOnly
-            } else {
-                original = .allRows
-            }
-
-            let shared = SurfaceRowPassTerms(
-                useTwoPass: use2Pass,
-                rootScrollBlitVacatedBand: gpuScroll,
-                isSmoothScrolling: smooth,
-                canDirtyOnlyWithBlur: dirtyBlur,
-                loadedPreviousContents: loaded,
-                hasDirtyRows: rowDirty,
-                glowEnabled: glow,
-                isDecoratedSurface: decorated,
-                drawableSizeChanged: sizeChg
-            ).plan
-
-            checkPlan(shared, original, "external row pass mask=\(mask)")
         }
     }
 
@@ -803,6 +560,47 @@ private enum SurfaceDrawGateTests {
         }
     }
 
+    /// settleSurfaceAgainstOwnCommit's postcondition: it returns with the
+    /// lock held, and true only when no commit landed after the last service
+    /// (the frame's rows and scroll state come from one commit). A commit
+    /// storm that outlasts maxAttempts must answer false, not true.
+    private static func verifySettleAgainstOwnCommit() {
+        // `commitsDuringService[i]` commits land while service call i runs.
+        func run(_ commitsDuringService: [Int], maxAttempts: Int) -> (settled: Bool, services: Int, lockHeld: Bool) {
+            let lock = NSLock()
+            var revision: UInt64 = 0
+            var services = 0
+            let settled = settleSurfaceAgainstOwnCommit(
+                lock: lock,
+                commitRevision: { revision },
+                service: {
+                    if services < commitsDuringService.count {
+                        revision += UInt64(commitsDuringService[services])
+                    }
+                    services += 1
+                },
+                maxAttempts: maxAttempts
+            )
+            let lockHeld = !lock.try()
+            // Either the settle's hold or the try's; release it.
+            lock.unlock()
+            return (settled, services, lockHeld)
+        }
+        func expect(_ got: (settled: Bool, services: Int, lockHeld: Bool),
+                    settled: Bool, services: Int, _ what: String) {
+            if got.settled != settled || got.services != services || !got.lockHeld {
+                failures += 1
+                print("FAIL settle \(what): settled=\(got.settled) services=\(got.services)"
+                    + " lockHeld=\(got.lockHeld), expected settled=\(settled) services=\(services) lockHeld=true")
+            }
+        }
+        expect(run([], maxAttempts: 3), settled: true, services: 1, "quiet")
+        expect(run([1], maxAttempts: 3), settled: true, services: 2, "one commit, then quiet")
+        expect(run([1, 1], maxAttempts: 3), settled: true, services: 3, "settles on the last attempt")
+        expect(run([1, 1, 1], maxAttempts: 3), settled: false, services: 3, "storm outlasts the bound")
+        expect(run([1], maxAttempts: 1), settled: false, services: 1, "one attempt, raced")
+    }
+
     static func main() {
         verifyScrollBlitGate()
         verifyMainSurface()
@@ -811,12 +609,9 @@ private enum SurfaceDrawGateTests {
         verifyScrollOffsetLatch()
         verifyExternalSurface()
         verifyBlinkOnlySkip()
-        verifyMainLoadAction()
-        verifyExternalLoadAction()
         verifyIdleCounter()
-        verifyMainRowPass()
-        verifyExternalRowPass()
         verifyFastScrollThreshold()
+        verifySettleAgainstOwnCommit()
 
         // A term a surface does not have must never block its skip. The main
         // surface has no staged scroll, no scroll-offset latch and no cursor
@@ -829,24 +624,16 @@ private enum SurfaceDrawGateTests {
         }
 
         // Both outcomes must actually occur, or the loops assert nothing.
-        // Every plan the enum can name must actually be produced, or an arm
-        // above is unreachable and asserts nothing.
-        if planSeen.count != 4 {
+        if skipSeen == 0 || drawSeen == 0 {
             failures += 1
-            print("FAIL: only \(planSeen.count) of 4 row-pass plans occurred: \(planSeen.sorted())")
-        }
-        if skipSeen == 0 || drawSeen == 0 || forceSeen == 0 || noForceSeen == 0 {
-            failures += 1
-            print("FAIL: the enumeration produced skip=\(skipSeen) draw=\(drawSeen)"
-                + " force=\(forceSeen) noForce=\(noForceSeen)")
+            print("FAIL: the enumeration produced skip=\(skipSeen) draw=\(drawSeen)")
         }
 
         if failures != 0 {
             print("surface draw gate: \(failures) failure(s)")
             exit(1)
         }
-        print("surface draw gate: \(skipSeen + drawSeen) idle+reuse, \(forceSeen + noForceSeen)"
-            + " force and \(planChecks) row-pass assignments agree"
-            + " (all \(planSeen.count) plans produced)")
+        print("surface draw gate: \(skipSeen + drawSeen) idle assignments agree"
+            + " (skip=\(skipSeen) draw=\(drawSeen))")
     }
 }

@@ -2644,6 +2644,9 @@ pub const ExternalWindow = struct {
     paint_row_ranges: std.ArrayListUnmanaged(PaintRowRange) = .empty,
     // Whether the last paint drew any root row, for atlasUploadOwesFullPaint.
     paint_drew_root_rows: bool = false,
+    // back_tex holds the last row-mode frame. False until a full row frame
+    // presents; every failure path and every recreate clears it.
+    back_tex_valid: bool = false,
 
     pub fn deinit(
         self: *ExternalWindow,
@@ -4328,18 +4331,19 @@ pub fn drawCursorOverlay(g: *d3d11.Renderer, p: CursorOverlayParams) !void {
     // stale overlay is gone before this runs and the two branches left are the
     // whole policy: the row was already redrawn, or it was not and blink-off
     // has to redraw its content to erase the cursor.
+    const shown = render_pipeline_helpers.cursorVertsForFrame(Vertex, p.cursor_verts, p.blink_visible);
     if (p.row_already_redrawn) {
-        if (p.blink_visible) {
+        if (shown.len != 0) {
             if (log_enabled) applog.appLog("[cursor-overlay] row already redrawn, draw cursor row={d}\n", .{cursor_row});
             try g.setLayerTransform(cursor_ox, cursor_oy, layer_w, layer_h);
-            try g.drawVB(vb, p.cursor_verts.len);
+            try g.drawVB(vb, shown.len);
         } else if (log_enabled) {
             applog.appLog("[cursor-overlay] row already redrawn, blink off row={d}\n", .{cursor_row});
         }
-    } else if (p.blink_visible) {
-        if (log_enabled) applog.appLog("[cursor-overlay] draw cursor row={d} verts={d}\n", .{ cursor_row, p.cursor_verts.len });
+    } else if (shown.len != 0) {
+        if (log_enabled) applog.appLog("[cursor-overlay] draw cursor row={d} verts={d}\n", .{ cursor_row, shown.len });
         try g.setLayerTransform(cursor_ox, cursor_oy, layer_w, layer_h);
-        try g.drawVB(vb, p.cursor_verts.len);
+        try g.drawVB(vb, shown.len);
     } else {
         if (log_enabled) applog.appLog("[cursor-overlay] blink off, redraw row={d}\n", .{cursor_row});
         // The core represents a genuinely empty row with an empty vertex list.
@@ -4350,7 +4354,7 @@ pub fn drawCursorOverlay(g: *d3d11.Renderer, p: CursorOverlayParams) !void {
     }
 
     // 5. Update tracking for scroll ghost erasure.
-    if (p.blink_visible) {
+    if (shown.len != 0) {
         p.last_painted_cursor_row.* = cursor_row;
     } else {
         p.last_painted_cursor_row.* = null;

@@ -430,6 +430,9 @@ pub const Callbacks = struct {
     // ASCII fast path table callback
     on_get_ascii_table: ?c_api.GetAsciiTableFn = null,
 
+    // Informational; the core recovers on its own (zonvie_core.h).
+    on_callback_error: ?*const fn (ctx: ?*anyopaque, code: u32, component: [*]const u8, component_len: usize) callconv(.c) void = null,
+
     // Main row-buffer scroll fast path notification
 
     // External grid (sub-grid) row-buffer scroll fast path notification
@@ -1230,6 +1233,12 @@ pub const Core = struct {
             => true,
             else => false,
         };
+    }
+
+    /// Tell the frontend why a callback's work was replaced or dropped.
+    pub fn reportCallbackError(self: *Core, code: c_api.CallbackErrorCode, component: []const u8) void {
+        const f = self.cb.on_callback_error orelse return;
+        f(self.ctx, @intFromEnum(code), component.ptr, component.len);
     }
 
     /// Record a fixed rendering/resource violation from any flush driver.
@@ -2676,6 +2685,7 @@ pub const Core = struct {
         }
         self.atlas_reset_during_flush = true;
         self.perf_atlas_full_reset_count +%= 1;
+        self.reportCallbackError(.atlas_full, "atlas");
         self.resetCoreAtlas();
     }
 
@@ -3305,6 +3315,7 @@ pub const Core = struct {
         }
         if (self.flush_aborted) return null;
         if (ok == 0) {
+            self.reportCallbackError(.glyph_rasterize, "rasterize_glyph");
             if (arm_transient_retry) self.recordTransientGlyphNegative();
             return blankGlyphEntry(&bm);
         }
@@ -5997,6 +6008,16 @@ const AtlasFailureTestState = struct {
     abort_create: bool = false,
     abort_raster: bool = false,
     raster_miss: bool = false,
+    last_error_code: u32 = 0,
+    error_calls: u32 = 0,
+
+    fn callbackError(ctx: ?*anyopaque, code: u32, component: [*]const u8, component_len: usize) callconv(.c) void {
+        _ = component;
+        _ = component_len;
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.last_error_code = code;
+        self.error_calls += 1;
+    }
 
     fn rasterize(
         ctx: ?*anyopaque,
@@ -6280,6 +6301,25 @@ test "glyph cache slot keys separate every style of a code and never equal the e
             try std.testing.expect(a.key != glyphCacheSlotKey(code +% 1, @intCast(style_a)).key);
         }
     }
+}
+
+test "a rasterize miss and an atlas reset are reported through on_callback_error" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var state = AtlasFailureTestState{ .core = &core, .raster_miss = true };
+    core.ctx = &state;
+    core.cb.on_rasterize_glyph = AtlasFailureTestState.rasterize;
+    core.cb.on_atlas_upload = AtlasFailureTestState.upload;
+    core.cb.on_atlas_create = AtlasFailureTestState.create;
+    core.cb.on_callback_error = AtlasFailureTestState.callbackError;
+
+    _ = core.ensureGlyphPhase2('A', 0);
+    try std.testing.expectEqual(@as(u32, 1), state.error_calls);
+    try std.testing.expectEqual(@intFromEnum(c_api.CallbackErrorCode.glyph_rasterize), state.last_error_code);
+
+    core.replaceAtlas(false);
+    try std.testing.expectEqual(@as(u32, 2), state.error_calls);
+    try std.testing.expectEqual(@intFromEnum(c_api.CallbackErrorCode.atlas_full), state.last_error_code);
 }
 
 test "aborted atlas upload rolls back shelf allocation" {

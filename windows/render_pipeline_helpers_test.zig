@@ -700,6 +700,8 @@ test "a decorated surface's forced-full frame presents in full even with no dama
     // empty list as "nothing changed".
     for ([_]bool{ false, true }) |shader| {
         const gate = helpers.presentGate(.{
+            .layout_ok = true,
+            .metrics_ok = true,
             .force_full_rows = true,
             .preserve_back = false,
             .rows = 0,
@@ -889,145 +891,110 @@ test "paint policy forces a full redraw on each of its four terms" {
     }
 }
 
-/// The main driver's present decision as window.zig wrote it before
-/// `presentGate`, kept verbatim as the oracle.
-fn mainPresentOracle(in: helpers.PresentGateInputs) helpers.PresentGate {
-    const s = in.seed.?;
-    const effective_rows = in.rows;
-    const allow_present = blk: {
-        if (!in.layout_ok) break :blk false;
-        if (!in.metrics_ok) break :blk false;
-        if (in.frame_incomplete) break :blk false;
-        if (s.clear) break :blk true;
-        if (s.pending and !in.preserve_back) break :blk true;
-        if (effective_rows == 0) break :blk false;
-        if (s.pending) {
-            if (s.back_tex_valid) {
-                if (s.rows_mismatch) {
-                    if (in.rows_to_draw != 0 and in.skipped_empty == 0) break :blk true;
-                    break :blk false;
-                }
-                break :blk true;
-            }
-            if (s.rows_mismatch) {
-                if (in.rows_to_draw != 0 and in.skipped_empty == 0) break :blk true;
-                break :blk false;
-            }
-            if (s.row_valid_count == effective_rows) {
-                if (in.skipped_empty != 0) break :blk false;
-                if (in.rows_to_draw != effective_rows) break :blk false;
-                break :blk true;
-            }
-            break :blk false;
+/// Every external-driver gate input, built the way the driver builds it.
+fn sweepExternalGate(comptime check: fn (helpers.PresentGateInputs, helpers.PresentGate) anyerror!void) !void {
+    var bits: u32 = 0;
+    while (bits < (1 << 7)) : (bits += 1) {
+        const in = helpers.externalPresentGateInputs(
+            bits & (1 << 0) != 0,
+            bits & (1 << 1) != 0,
+            bits & (1 << 6) != 0,
+            bits & (1 << 2) != 0,
+            bits & (1 << 3) != 0,
+            bits & (1 << 4) != 0,
+            if (bits & (1 << 5) != 0) 2 else 0,
+        );
+        try check(in, helpers.presentGate(in));
+    }
+}
+
+test "external present gate: a stale layout or stale metrics refuses" {
+    try sweepExternalGate(struct {
+        fn f(in: helpers.PresentGateInputs, g: helpers.PresentGate) !void {
+            if (in.frame_incomplete) return;
+            const want_refuse = !in.layout_ok or !in.metrics_ok;
+            try std.testing.expectEqual(want_refuse, g.verdict == .refuse);
         }
-        if (in.force_full_rows and in.skipped_empty != 0) break :blk false;
-        if (in.force_full_rows and in.rows_to_draw != effective_rows) break :blk false;
-        break :blk true;
-    };
-    const full = in.force_full_rows or
-        (s.pending and !s.back_tex_valid and !s.rows_mismatch) or
-        s.clear or
-        in.present_rects_overflowed or
-        in.custom_shader;
-    const rendered_complete_frame = effective_rows != 0 and
-        in.skipped_empty == 0 and
-        in.rows_to_draw == effective_rows;
+    }.f);
+}
+
+test "external present gate: a forced, overflowed or shader frame presents to every buffer" {
+    try sweepExternalGate(struct {
+        fn f(in: helpers.PresentGateInputs, g: helpers.PresentGate) !void {
+            if (!in.layout_ok or !in.metrics_ok or in.frame_incomplete) return;
+            const want_full = in.force_full_rows or in.present_rects_overflowed or in.custom_shader;
+            try std.testing.expectEqual(want_full, g.full);
+            if (want_full) try std.testing.expectEqual(helpers.PresentVerdict.present, g.verdict);
+        }
+    }.f);
+}
+
+test "external present gate: a partial frame presents its damage and skips when it has none" {
+    try sweepExternalGate(struct {
+        fn f(in: helpers.PresentGateInputs, g: helpers.PresentGate) !void {
+            if (!in.layout_ok or !in.metrics_ok or in.frame_incomplete or g.full) return;
+            const want: helpers.PresentVerdict = if (in.present_rects == 0) .skip else .present;
+            try std.testing.expectEqual(want, g.verdict);
+            // The external back_tex is never discarded by a present.
+            try std.testing.expect(g.back_tex_valid);
+        }
+    }.f);
+}
+
+test "external back_tex with no valid frame refuses a partial present and presents a full one" {
+    // A partial frame drawn over it must not reach the screen.
+    const partial = helpers.externalPresentGateInputs(true, true, false, false, false, false, 2);
+    try std.testing.expectEqual(helpers.PresentVerdict.refuse, helpers.presentGate(partial).verdict);
+    // A full frame over it presents to every buffer.
+    const full = helpers.presentGate(helpers.externalPresentGateInputs(true, true, false, true, false, false, 2));
+    try std.testing.expectEqual(helpers.PresentVerdict.present, full.verdict);
+    try std.testing.expect(full.full);
+}
+
+test "an incomplete frame never presents, with or without a seed" {
+    var in = helpers.externalPresentGateInputs(true, true, true, true, false, false, 2);
+    in.frame_incomplete = true;
+    try std.testing.expectEqual(helpers.PresentVerdict.refuse, helpers.presentGate(in).verdict);
+    in.seed = .{ .pending = false, .clear = true, .back_tex_valid = true, .rows_mismatch = false, .row_valid_count = 0 };
+    try std.testing.expectEqual(helpers.PresentVerdict.refuse, helpers.presentGate(in).verdict);
+}
+
+test "both drivers' gate inputs refuse a stale layout even when everything else presents" {
+    // External: the driver's own builder, with a forced full frame.
+    const ext = helpers.externalPresentGateInputs(false, true, true, true, false, false, 2);
+    try std.testing.expectEqual(helpers.PresentVerdict.refuse, helpers.presentGate(ext).verdict);
+    // Main: a seed clear, which presents unconditionally once the inputs are
+    // current, through the builder window.zig uses.
+    var facts = mainSeedClearFacts();
+    facts.layout_ok = false;
+    try std.testing.expectEqual(helpers.PresentVerdict.refuse, helpers.presentGate(helpers.mainPresentGateInputs(facts)).verdict);
+}
+
+/// A main frame the gate presents: a seed clear on current inputs.
+fn mainSeedClearFacts() helpers.MainPresentFacts {
     return .{
-        .verdict = if (allow_present) .present else .refuse,
-        .full = full,
-        .back_tex_valid = (s.back_tex_valid and in.preserve_back) or rendered_complete_frame,
+        .layout_ok = true,
+        .metrics_ok = true,
+        .frame_incomplete = false,
+        .force_full_rows = true,
+        .preserve_back = false,
+        .rows = 4,
+        .rows_to_draw = 4,
+        .skipped_empty = 0,
+        .custom_shader = false,
+        .present_rects = 2,
+        .present_rects_overflowed = false,
+        .seed = .{ .pending = true, .clear = true, .back_tex_valid = true, .rows_mismatch = false, .row_valid_count = 4 },
     };
 }
 
-/// The external driver's, from external_windows.zig: an incomplete frame and
-/// stale metrics requeue, no damage skips, and back_tex is always valid.
-fn externalPresentOracle(in: helpers.PresentGateInputs) helpers.PresentGate {
-    const full = in.force_full_rows or in.custom_shader;
-    const verdict: helpers.PresentVerdict = if (in.frame_incomplete or !in.metrics_ok)
-        .refuse
-    else if (!full and in.present_rects == 0)
-        .skip
-    else
-        .present;
-    return .{ .verdict = verdict, .full = full, .back_tex_valid = true };
+test "main gate inputs: the seed-clear baseline presents" {
+    const g = helpers.presentGate(helpers.mainPresentGateInputs(mainSeedClearFacts()));
+    try std.testing.expectEqual(helpers.PresentVerdict.present, g.verdict);
 }
 
-fn expectSameGate(want: helpers.PresentGate, got: helpers.PresentGate) !void {
-    try std.testing.expectEqual(want.verdict, got.verdict);
-    // Fullness and validity only mean anything for a frame that presents.
-    if (want.verdict != .present) return;
-    try std.testing.expectEqual(want.full, got.full);
-    try std.testing.expectEqual(want.back_tex_valid, got.back_tex_valid);
-}
-
-test "the present gate answers what the main driver answered, for every input" {
-    var n: u32 = 0;
-    var bits: u32 = 0;
-    while (bits < (1 << 12)) : (bits += 1) {
-        for ([_]usize{ 0, 3, 4 }) |rows_to_draw| {
-            for ([_]u32{ 0, 1 }) |skipped_empty| {
-                for ([_]usize{ 0, 4 }) |rows| {
-                    for ([_]usize{ 0, 4 }) |row_valid_count| {
-                        const bit = struct {
-                            fn at(v: u32, i: u5) bool {
-                                return (v >> i) & 1 != 0;
-                            }
-                        }.at;
-                        const in = helpers.PresentGateInputs{
-                            .layout_ok = bit(bits, 0),
-                            .metrics_ok = bit(bits, 1),
-                            .frame_incomplete = bit(bits, 2),
-                            .force_full_rows = bit(bits, 3),
-                            .preserve_back = bit(bits, 4),
-                            .custom_shader = bit(bits, 5),
-                            .present_rects_overflowed = bit(bits, 6),
-                            .present_rects = if (bit(bits, 7)) 2 else 0,
-                            .rows = rows,
-                            .rows_to_draw = rows_to_draw,
-                            .skipped_empty = skipped_empty,
-                            .empty_damage_presents_all = true,
-                            .seed = .{
-                                .pending = bit(bits, 8),
-                                .clear = bit(bits, 9),
-                                .back_tex_valid = bit(bits, 10),
-                                .rows_mismatch = bit(bits, 11),
-                                .row_valid_count = row_valid_count,
-                            },
-                        };
-                        try expectSameGate(mainPresentOracle(in), helpers.presentGate(in));
-                        n += 1;
-                    }
-                }
-            }
-        }
-    }
-    try std.testing.expect(n > 10_000);
-}
-
-test "the present gate answers what the external driver answered, for every input" {
-    var bits: u32 = 0;
-    while (bits < (1 << 6)) : (bits += 1) {
-        for ([_]usize{ 0, 3, 4 }) |rows_to_draw| {
-            for ([_]u32{ 0, 1 }) |skipped_empty| {
-                const in = helpers.PresentGateInputs{
-                    .metrics_ok = bits & 1 != 0,
-                    .frame_incomplete = bits & 2 != 0,
-                    .force_full_rows = bits & 4 != 0,
-                    .preserve_back = bits & 8 != 0,
-                    .custom_shader = bits & 16 != 0,
-                    .present_rects = if (bits & 32 != 0) 2 else 0,
-                    .rows = 4,
-                    .rows_to_draw = rows_to_draw,
-                    .skipped_empty = skipped_empty,
-                };
-                try expectSameGate(externalPresentOracle(in), helpers.presentGate(in));
-            }
-        }
-    }
-}
-
-/// Every main-driver input the oracle sweep covers, with its gate. The named
-/// properties below hold over this whole space independently of the oracle.
+/// Every main-driver input combination, with its gate. The named properties
+/// below must hold over this whole space.
 fn sweepMainGate(comptime check: fn (helpers.PresentGateInputs, helpers.PresentGate) anyerror!void) !void {
     var bits: u32 = 0;
     while (bits < (1 << 12)) : (bits += 1) {
@@ -1134,6 +1101,8 @@ test "present gate property: a frame that drew every row leaves back_tex valid" 
 
 test "a surface whose chrome draws without damage never skips an empty present" {
     const in = helpers.PresentGateInputs{
+        .layout_ok = true,
+        .metrics_ok = true,
         .force_full_rows = false,
         .preserve_back = true,
         .rows = 4,
@@ -1892,6 +1861,44 @@ test "the cursor row scissor stays inside the cursor's layer" {
         TestRect{ .left = 10, .top = 30, .right = 10 + 240, .bottom = 46 },
         helpers.cursorRowScissor(TestRect, 10, 30, 500, 0, 0, 240, 0, 16),
     );
+}
+
+fn damageContains(damage: [3]?TestRect, r: TestRect) bool {
+    for (damage) |d_opt| {
+        const d = d_opt orelse continue;
+        if (d.left <= r.left and d.top <= r.top and d.right >= r.right and d.bottom >= r.bottom) return true;
+    }
+    return false;
+}
+
+test "cursor damage covers the scissor band of the previous and the current cursor row" {
+    // A 2 px underline cursor on row 5 of a layer at y=32; the previous
+    // cursor was on row 2. The blink-off erase clears the whole scissor
+    // band, not just the vertex box, so both full-height bands are damage.
+    const bounds = core.cursor_rect.Rect{ .left = 10 + 248 + 80, .top = 30 + 32 + 5 * 16 + 14, .right = 10 + 248 + 88, .bottom = 30 + 32 + 6 * 16 };
+    const damage = helpers.cursorDamageRects(TestRect, .{ 2, 5 }, bounds, 10, 30, 500, 32, 16, 600, 800);
+    for ([_]u32{ 2, 5 }) |row| {
+        // Any layer the cursor's grid can be: the root, either split half.
+        try std.testing.expect(damageContains(damage, helpers.cursorRowScissor(TestRect, 10, 30, 500, 0, 32, null, row, 16)));
+        try std.testing.expect(damageContains(damage, helpers.cursorRowScissor(TestRect, 10, 30, 500, 248, 32, 252, row, 16)));
+        try std.testing.expect(damageContains(damage, helpers.cursorRowScissor(TestRect, 10, 30, 500, 0, 32, 240, row, 16)));
+    }
+}
+
+test "cursor damage covers a cursor box that overhangs its row" {
+    const bounds = core.cursor_rect.Rect{ .left = 40.5, .top = 30 + 3 * 16 - 2, .right = 49.5, .bottom = 30 + 4 * 16 + 3 };
+    const damage = helpers.cursorDamageRects(TestRect, .{ null, 3 }, bounds, 0, 30, 500, 0, 16, 600, 800);
+    try std.testing.expect(damageContains(damage, .{ .left = 40, .top = 30 + 3 * 16 - 2, .right = 50, .bottom = 30 + 4 * 16 + 3 }));
+}
+
+test "cursor damage is clipped to the client and never empty" {
+    // No cursor at all: no damage.
+    const none = helpers.cursorDamageRects(TestRect, .{ null, null }, null, 0, 0, 500, 0, 16, 600, 800);
+    for (none) |d| try std.testing.expect(d == null);
+    // A previous row past a shrunk client is dropped; a straddling one clipped.
+    const damage = helpers.cursorDamageRects(TestRect, .{ 60, 49 }, null, 0, 0, 500, 0, 16, 600, 790);
+    try std.testing.expect(damage[0] == null);
+    try std.testing.expectEqual(TestRect{ .left = 0, .top = 784, .right = 500, .bottom = 790 }, damage[1].?);
 }
 
 // --- on_vertices_row disposition (zonvie_core.h, on_vertices_row) ---

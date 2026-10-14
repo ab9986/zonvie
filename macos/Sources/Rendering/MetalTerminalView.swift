@@ -293,7 +293,9 @@ final class MetalTerminalView: GridInputView {
     }
 
     private func drawablePxRectToViewRect(_ rectPxTopOrigin: NSRect) -> NSRect {
-        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
+        let geometry = currentRedrawGeometry()
+        let scale = geometry.scale
+        let bounds = geometry.bounds
     
         // drawable px (top-origin) -> points (top-origin)
         var r = NSRect(
@@ -304,7 +306,7 @@ final class MetalTerminalView: GridInputView {
         )
     
         // Convert to NSView coordinates if the view is not flipped (bottom-left origin).
-        if !isFlipped {
+        if !geometry.flipped {
             r.origin.y = bounds.height - (r.origin.y + r.size.height)
         }
     
@@ -1114,7 +1116,11 @@ final class MetalTerminalView: GridInputView {
             if floatGrid.anchorGrid > 1 {
                 for i in 0..<windowCount where offsets[i].gridId == floatGrid.anchorGrid {
                     // Only follow when the anchor is itself a scrolled window.
-                    if let aw = gridInfoMap[offsets[i].gridId], aw.zindex <= 0 {
+                    if let aw = gridInfoMap[offsets[i].gridId],
+                       surfaceFloatFollowsAnchorScroll(
+                           followsScroll: floatGrid.followsScroll,
+                           scrolledInOwnRight: alreadyScrolled,
+                           anchorIsScrolledWindow: aw.zindex <= 0) {
                         followedOffsetYPx = offsets[i].offsetYPx
                         followedGridId = offsets[i].gridId
                     }
@@ -1403,7 +1409,8 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
             ZonvieCore.appLogPerf("[perf_input] seq=\(inputTrace.seq) stage=request_redraw delta_us=\(deltaUs)")
             core?.markInputTraceRequestRedrawLogged(seq: inputTrace.seq)
         }
-        redrawScheduler.requestRedraw(rect: rect, bounds: bounds, window: window) { [weak self] redrawRect in
+        let geometry = currentRedrawGeometry()
+        redrawScheduler.requestRedraw(rect: rect, bounds: geometry.bounds, window: geometry.window) { [weak self] redrawRect in
             guard let self else { return }
             if ZonvieCore.appLogEnabled {
                 ZonvieCore.appLog("setNeedsDisplay(out): surface=\(self.surfaceId) r=\(String(describing: redrawRect)) bounds=\(self.bounds)")
@@ -1422,8 +1429,46 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
     // held) stops the repeat-pacing display link, which releases its extra
     // retain, and parks its draw loop; the main view used to leave the loop
     // running.
+    /// The AppKit geometry the redraw path reads. Row callbacks request
+    /// redraws on the core thread, where AppKit must not be touched, so the
+    /// main thread snapshots it here whenever it can change.
+    struct RedrawGeometry {
+        var scale: CGFloat = surfaceFallbackBackingScale
+        var flipped = false
+        var bounds: NSRect = .zero
+        weak var window: NSWindow?
+    }
+    /// Protected by `redrawGeometryLock`; written on the main thread only.
+    private var redrawGeometry = RedrawGeometry()
+    private let redrawGeometryLock = NSLock()
+
+    private func refreshRedrawGeometry() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        let measured = RedrawGeometry(
+            scale: window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? surfaceFallbackBackingScale,
+            flipped: isFlipped,
+            bounds: bounds,
+            window: window
+        )
+        redrawGeometryLock.lock()
+        redrawGeometry = measured
+        redrawGeometryLock.unlock()
+    }
+
+    func currentRedrawGeometry() -> RedrawGeometry {
+        redrawGeometryLock.lock()
+        defer { redrawGeometryLock.unlock() }
+        return redrawGeometry
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        refreshRedrawGeometry()
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        refreshRedrawGeometry()
         applyAlwaysScrollbarVisibility()
         guard window == nil else { return }
         deactivateSurfaceDrawLoop()
@@ -1432,6 +1477,7 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
 
     override func layout() {
         super.layout()
+        refreshRedrawGeometry()
         layoutScrollbar()
     }
 

@@ -95,7 +95,16 @@ typedef int (*zonvie_atlas_ensure_glyph_fn)(
 /* Text-run shaping: shape multiple scalars into glyphs with positions.
    Frontend performs platform-specific shaping (HarfBuzz on macOS, DWrite on Windows).
    Returns actual glyph count. If > out_cap, caller should retry with larger buffers.
-   out_clusters[i] = index of first input scalar that produced glyph i (HarfBuzz convention). */
+   out_clusters[i] = index of first input scalar that produced glyph i (HarfBuzz convention).
+   The core checks every result and relies on these rules:
+   - 0 means "not shaped": the run is drawn one glyph per scalar.
+   - out_clusters[0] == 0, out_clusters is non-decreasing, and every entry is
+     < scalar_count; a result breaking any of these is drawn as for 0.
+   - When the core retries with out_cap equal to the count first returned, the
+     second call returns no more than that; a larger count ends the session
+     (a contract violation, not a recoverable state).
+   Both rejections are reported through on_callback_error
+   (ZONVIE_CALLBACK_ERROR_SHAPE_FAILED). */
 typedef size_t (*zonvie_shape_text_run_fn)(
     void* ctx,
     const uint32_t* scalars, size_t scalar_count,
@@ -203,7 +212,11 @@ typedef void (*zonvie_on_vertices_row_fn)(
    A MAIN callback with row_count=0, verts=NULL, and vert_count=0 publishes
    a layout-only zero-cell transition. total_rows/total_cols are authoritative,
    and at least one is zero. It clears the logical MAIN surface without
-   treating a nonexistent row as row content. */
+   treating a nonexistent row as row content. Only grid 1 receives it: a
+   sub-grid (external window root or placed layer) at a zero-cell shape gets
+   no on_vertices_row; its rows keep their last contents until the grid is
+   resized, hidden or closed. Neovim never gives a window grid a zero-cell
+   shape. */
 
 /* Grid row-shift notification.
    Fired once per grid per flush batch when that grid's rows can be carried by
@@ -327,7 +340,11 @@ typedef void (*zonvie_on_connect_fn)(
    Not fired while rows or cols is 0, nor, for an ext_windows grid awaiting
    its first resize, while rows or cols is below 2. A frontend must treat a
    repeat for a known grid_id as an update of that window, never as a second
-   window. */
+   window.
+   Until it has fired for a grid_id, that surface gets no on_surface_layout
+   and no on_grid_row_scroll, but its rows and cursor may already arrive
+   through on_vertices_row: a frontend keeps them to seed the window, or drops
+   them and requests a full resend once the window exists. */
 typedef void (*zonvie_on_external_window_fn)(
     void* ctx,
     int64_t grid_id,
@@ -1969,13 +1986,15 @@ ZONVIE_API void zonvie_core_retry_flush_locked(zonvie_core *core);
    actually drive the next attempt.
    Takes grid_mu itself — call ONLY from a context that does not already
    hold it (e.g. a main-thread retry timer). Do NOT call from
-   on_flush_begin/on_flush_end (core/RPC thread, grid_mu held for the
-   entire handleRedraw duration) — use zonvie_core_force_resend_locked
-   there instead, or this self-deadlocks on the non-recursive grid_mu. */
+   on_flush_begin/on_flush_end, on_grid_row_scroll or any other callback run
+   inside a flush (core/RPC thread, grid_mu held for the entire handleRedraw
+   duration) — use zonvie_core_force_resend_locked there instead, or this
+   self-deadlocks on the non-recursive grid_mu. */
 ZONVIE_API void zonvie_core_force_resend(zonvie_core *core);
 
 /* Same effect as zonvie_core_force_resend, for callers that ALREADY hold
-   grid_mu — specifically on_flush_begin/on_flush_end. */
+   grid_mu: on_flush_begin/on_flush_end, on_grid_row_scroll, and the other
+   callbacks the core runs inside a flush. */
 ZONVIE_API void zonvie_core_force_resend_locked(zonvie_core *core);
 
 #ifdef __cplusplus

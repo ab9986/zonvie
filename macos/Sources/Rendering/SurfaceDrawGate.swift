@@ -141,147 +141,6 @@ struct SurfaceIdleTerms {
     }
 }
 
-/// Whether a surface's render pass may `.load` the back texture it drew last
-/// frame, or has to `.clear` and draw it all again.
-///
-/// `SurfaceFrameDecision.loadsPreviousContents` — the final mapping onto the
-/// load action — was already shared. What was not shared is the predicate that feeds it, and
-/// that is where the two surfaces had drifted furthest: main computes one
-/// expression, external computes four (`cursorOnlyFrame`, `reuseHostedContents`,
-/// `reuseRootContents`, `partialHostedContents`) and then a fifth over them.
-///
-/// Laid side by side they turn out to be the same shape — external's is main's
-/// with a prefix of guards main has no state for, and four extra arms. So the
-/// union works here exactly as it does for `SurfaceIdleTerms`: every term, and
-/// a surface that lacks one leaves it at the value that cannot change its own
-/// answer.
-///
-/// One term needs its role spelled out, because its name would otherwise lie.
-/// See `layersOutsideDirtySet`.
-struct SurfaceLoadActionTerms {
-    /// `canDirtyOnlyWithBlur` for either surface. The external surface also
-    /// tested its font, layout-damage and decoration guards here; the guards
-    /// below refuse reuse on those already, and without reuse the row pass
-    /// cannot choose dirty rows, so the answer was the same.
-    static func dirtyOnlyWithBlur(
-        rowMode: Bool,
-        useTwoPass: Bool,
-        hasDirtyRowsInRowMode: Bool,
-        hasPresentedOnce: Bool,
-        isSmoothScrolling: Bool,
-        drawableSizeChanged: Bool,
-        glowEnabled: Bool
-    ) -> Bool {
-        rowMode && useTwoPass && hasDirtyRowsInRowMode
-            && hasPresentedOnce && !isSmoothScrolling && !drawableSizeChanged && !glowEnabled
-    }
-
-    // MARK: guards — any one of these refuses reuse outright
-
-    /// Additive bloom accumulates brightness over a loaded texture.
-    var glowEnabled = false
-
-    /// The committed rows were generated with the font metrics in force now.
-    /// A surface with no font-generation gate has nothing to be stale about
-    /// and passes the default.
-    var fontIsCurrent = true
-
-    /// The layout moved under this surface, so what the texture holds is in
-    /// the wrong place. A surface that does not track layout damage separately
-    /// passes the default.
-    var hasLayoutDamage = false
-
-    /// ext-cmdline and friends: their viewport origin offset means a partial
-    /// redraw's scissor rects do not line up, so they always clear.
-    var isDecoratedSurface = false
-
-    /// This surface hosts layers whose contents are **not** represented in its
-    /// own dirty-row set, so reuse is safe only if a hosted-specific arm below
-    /// approved it.
-    ///
-    /// Not "this surface hosts layers". The main surface hosts them too, and
-    /// folds their pending work into `hasDirtyRowsInRowMode` via `anyLayerWork`
-    /// — its layers ARE in the dirty set, so it passes false and its answer is
-    /// unchanged. Naming this after the layers rather than after the role is
-    /// how a rule gets moved onto a surface where the same word means something
-    /// else.
-    var layersOutsideDirtySet = false
-
-    // MARK: arms — any one of these permits reuse
-
-    /// The scroll is being served by a GPU blit of the texture being loaded.
-    var useGpuScrollCopy = false
-
-    /// Under blur, a dirty-only redraw is still safe because the two-pass
-    /// background pass overwrites rather than blends, so alpha cannot build up.
-    var canDirtyOnlyWithBlur = false
-
-    /// Hosted layers are unchanged and nothing else moved.
-    var reuseHostedContents = false
-
-    /// The same, for a surface with no hosted layers at all.
-    var reuseRootContents = false
-
-    /// Hosted layers are unchanged but some rows are dirty, so the frame
-    /// recomposes those bands over the loaded texture.
-    var partialHostedContents = false
-
-    /// A damaged pixel rectangle that no row expresses.
-    var hasDirtyRect = false
-
-    /// Row vertices are in use and something owes rows.
-    var hasDirtyRowsInRowMode = false
-
-    /// A scroll offset is active. Reuse of a texture drawn at a different
-    /// offset would show the same pixels one row out.
-    var isSmoothScrolling = false
-
-    /// Every guard passes.
-    private var guardsAllow: Bool {
-        !glowEnabled && fontIsCurrent && !hasLayoutDamage && !isDecoratedSurface
-    }
-
-    /// The decision and every term behind it, for `ZONVIE_DRAW_TRACE=1`.
-    /// One field set for both surfaces — see `SurfaceIdleTerms.traceLine`.
-    func traceLine(surface: Int64) -> String {
-        "surface=\(surface) gate=load"
-            + " glow=\(glowEnabled ? 1 : 0) fontCurrent=\(fontIsCurrent ? 1 : 0)"
-            + " layout=\(hasLayoutDamage ? 1 : 0) decorated=\(isDecoratedSurface ? 1 : 0)"
-            + " layersOutside=\(layersOutsideDirtySet ? 1 : 0)"
-            + " gpuScroll=\(useGpuScrollCopy ? 1 : 0)"
-            + " dirtyBlur=\(canDirtyOnlyWithBlur ? 1 : 0)"
-            + " reuseHosted=\(reuseHostedContents ? 1 : 0) reuseRoot=\(reuseRootContents ? 1 : 0)"
-            + " partialHosted=\(partialHostedContents ? 1 : 0)"
-            + " rect=\(hasDirtyRect ? 1 : 0) rowDirty=\(hasDirtyRowsInRowMode ? 1 : 0)"
-            + " smooth=\(isSmoothScrolling ? 1 : 0)"
-            + " -> reuse=\(reusesPreviousContents ? 1 : 0) force=\(forcesReusePreviousContents ? 1 : 0)"
-    }
-
-    /// `shouldReusePreviousContents`: reuse is permitted if blur does not
-    /// intervene. `SurfaceFrameDecision` applies that last condition.
-    var reusesPreviousContents: Bool {
-        guardsAllow
-            && (!layersOutsideDirtySet || reuseHostedContents || partialHostedContents)
-            && (useGpuScrollCopy
-                || canDirtyOnlyWithBlur
-                || reuseHostedContents
-                || reuseRootContents
-                || partialHostedContents
-                || (!isSmoothScrolling && (hasDirtyRect || hasDirtyRowsInRowMode)))
-    }
-
-    /// `forceReusePreviousContents`: reuse even under blur. Only the arms whose
-    /// own pass overwrites what it loads, or which encode no surface pass at
-    /// all, may say this.
-    var forcesReusePreviousContents: Bool {
-        guardsAllow
-            && (useGpuScrollCopy
-                || canDirtyOnlyWithBlur
-                || reuseHostedContents
-                || reuseRootContents)
-    }
-}
-
 /// A surface's draw-loop idle accounting: how many consecutive frames produced
 /// nothing, and when that means the loop should go back to on-demand drawing.
 ///
@@ -351,78 +210,6 @@ enum SurfaceRowPassPlan: Equatable {
 
     /// Every row of the grid, with no retained rows and no scissor.
     case allRows
-}
-
-/// What a surface knows when it picks a row-pass plan.
-///
-/// Like the other two predicates here, a surface that has no such state leaves
-/// the term at the value that cannot change its own answer, and two terms are
-/// named for their ROLE rather than for the variable that usually fills them —
-/// see `rootScrollBlitVacatedBand` and `hasDirtyRows`.
-struct SurfaceRowPassTerms {
-    /// Blur's two-pass background/glyph path is in use.
-    var useTwoPass = false
-
-    /// A GPU blit already shifted **this pass's own target** for a scroll, so
-    /// the band it vacated holds no valid pixels and must be repainted while
-    /// the rest must not be.
-    ///
-    /// Not "a scroll blit happened". The main surface blits too, but for its
-    /// *layers*, which its layer pass repaints on its own; its root is the
-    /// `ext_multigrid` container and never scrolls, so it passes false and its
-    /// answer is unchanged. Naming this after `useGpuScrollCopy` would have
-    /// moved an external rule onto a root where it means something else.
-    var rootScrollBlitVacatedBand = false
-
-    /// A sub-row scroll offset is active, so every row lands somewhere new.
-    var isSmoothScrolling = false
-
-    /// Blur is on and a dirty-only redraw is still safe, because the two-pass
-    /// background pass overwrites instead of blending.
-    var canDirtyOnlyWithBlur = false
-
-    /// The render pass loaded the back texture rather than clearing it. Without
-    /// that, every row this frame does not draw would be blank.
-    ///
-    /// Only external tested this alongside `canDirtyOnlyWithBlur`. Main did
-    /// not have to: its `canDirtyOnlyWithBlur` forces reuse, and itself
-    /// requires `hasPresentedOnce && !drawableSizeChanged`, which is exactly
-    /// what `SurfaceFrameDecision` needs to answer `.load`. So the
-    /// conjunct is a no-op on main rather than a new condition.
-    var loadedPreviousContents = false
-
-    /// Something owes rows.
-    ///
-    /// On the main surface that includes a hosted layer owing work
-    /// (`anyLayerWork`), because its layers are drawn from this same pass; an
-    /// external surface expresses hosted work through its own dirty rows and
-    /// passes just those.
-    var hasDirtyRows = false
-
-    /// Additive bloom needs the whole frame composited, so no partial redraw.
-    var glowEnabled = false
-
-    /// ext-cmdline and friends: their viewport origin offset means a partial
-    /// redraw's scissor rects do not line up, so they redraw whole.
-    var isDecoratedSurface = false
-
-    /// The drawable resized; the back texture was cleared to match.
-    var drawableSizeChanged = false
-
-    var plan: SurfaceRowPassPlan {
-        if useTwoPass {
-            if rootScrollBlitVacatedBand { return .dirtyRowsAfterScrollBlit }
-            if canDirtyOnlyWithBlur && loadedPreviousContents { return .dirtyRowsOnly }
-            return .allRowsWithRetained
-        }
-        if isSmoothScrolling { return .allRowsWithRetained }
-        if rootScrollBlitVacatedBand { return .dirtyRowsAfterScrollBlit }
-        if !isDecoratedSurface && !glowEnabled && hasDirtyRows
-            && !drawableSizeChanged && loadedPreviousContents {
-            return .dirtyRowsOnly
-        }
-        return .allRows
-    }
 }
 
 /// Whether a surface is showing a sub-row scroll offset, and whether it was
@@ -633,7 +420,9 @@ struct SurfaceScrollBlitGate {
 
 /// Settle a surface's frame-side scroll state against ITS OWN commit, and
 /// take the hold its committed snapshot is read under. Returns with `lock`
-/// held.
+/// held either way; false means a commit landed after the last service, so
+/// the snapshot would pair new rows with stale scroll state and the caller
+/// must not draw from it.
 ///
 /// Three things describe one cursor on the glass — the committed rows, the
 /// cursor rect the shader is handed, and the displacement that cancels a row
@@ -651,16 +440,17 @@ func settleSurfaceAgainstOwnCommit(
     commitRevision: () -> UInt64,
     service: () -> Void,
     maxAttempts: Int = 3
-) {
+) -> Bool {
     var attempts = 0
     while true {
         lock.lock()
-        let settled = commitRevision()
+        let serviced = commitRevision()
         lock.unlock()
         service()
         lock.lock()
         attempts += 1
-        if commitRevision() == settled || attempts >= maxAttempts { return }
+        if commitRevision() == serviced { return true }
+        if attempts >= maxAttempts { return false }
         lock.unlock()
     }
 }

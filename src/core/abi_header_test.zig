@@ -289,3 +289,11 @@ test "mouse modifier letters follow the header MOD_* bits" {
     try std.testing.expectEqualStrings("S", frontend_rules.mouseModifierString(&buf, c.ZONVIE_MOD_SHIFT));
     try std.testing.expectEqualStrings("D", frontend_rules.mouseModifierString(&buf, c.ZONVIE_MOD_SUPER));
 }
+
+test "callback error codes match zonvie_callback_error_code" {
+    const E = c_api.CallbackErrorCode;
+    try std.testing.expectEqual(@as(u32, c.ZONVIE_CALLBACK_ERROR_OOM), @intFromEnum(E.oom));
+    try std.testing.expectEqual(@as(u32, c.ZONVIE_CALLBACK_ERROR_GLYPH_RASTERIZE), @intFromEnum(E.glyph_rasterize));
+    try std.testing.expectEqual(@as(u32, c.ZONVIE_CALLBACK_ERROR_ATLAS_FULL), @intFromEnum(E.atlas_full));
+    try std.testing.expectEqual(@as(u32, c.ZONVIE_CALLBACK_ERROR_SHAPE_FAILED), @intFromEnum(E.shape_failed));
+}

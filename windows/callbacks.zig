@@ -402,6 +402,22 @@ fn postCursorBlinkUpdateLocking(app: *App) void {
     postCursorBlinkUpdate(hwnd);
 }
 
+/// One on_vertices_row call, as each route reads it.
+const RowCall = struct {
+    grid_id: i64,
+    row_start: u32,
+    row_count: u32,
+    verts_ptr: ?[*]const app_mod.Vertex,
+    vert_count: usize,
+    flags: u32,
+    total_rows: u32,
+    total_cols: u32,
+    is_main_update: bool,
+    is_cursor_update: bool,
+    layout_only: bool,
+    log_verbose: bool,
+};
+
 pub fn onVerticesRow(
     ctx: ?*anyopaque,
     grid_id: i64,
@@ -422,37 +438,33 @@ pub fn onVerticesRow(
         vert_count == 0 and
         (total_rows == 0 or total_cols == 0);
 
-    // zonvie_core.h: exactly one of MAIN and CURSOR is set. A callback with
-    // neither carries no layer, so no row may be replaced by it.
+    // zonvie_core.h: exactly one of MAIN and CURSOR is set; the core is the
+    // only sender, so anything else is its bug.
     const is_main_update = (flags & app_mod.VERT_UPDATE_MAIN) != 0;
     const is_cursor_update = (flags & app_mod.VERT_UPDATE_CURSOR) != 0;
     std.debug.assert(is_main_update != is_cursor_update);
-    if (!is_main_update and !is_cursor_update) return;
+
+    const call: RowCall = .{
+        .grid_id = grid_id,
+        .row_start = row_start,
+        .row_count = row_count,
+        .verts_ptr = verts_ptr,
+        .vert_count = vert_count,
+        .flags = flags,
+        .total_rows = total_rows,
+        .total_cols = total_cols,
+        .is_main_update = is_main_update,
+        .is_cursor_update = is_cursor_update,
+        .layout_only = layout_only,
+        .log_verbose = log_verbose,
+    };
 
     // In row-only ABI configurations the core sends the main-window cursor
     // through this callback with CURSOR set and MAIN clear. It has its own
     // cursor-layer transaction (storeMainSurfaceCursor); the row payload must
     // never replace or dirty the main row set.
     if (is_cursor_update and !is_main_update) {
-        // A grid the main surface places as a layer owns the surface's one
-        // cursor. Remember which layer it is so the overlay is drawn with that
-        // layer's transform. Grid 1 needs no route lookup.
-        const route: render_helpers.RowGridRoute = if (grid_id == 1) .main_root else blk: {
-            app.mu.lockUncancelable(core.clock.io());
-            defer app.mu.unlock(core.clock.io());
-            break :blk routeKind(resolveGridRouteLocked(app, grid_id));
-        };
-        if (render_helpers.mainSurfaceTakesCursor(grid_id, route)) {
-            if (render_helpers.ignoresCursorClear(vert_count, app.surf.tbs.cursorLayerGridIdInFlush(), grid_id)) {
-                traceRender(app, "event=cursor_ignore surface=1 grid={d} owner={d} reason=empty_nonowner\n", .{ grid_id, app.surf.tbs.cursorLayerGridIdInFlush() });
-                postCursorBlinkUpdateLocking(app);
-                return;
-            }
-            if (grid_id != 1) traceRender(app, "event=cursor_route surface=1 grid={d} vertices={d}\n", .{ grid_id, vert_count });
-            app.surf.tbs.stageCursorLayerGrid(grid_id);
-            storeMainSurfaceCursor(app, verts_ptr, vert_count, row_start);
-            return;
-        }
+        if (routeCursorToMainSurface(app, call)) return;
     }
 
     app.mu.lockUncancelable(core.clock.io());
@@ -465,26 +477,64 @@ pub fn onVerticesRow(
     // capture them under a child id: only HWND roots consume pending frames.
     if (app.flush_failed) return;
 
-    if (log_verbose) {
-        applog.appLog(
-            "[win] on_vertices_row row_start={d} row_count={d} vert_count={d} flags=0x{x} rows={d} row_valid={d}\n",
-            .{
-                row_start,
-                row_count,
-                vert_count,
-                flags,
-                app.surf.surface.rows,
-                app.row_valid_count,
-            },
-        );
+    if (log_verbose) logRowCallbackLocked(app, call);
+
+    // External grids use their own vertex storage (the window's TBS, or
+    // pending_external_verts before the window exists).
+    if (grid_id != 1) {
+        storeExternalGridRowLocked(app, call);
+        return;
     }
-    if (row_count != 1 and !layout_only and log_verbose) {
+    storeMainRootRowLocked(app, call);
+}
+
+/// The cursor-only route onto the main surface. Returns false when the main
+/// surface does not take this grid's cursor.
+fn routeCursorToMainSurface(app: *App, call: RowCall) bool {
+    const grid_id = call.grid_id;
+    // A grid the main surface places as a layer owns the surface's one
+    // cursor. Remember which layer it is so the overlay is drawn with that
+    // layer's transform. Grid 1 needs no route lookup.
+    const route: render_helpers.RowGridRoute = if (grid_id == 1) .main_root else blk: {
+        app.mu.lockUncancelable(core.clock.io());
+        defer app.mu.unlock(core.clock.io());
+        break :blk routeKind(resolveGridRouteLocked(app, grid_id));
+    };
+    if (!render_helpers.mainSurfaceTakesCursor(grid_id, route)) return false;
+    if (render_helpers.ignoresCursorClear(call.vert_count, app.surf.tbs.cursorLayerGridIdInFlush(), grid_id)) {
+        traceRender(app, "event=cursor_ignore surface=1 grid={d} owner={d} reason=empty_nonowner\n", .{ grid_id, app.surf.tbs.cursorLayerGridIdInFlush() });
+        postCursorBlinkUpdateLocking(app);
+        return true;
+    }
+    if (grid_id != 1) traceRender(app, "event=cursor_route surface=1 grid={d} vertices={d}\n", .{ grid_id, call.vert_count });
+    app.surf.tbs.stageCursorLayerGrid(grid_id);
+    storeMainSurfaceCursor(app, call.verts_ptr, call.vert_count, call.row_start);
+    return true;
+}
+
+fn logRowCallbackLocked(app: *App, call: RowCall) void {
+    const row_start = call.row_start;
+    const row_count = call.row_count;
+    const vert_count = call.vert_count;
+    const verts_ptr = call.verts_ptr;
+    applog.appLog(
+        "[win] on_vertices_row row_start={d} row_count={d} vert_count={d} flags=0x{x} rows={d} row_valid={d}\n",
+        .{
+            row_start,
+            row_count,
+            vert_count,
+            call.flags,
+            app.surf.surface.rows,
+            app.row_valid_count,
+        },
+    );
+    if (row_count != 1 and !call.layout_only) {
         applog.appLog(
             "[win] on_vertices_row WARN row_count={d} row_start={d} vert_count={d}\n",
             .{ row_count, row_start, vert_count },
         );
     }
-    if (log_verbose and verts_ptr != null and vert_count != 0) {
+    if (verts_ptr != null and vert_count != 0) {
         const verts = verts_ptr.?[0..vert_count];
         var glyph_verts: u32 = 0;
         var bad_uv: u32 = 0;
@@ -558,360 +608,408 @@ pub fn onVerticesRow(
             }
         }
     }
+}
 
-    // Handle external grids (grid_id != 1) separately
-    // External grids use their own vertex storage (the window's TBS, or
-    // pending_external_verts before the window exists)
-    if (grid_id != 1) {
-        const flush_generation = app.core_flush_generation.load(.acquire);
-        if (log_verbose) applog.appLog(
-            "[win] on_vertices_row external grid_id={d} row_start={d} vert_count={d} total_rows={d} total_cols={d}\n",
-            .{ grid_id, row_start, vert_count, total_rows, total_cols },
-        );
+/// grid_id != 1: a main-window layer, a live external window, or the pending
+/// capture for a window not created yet. Under app.mu.
+fn storeExternalGridRowLocked(app: *App, call: RowCall) void {
+    const grid_id = call.grid_id;
+    const is_main_update = call.is_main_update;
+    const is_cursor_update = call.is_cursor_update;
+    const flush_generation = app.core_flush_generation.load(.acquire);
+    if (call.log_verbose) applog.appLog(
+        "[win] on_vertices_row external grid_id={d} row_start={d} vert_count={d} total_rows={d} total_cols={d}\n",
+        .{ grid_id, call.row_start, call.vert_count, call.total_rows, call.total_cols },
+    );
 
-        // A grid the main surface places as a layer -- a float or split that
-        // lives in the main window, not its own -- is stored per grid and
-        // drawn on top of the root grid. Cursor rows keep the external path,
-        // which already owns the cursor layer.
-        //
-        // A window already closing does not count as a registration. The core
-        // un-externalizes a grid and re-sends all of its rows in ONE flush
-        // (flush.zig, the newly-hosted markAllDirty), while this map is only
-        // cleared later by the UI thread -- so a grid moving back into the
-        // main window as a float was routed to the dead window, refused there
-        // for closing, and parked in pending_external_verts, which nothing
-        // drains unless that id becomes an external window again. The layer
-        // route is the correct one the moment the close is staged: the new
-        // layout is already published, and the ABI requires tolerating rows
-        // for a grid that is in no layer yet.
-        const row_route = resolveGridRouteLocked(app, grid_id);
-        if (render_helpers.externalRowDisposition(.{ .main = is_main_update, .cursor = is_cursor_update, .route = routeKind(row_route), .live_window = false }) == .layer_row) {
-            const row_verts: []const app_mod.Vertex =
-                if (verts_ptr) |vp| vp[0..vert_count] else &[_]app_mod.Vertex{};
-            const stored = storeMainSurfaceLayerRowLocked(app, grid_id, row_start, row_verts, total_rows, total_cols, row_route);
-            // It refuses only external_root/unplaced, which are not layer rows.
-            std.debug.assert(stored);
-            // Request a paint, but do NOT dirty the root rows underneath:
-            // grid 1 holds no cells under ext_multigrid, so the root row
-            // loop would draw its empty-row background fill over the whole
-            // window every frame — which is opaque and destroys blur.
-            // The layer's own dirty flag and present rect carry the frame.
-            // Only for a main-window layer: a float an external window
-            // hosts already asked its host (storeMainSurfaceLayerRowLocked
-            // sets its flag), and the main flag drives a whole-window
-            // InvalidateRect — the row-scroll path makes the same split.
-            switch (row_route) {
-                .main_root, .main_layer, .unplaced => app.surf.flush_needs_invalidate = true,
-                .external_layer, .external_root => {},
-            }
-            return;
+    // A grid the main surface places as a layer -- a float or split that
+    // lives in the main window, not its own -- is stored per grid and
+    // drawn on top of the root grid. Cursor rows keep the external path,
+    // which already owns the cursor layer.
+    //
+    // A window already closing does not count as a registration. The core
+    // un-externalizes a grid and re-sends all of its rows in ONE flush
+    // (flush.zig, the newly-hosted markAllDirty), while this map is only
+    // cleared later by the UI thread -- so a grid moving back into the
+    // main window as a float was routed to the dead window, refused there
+    // for closing, and parked in pending_external_verts, which nothing
+    // drains unless that id becomes an external window again. The layer
+    // route is the correct one the moment the close is staged: the new
+    // layout is already published, and the ABI requires tolerating rows
+    // for a grid that is in no layer yet.
+    const row_route = resolveGridRouteLocked(app, grid_id);
+    if (render_helpers.externalRowDisposition(.{ .main = is_main_update, .cursor = is_cursor_update, .route = routeKind(row_route), .live_window = false }) == .layer_row) {
+        const row_verts: []const app_mod.Vertex =
+            if (call.verts_ptr) |vp| vp[0..call.vert_count] else &[_]app_mod.Vertex{};
+        const stored = storeMainSurfaceLayerRowLocked(app, grid_id, call.row_start, row_verts, call.total_rows, call.total_cols, row_route);
+        // It refuses only external_root/unplaced, which are not layer rows.
+        std.debug.assert(stored);
+        // Request a paint, but do NOT dirty the root rows underneath:
+        // grid 1 holds no cells under ext_multigrid, so the root row
+        // loop would draw its empty-row background fill over the whole
+        // window every frame — which is opaque and destroys blur.
+        // The layer's own dirty flag and present rect carry the frame.
+        // Only for a main-window layer: a float an external window
+        // hosts already asked its host (storeMainSurfaceLayerRowLocked
+        // sets its flag), and the main flag drives a whole-window
+        // InvalidateRect — the row-scroll path makes the same split.
+        switch (row_route) {
+            .main_root, .main_layer, .unplaced => app.surf.flush_needs_invalidate = true,
+            .external_layer, .external_root => {},
         }
-
-        // A newly-created HWND can still have a pending CPU frame when the
-        // UI thread hit OOM while seeding its TBS. Keep subsequent core
-        // updates in that pending transaction until the UI applies it
-        // successfully; writing the live surface here would let an older
-        // pending frame overwrite newer vertices on retry.
-        var has_pending_capture = false;
-        for (app.pending_external_verts.items) |pv| {
-            if (pv.grid_id == grid_id) {
-                has_pending_capture = true;
-                break;
-            }
-        }
-        const live_ext_win = blk: {
-            if (has_pending_capture) break :blk null;
-            // The grid's own window only counts while it is not closing. A
-            // grid moving into a float hosted by ANOTHER external window still
-            // matches the stale entry here, and taking it meant the update was
-            // refused as pending-close instead of falling through to the host
-            // that now owns it -- the content rows found their way there, the
-            // cursor did not.
-            const own_win = blk_own: {
-                if (app.external_windows.get(grid_id)) |w| {
-                    if (!w.is_pending_close) break :blk_own w;
-                }
-                break :blk_own null;
-            };
-            const ext_win = own_win orelse externalSurfaceForGridLocked(app, grid_id) orelse break :blk null;
-            // A closing HWND belongs to the old lifecycle. Capture updates for
-            // the replacement lifecycle instead of letting the core consume
-            // them as successful writes to a window that will be destroyed.
-            if (ext_win.is_pending_close) break :blk null;
-            // External surfaces join lazily on their first update. Bracketing
-            // every external HWND in onFlushBegin made one occluded/busy window
-            // apply backpressure to unrelated main-grid flushes and copied every
-            // external committed set even when it was untouched.
-            if (!is_cursor_update and !ensureExternalSurfaceFlush(app, ext_win, false)) return;
-            break :blk ext_win;
-        };
-        const disposition = render_helpers.externalRowDisposition(.{
-            .main = is_main_update,
-            .cursor = is_cursor_update,
-            .route = routeKind(row_route),
-            .live_window = live_ext_win != null,
-        });
-        switch (disposition) {
-            .live_cursor, .live_row, .pending_cursor, .pending_row => {},
-            // Handled above; reaching the row writes below would replace rows
-            // a callback with neither flag must retain.
-            .retain_rows, .layer_row => return,
-        }
-
-        // Try to find an existing external window with no pending seed.
-        if (live_ext_win) |ext_win| {
-            if (!is_cursor_update and ext_win.surf.tbs.is_in_flush) {
-                ext_win.surf.tbs.writeSet().metrics_gen = app.shared_metrics_gen;
-            }
-            if (disposition == .live_cursor) {
-                // guicursor carries a blink cadence per mode, so every cursor
-                // update re-reads it, as on the main surface and on macOS.
-                // Grid 1 used to be sent an empty cursor on every move and
-                // that post covered this surface; it is sent one only when
-                // the cursor leaves it now.
-                if (app.hwnd) |hwnd| _ = c.PostMessageW(hwnd, app_mod.WM_APP_UPDATE_CURSOR_BLINK, 0, 0);
-                if (render_helpers.ignoresCursorClear(vert_count, ext_win.surf.tbs.cursorLayerGridIdInFlush(), grid_id)) {
-                    traceRender(app, "event=cursor_ignore surface={d} grid={d} owner={d} reason=empty_nonowner\n", .{ traceExternalSurfaceId(ext_win, grid_id), grid_id, ext_win.surf.tbs.cursorLayerGridIdInFlush() });
-                    return;
-                }
-                traceRender(app, "event=cursor_route surface={d} grid={d} vertices={d}\n", .{ traceExternalSurfaceId(ext_win, grid_id), grid_id, vert_count });
-                if (!app.core_flush_active.load(.acquire)) {
-                    failFlush(app);
-                    return;
-                }
-                const cursor_slice: []const app_mod.Vertex = if (verts_ptr != null and vert_count != 0)
-                    verts_ptr.?[0..vert_count]
-                else
-                    &.{};
-                const cursor_row: ?u32 = if (cursor_slice.len != 0) row_start else null;
-
-                // The TBS cursor transaction records the old and the new row;
-                // paint reads its committed snapshot.
-                if (!ext_win.surf.tbs.storeMainCursor(app.alloc, cursor_slice, cursor_row)) {
-                    failFlush(app);
-                    return;
-                }
-                ext_win.surf.tbs.stageCursorLayerGrid(grid_id);
-                ext_win.surf.flush_needs_invalidate = true;
-                // InvalidateRect deferred to onFlushEnd.
-                return;
-            }
-
-            const size_changed = (ext_win.surf.surface.rows != total_rows or ext_win.surf.surface.cols != total_cols);
-            if (ext_win.surf.tbs.is_in_flush) {
-                const ws = ext_win.surf.tbs.writeSet();
-                const tbs_size_changed = ws.rows != total_rows or
-                    ws.cols != total_cols or
-                    ws.row_map.items.len != total_rows;
-                if (tbs_size_changed) {
-                    // Reserve both variable-size structures before dropping
-                    // any slot refs. A failed resize cancels the write set and
-                    // leaves the committed external frame intact.
-                    ws.row_map.ensureTotalCapacity(app.alloc, total_rows) catch {
-                        failFlush(app);
-                        return;
-                    };
-                    if (!ext_win.surf.tbs.prepareRowSyncTracking(app.alloc, total_rows)) {
-                        failFlush(app);
-                        return;
-                    }
-                    ext_win.surf.tbs.requireFullRowSync();
-
-                    const old_len = ws.row_map.items.len;
-                    const new_len: usize = @intCast(total_rows);
-                    if (new_len < old_len) {
-                        for (ws.row_map.items[new_len..]) |*mapping| {
-                            if (mapping.slot != app_mod.SLOT_NONE) {
-                                ext_win.surf.tbs.pool.release(app.alloc, mapping.slot);
-                                mapping.slot = app_mod.SLOT_NONE;
-                            }
-                        }
-                    }
-                    ws.row_map.items.len = new_len;
-                    if (new_len > old_len) {
-                        for (ws.row_map.items[old_len..]) |*mapping| mapping.* = .{};
-                    }
-                    ws.rows = total_rows;
-                    ws.cols = total_cols;
-                }
-            }
-            ext_win.surf.surface.rows = total_rows;
-            ext_win.surf.surface.cols = total_cols;
-            ext_win.surf.flush_needs_invalidate = true;
-            if (size_changed) {
-                ext_win.surf.surface.paint_full = true;
-                if (ext_win.surf.tbs.is_in_flush) {
-                    ext_win.surf.tbs.flush_paint_full = true;
-                }
-            }
-
-            if (row_count == 1) {
-                // TBS: COW detach + write to slot, mark dirty.
-                if (ext_win.surf.tbs.is_in_flush) {
-                    // External windows own a separate pool, so they need the
-                    // same layout/peak observations as the main grid above.
-                    ext_win.surf.tbs.pool.noteLayoutWidth(total_cols);
-                    if (!ext_win.surf.tbs.writeFlushRow(app.alloc, row_start, if (verts_ptr) |p| p[0..vert_count] else &.{})) failFlush(app);
-                }
-            } else if (row_count == 0) {
-                // A zero-cell layout (zonvie_core.h): no row content survives.
-                if (ext_win.surf.tbs.is_in_flush) {
-                    const ws = ext_win.surf.tbs.writeSet();
-                    ws.row_mode = true;
-                    ext_win.surf.tbs.requireFullRowSync();
-                    ws.releaseAllSlots(app.alloc, &ext_win.surf.tbs.pool);
-                    ext_win.surf.tbs.flush_paint_full = true;
-                }
-            }
-
-            // Resize popupmenu window if size changed (keep top-left position)
-            // Use deferred resize via PostMessage to avoid deadlock with WM_SIZE handler
-            if (grid_id == app_mod.POPUPMENU_GRID_ID and size_changed) {
-                const cell_w = app.cell_w_px;
-                const cell_h = app.rowHeightPx();
-                const content_w: c_int = @intCast(total_cols * cell_w);
-                const content_h: c_int = @intCast(total_rows * cell_h);
-
-                const outer = external_windows.windowOuterSizePx(ext_win.hwnd, content_w, content_h);
-                const window_w: c_int = outer.w;
-                const window_h: c_int = outer.h;
-
-                if (log_verbose) applog.appLog("[win] on_vertices_row popupmenu resize pending: content=({d},{d}) window=({d},{d})\n", .{ content_w, content_h, window_w, window_h });
-
-                // Store pending resize info and post message to do the actual resize outside of callback
-                ext_win.needs_window_resize = true;
-                ext_win.pending_window_w = window_w;
-                ext_win.pending_window_h = window_h;
-                ext_win.needs_renderer_resize = true;
-
-                // Post message to main window to trigger resize asynchronously (outside of lock)
-                if (app.hwnd) |main_hwnd| {
-                    if (c.PostMessageW(main_hwnd, app_mod.WM_APP_RESIZE_POPUPMENU, @bitCast(app_mod.POPUPMENU_GRID_ID), 0) == 0) {
-                        // PostMessage failed, reset flag to avoid stale state
-                        ext_win.needs_window_resize = false;
-                        if (log_verbose) applog.appLog("[win] on_vertices_row popupmenu PostMessageW failed\n", .{});
-                    }
-                } else {
-                    // No main hwnd, reset flag
-                    ext_win.needs_window_resize = false;
-                }
-            }
-
-            // InvalidateRect deferred to onFlushEnd for coalescing.
-
-            if (log_verbose) applog.appLog(
-                "[win] on_vertices_row external grid_id={d} updated\n",
-                .{grid_id},
-            );
-        } else {
-            // Window doesn't exist yet - store in pending_external_verts
-            // Find or create pending entry for this grid_id
-            var found_idx: ?usize = null;
-            for (app.pending_external_verts.items, 0..) |*pv, i| {
-                if (pv.grid_id == grid_id) {
-                    found_idx = i;
-                    break;
-                }
-            }
-
-            // Handle cursor update for pending entries. Store the cursor in the
-            // dedicated cursor_verts buffer (same as the live ext_win path),
-            // NOT baked into row/flat content. Baking left a stale cursor block
-            // in the row that was never erased once the window existed: later
-            // cursor-only updates do not re-send the row's content, so the old
-            // block kept being drawn under the new shape-aware overlay cursor.
-            if (disposition == .pending_cursor) {
-                // Every cursor update re-reads the blink cadence (see the
-                // live external path above).
-                if (app.hwnd) |hwnd| _ = c.PostMessageW(hwnd, app_mod.WM_APP_UPDATE_CURSOR_BLINK, 0, 0);
-                if (found_idx) |idx| {
-                    const pv = &app.pending_external_verts.items[idx];
-                    if (verts_ptr != null and vert_count != 0) {
-                        // Reserve BEFORE clearing so an OOM keeps the old
-                        // cursor capture intact (the pending entry is the
-                        // ONLY copy — the window does not exist yet).
-                        pv.surface.cursor_verts.ensureTotalCapacity(app.alloc, vert_count) catch {
-                            failFlush(app);
-                            return;
-                        };
-                        pv.surface.cursor_verts.clearRetainingCapacity();
-                        pv.surface.cursor_verts.appendSliceAssumeCapacity(verts_ptr.?[0..vert_count]);
-                        pv.surface.last_cursor_row = row_start;
-                    } else {
-                        pv.surface.cursor_verts.clearRetainingCapacity();
-                        pv.surface.last_cursor_row = null;
-                    }
-                    pv.flush_generation = flush_generation;
-                }
-                // No pending entry yet means no content rows either; cursor alone is not useful.
-                return;
-            }
-
-            if (found_idx) |idx| {
-                // Update existing pending entry. rows/cols are committed
-                // AFTER the content update succeeds — the keep-old failure
-                // paths below must not pair the old capture with new dims.
-                const pv = &app.pending_external_verts.items[idx];
-                if (row_count == 0) {
-                    // A zero-cell layout: no row content survives.
-                    _ = pv.surface.truncateRows(app.alloc, 0);
-                } else if (row_count == 1) {
-                    _ = pv.surface.truncateRows(app.alloc, total_rows);
-                    if (!storeSurfaceRowVerts(app.alloc, &pv.surface.row_verts, row_start, verts_ptr, vert_count)) {
-                        // OOM mid-frame: rows updated earlier this flush mix
-                        // with older rows — the entry is no longer a
-                        // consistent frame, and onFlushEnd's TBS cancel does
-                        // NOT roll pending buffers back. Discard the entry so
-                        // window creation shows nothing rather than a mixed
-                        // frame; the abort keeps core dirty and the next
-                        // flush rebuilds the pending capture from scratch.
-                        var dropped = app.pending_external_verts.swapRemove(idx);
-                        dropped.deinit(app.alloc);
-                        failFlush(app);
-                        return;
-                    }
-                }
-                pv.surface.rows = total_rows;
-                pv.surface.cols = total_cols;
-                pv.flush_generation = flush_generation;
-                pv.metrics_gen = app.shared_metrics_gen;
-            } else {
-                // Create new pending entry
-                var new_pv = app_mod.PendingExternalVertices{
-                    .grid_id = grid_id,
-                    .flush_generation = flush_generation,
-                    .metrics_gen = app.shared_metrics_gen,
-                    .surface = .{ .rows = total_rows, .cols = total_cols },
-                };
-                if (row_count == 1) {
-                    if (!storeSurfaceRowVerts(app.alloc, &new_pv.surface.row_verts, row_start, verts_ptr, vert_count)) {
-                        // Free the partially built entry (row storage may
-                        // have been resized before the failure).
-                        new_pv.deinit(app.alloc);
-                        failFlush(app);
-                        return;
-                    }
-                }
-                app.pending_external_verts.append(app.alloc, new_pv) catch {
-                    // The freshly built pending entry is dropped — release
-                    // its buffers and abort so the core re-sends.
-                    var dropped = new_pv;
-                    dropped.deinit(app.alloc);
-                    failFlush(app);
-                    return;
-                };
-            }
-
-            if (log_verbose) applog.appLog(
-                "[win] on_vertices_row external grid_id={d} stored in pending_external_verts\n",
-                .{grid_id},
-            );
-        }
-        return; // Don't process as global grid
+        return;
     }
 
-    const disposition = render_helpers.mainRowDisposition(.{
+    // A newly-created HWND can still have a pending CPU frame when the
+    // UI thread hit OOM while seeding its TBS. Keep subsequent core
+    // updates in that pending transaction until the UI applies it
+    // successfully; writing the live surface here would let an older
+    // pending frame overwrite newer vertices on retry.
+    var has_pending_capture = false;
+    for (app.pending_external_verts.items) |pv| {
+        if (pv.grid_id == grid_id) {
+            has_pending_capture = true;
+            break;
+        }
+    }
+    const live_ext_win = blk: {
+        if (has_pending_capture) break :blk null;
+        // The grid's own window only counts while it is not closing. A
+        // grid moving into a float hosted by ANOTHER external window still
+        // matches the stale entry here, and taking it meant the update was
+        // refused as pending-close instead of falling through to the host
+        // that now owns it -- the content rows found their way there, the
+        // cursor did not.
+        const own_win = blk_own: {
+            if (app.external_windows.get(grid_id)) |w| {
+                if (!w.is_pending_close) break :blk_own w;
+            }
+            break :blk_own null;
+        };
+        const ext_win = own_win orelse externalSurfaceForGridLocked(app, grid_id) orelse break :blk null;
+        // A closing HWND belongs to the old lifecycle. Capture updates for
+        // the replacement lifecycle instead of letting the core consume
+        // them as successful writes to a window that will be destroyed.
+        if (ext_win.is_pending_close) break :blk null;
+        // External surfaces join lazily on their first update. Bracketing
+        // every external HWND in onFlushBegin made one occluded/busy window
+        // apply backpressure to unrelated main-grid flushes and copied every
+        // external committed set even when it was untouched.
+        if (!is_cursor_update and !ensureExternalSurfaceFlush(app, ext_win, false)) return;
+        break :blk ext_win;
+    };
+    const disposition = render_helpers.externalRowDisposition(.{
         .main = is_main_update,
+        .cursor = is_cursor_update,
+        .route = routeKind(row_route),
+        .live_window = live_ext_win != null,
+    });
+    switch (disposition) {
+        .live_cursor, .live_row, .pending_cursor, .pending_row => {},
+        // Handled above; reaching the row writes below would replace rows
+        // a callback with neither flag must retain.
+        .retain_rows, .layer_row => return,
+    }
+
+    if (live_ext_win) |ext_win| {
+        if (!is_cursor_update and ext_win.surf.tbs.is_in_flush) {
+            ext_win.surf.tbs.writeSet().metrics_gen = app.shared_metrics_gen;
+        }
+        if (disposition == .live_cursor) {
+            storeLiveExternalCursorLocked(app, ext_win, call);
+            return;
+        }
+        storeLiveExternalRowLocked(app, ext_win, call);
+    } else {
+        storePendingExternalLocked(app, call, disposition, flush_generation);
+    }
+}
+
+fn storeLiveExternalCursorLocked(app: *App, ext_win: *app_mod.ExternalWindow, call: RowCall) void {
+    const grid_id = call.grid_id;
+    const vert_count = call.vert_count;
+    const verts_ptr = call.verts_ptr;
+    // guicursor carries a blink cadence per mode, so every cursor
+    // update re-reads it, as on the main surface and on macOS.
+    // Grid 1 used to be sent an empty cursor on every move and
+    // that post covered this surface; it is sent one only when
+    // the cursor leaves it now.
+    if (app.hwnd) |hwnd| _ = c.PostMessageW(hwnd, app_mod.WM_APP_UPDATE_CURSOR_BLINK, 0, 0);
+    if (render_helpers.ignoresCursorClear(vert_count, ext_win.surf.tbs.cursorLayerGridIdInFlush(), grid_id)) {
+        traceRender(app, "event=cursor_ignore surface={d} grid={d} owner={d} reason=empty_nonowner\n", .{ traceExternalSurfaceId(ext_win, grid_id), grid_id, ext_win.surf.tbs.cursorLayerGridIdInFlush() });
+        return;
+    }
+    traceRender(app, "event=cursor_route surface={d} grid={d} vertices={d}\n", .{ traceExternalSurfaceId(ext_win, grid_id), grid_id, vert_count });
+    if (!app.core_flush_active.load(.acquire)) {
+        failFlush(app);
+        return;
+    }
+    const cursor_slice: []const app_mod.Vertex = if (verts_ptr != null and vert_count != 0)
+        verts_ptr.?[0..vert_count]
+    else
+        &.{};
+    const cursor_row: ?u32 = if (cursor_slice.len != 0) call.row_start else null;
+
+    // The TBS cursor transaction records the old and the new row;
+    // paint reads its committed snapshot.
+    if (!ext_win.surf.tbs.storeMainCursor(app.alloc, cursor_slice, cursor_row)) {
+        failFlush(app);
+        return;
+    }
+    ext_win.surf.tbs.stageCursorLayerGrid(grid_id);
+    ext_win.surf.flush_needs_invalidate = true;
+    // InvalidateRect deferred to onFlushEnd.
+}
+
+fn storeLiveExternalRowLocked(app: *App, ext_win: *app_mod.ExternalWindow, call: RowCall) void {
+    const grid_id = call.grid_id;
+    const row_start = call.row_start;
+    const row_count = call.row_count;
+    const verts_ptr = call.verts_ptr;
+    const vert_count = call.vert_count;
+    const total_rows = call.total_rows;
+    const total_cols = call.total_cols;
+    const log_verbose = call.log_verbose;
+
+    const size_changed = (ext_win.surf.surface.rows != total_rows or ext_win.surf.surface.cols != total_cols);
+    if (ext_win.surf.tbs.is_in_flush) {
+        const ws = ext_win.surf.tbs.writeSet();
+        const tbs_size_changed = ws.rows != total_rows or
+            ws.cols != total_cols or
+            ws.row_map.items.len != total_rows;
+        if (tbs_size_changed) {
+            // Reserve both variable-size structures before dropping
+            // any slot refs. A failed resize cancels the write set and
+            // leaves the committed external frame intact.
+            ws.row_map.ensureTotalCapacity(app.alloc, total_rows) catch {
+                failFlush(app);
+                return;
+            };
+            if (!ext_win.surf.tbs.prepareRowSyncTracking(app.alloc, total_rows)) {
+                failFlush(app);
+                return;
+            }
+            ext_win.surf.tbs.requireFullRowSync();
+
+            const old_len = ws.row_map.items.len;
+            const new_len: usize = @intCast(total_rows);
+            if (new_len < old_len) {
+                for (ws.row_map.items[new_len..]) |*mapping| {
+                    if (mapping.slot != app_mod.SLOT_NONE) {
+                        ext_win.surf.tbs.pool.release(app.alloc, mapping.slot);
+                        mapping.slot = app_mod.SLOT_NONE;
+                    }
+                }
+            }
+            ws.row_map.items.len = new_len;
+            if (new_len > old_len) {
+                for (ws.row_map.items[old_len..]) |*mapping| mapping.* = .{};
+            }
+            ws.rows = total_rows;
+            ws.cols = total_cols;
+        }
+    }
+    ext_win.surf.surface.rows = total_rows;
+    ext_win.surf.surface.cols = total_cols;
+    ext_win.surf.flush_needs_invalidate = true;
+    if (size_changed) {
+        ext_win.surf.surface.paint_full = true;
+        if (ext_win.surf.tbs.is_in_flush) {
+            ext_win.surf.tbs.flush_paint_full = true;
+        }
+    }
+
+    if (row_count == 1) {
+        // TBS: COW detach + write to slot, mark dirty.
+        if (ext_win.surf.tbs.is_in_flush) {
+            // External windows own a separate pool, so they need the
+            // same layout/peak observations as the main grid above.
+            ext_win.surf.tbs.pool.noteLayoutWidth(total_cols);
+            if (!ext_win.surf.tbs.writeFlushRow(app.alloc, row_start, if (verts_ptr) |p| p[0..vert_count] else &.{})) failFlush(app);
+        }
+    } else if (row_count == 0) {
+        // A zero-cell layout (zonvie_core.h): no row content survives.
+        if (ext_win.surf.tbs.is_in_flush) {
+            const ws = ext_win.surf.tbs.writeSet();
+            ws.row_mode = true;
+            ext_win.surf.tbs.requireFullRowSync();
+            ws.releaseAllSlots(app.alloc, &ext_win.surf.tbs.pool);
+            ext_win.surf.tbs.flush_paint_full = true;
+        }
+    }
+
+    // Resize popupmenu window if size changed (keep top-left position)
+    // Use deferred resize via PostMessage to avoid deadlock with WM_SIZE handler
+    if (grid_id == app_mod.POPUPMENU_GRID_ID and size_changed) {
+        const cell_w = app.cell_w_px;
+        const cell_h = app.rowHeightPx();
+        const content_w: c_int = @intCast(total_cols * cell_w);
+        const content_h: c_int = @intCast(total_rows * cell_h);
+
+        const outer = external_windows.windowOuterSizePx(ext_win.hwnd, content_w, content_h);
+        const window_w: c_int = outer.w;
+        const window_h: c_int = outer.h;
+
+        if (log_verbose) applog.appLog("[win] on_vertices_row popupmenu resize pending: content=({d},{d}) window=({d},{d})\n", .{ content_w, content_h, window_w, window_h });
+
+        // Store pending resize info and post message to do the actual resize outside of callback
+        ext_win.needs_window_resize = true;
+        ext_win.pending_window_w = window_w;
+        ext_win.pending_window_h = window_h;
+        ext_win.needs_renderer_resize = true;
+
+        // Post message to main window to trigger resize asynchronously (outside of lock)
+        if (app.hwnd) |main_hwnd| {
+            if (c.PostMessageW(main_hwnd, app_mod.WM_APP_RESIZE_POPUPMENU, @bitCast(app_mod.POPUPMENU_GRID_ID), 0) == 0) {
+                // PostMessage failed, reset flag to avoid stale state
+                ext_win.needs_window_resize = false;
+                if (log_verbose) applog.appLog("[win] on_vertices_row popupmenu PostMessageW failed\n", .{});
+            }
+        } else {
+            // No main hwnd, reset flag
+            ext_win.needs_window_resize = false;
+        }
+    }
+
+    // InvalidateRect deferred to onFlushEnd for coalescing.
+
+    if (log_verbose) applog.appLog(
+        "[win] on_vertices_row external grid_id={d} updated\n",
+        .{grid_id},
+    );
+}
+
+/// The window does not exist yet: store in pending_external_verts.
+fn storePendingExternalLocked(
+    app: *App,
+    call: RowCall,
+    disposition: render_helpers.ExternalRowDisposition,
+    flush_generation: u64,
+) void {
+    const grid_id = call.grid_id;
+    const row_start = call.row_start;
+    const row_count = call.row_count;
+    const verts_ptr = call.verts_ptr;
+    const vert_count = call.vert_count;
+    const total_rows = call.total_rows;
+    const total_cols = call.total_cols;
+
+    // Find or create pending entry for this grid_id
+    var found_idx: ?usize = null;
+    for (app.pending_external_verts.items, 0..) |*pv, i| {
+        if (pv.grid_id == grid_id) {
+            found_idx = i;
+            break;
+        }
+    }
+
+    // Handle cursor update for pending entries. Store the cursor in the
+    // dedicated cursor_verts buffer (same as the live ext_win path),
+    // NOT baked into row/flat content. Baking left a stale cursor block
+    // in the row that was never erased once the window existed: later
+    // cursor-only updates do not re-send the row's content, so the old
+    // block kept being drawn under the new shape-aware overlay cursor.
+    if (disposition == .pending_cursor) {
+        // Every cursor update re-reads the blink cadence (see the
+        // live external path above).
+        if (app.hwnd) |hwnd| _ = c.PostMessageW(hwnd, app_mod.WM_APP_UPDATE_CURSOR_BLINK, 0, 0);
+        if (found_idx) |idx| {
+            const pv = &app.pending_external_verts.items[idx];
+            if (verts_ptr != null and vert_count != 0) {
+                // Reserve BEFORE clearing so an OOM keeps the old
+                // cursor capture intact (the pending entry is the
+                // ONLY copy — the window does not exist yet).
+                pv.surface.cursor_verts.ensureTotalCapacity(app.alloc, vert_count) catch {
+                    failFlush(app);
+                    return;
+                };
+                pv.surface.cursor_verts.clearRetainingCapacity();
+                pv.surface.cursor_verts.appendSliceAssumeCapacity(verts_ptr.?[0..vert_count]);
+                pv.surface.last_cursor_row = row_start;
+            } else {
+                pv.surface.cursor_verts.clearRetainingCapacity();
+                pv.surface.last_cursor_row = null;
+            }
+            pv.flush_generation = flush_generation;
+        }
+        // No pending entry yet means no content rows either; cursor alone is not useful.
+        return;
+    }
+
+    if (found_idx) |idx| {
+        // Update existing pending entry. rows/cols are committed
+        // AFTER the content update succeeds — the keep-old failure
+        // paths below must not pair the old capture with new dims.
+        const pv = &app.pending_external_verts.items[idx];
+        if (row_count == 0) {
+            // A zero-cell layout: no row content survives.
+            _ = pv.surface.truncateRows(app.alloc, 0);
+        } else if (row_count == 1) {
+            _ = pv.surface.truncateRows(app.alloc, total_rows);
+            if (!storeSurfaceRowVerts(app.alloc, &pv.surface.row_verts, row_start, verts_ptr, vert_count)) {
+                // OOM mid-frame: rows updated earlier this flush mix
+                // with older rows — the entry is no longer a
+                // consistent frame, and onFlushEnd's TBS cancel does
+                // NOT roll pending buffers back. Discard the entry so
+                // window creation shows nothing rather than a mixed
+                // frame; the abort keeps core dirty and the next
+                // flush rebuilds the pending capture from scratch.
+                var dropped = app.pending_external_verts.swapRemove(idx);
+                dropped.deinit(app.alloc);
+                failFlush(app);
+                return;
+            }
+        }
+        pv.surface.rows = total_rows;
+        pv.surface.cols = total_cols;
+        pv.flush_generation = flush_generation;
+        pv.metrics_gen = app.shared_metrics_gen;
+    } else {
+        // Create new pending entry
+        var new_pv = app_mod.PendingExternalVertices{
+            .grid_id = grid_id,
+            .flush_generation = flush_generation,
+            .metrics_gen = app.shared_metrics_gen,
+            .surface = .{ .rows = total_rows, .cols = total_cols },
+        };
+        if (row_count == 1) {
+            if (!storeSurfaceRowVerts(app.alloc, &new_pv.surface.row_verts, row_start, verts_ptr, vert_count)) {
+                // Free the partially built entry (row storage may
+                // have been resized before the failure).
+                new_pv.deinit(app.alloc);
+                failFlush(app);
+                return;
+            }
+        }
+        app.pending_external_verts.append(app.alloc, new_pv) catch {
+            // The freshly built pending entry is dropped — release
+            // its buffers and abort so the core re-sends.
+            var dropped = new_pv;
+            dropped.deinit(app.alloc);
+            failFlush(app);
+            return;
+        };
+    }
+
+    if (call.log_verbose) applog.appLog(
+        "[win] on_vertices_row external grid_id={d} stored in pending_external_verts\n",
+        .{grid_id},
+    );
+}
+
+/// grid 1's rows, including its layout-only and seed bookkeeping. Under app.mu.
+fn storeMainRootRowLocked(app: *App, call: RowCall) void {
+    const row_start = call.row_start;
+    const row_count = call.row_count;
+    const verts_ptr = call.verts_ptr;
+    const vert_count = call.vert_count;
+    const flags = call.flags;
+    const total_rows = call.total_rows;
+    const total_cols = call.total_cols;
+    const log_verbose = call.log_verbose;
+
+    const disposition = render_helpers.mainRowDisposition(.{
+        .main = call.is_main_update,
         .row_start = row_start,
         .row_count = row_count,
         .vert_count = vert_count,

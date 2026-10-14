@@ -268,10 +268,17 @@ pub const Router = struct {
             if (r.filter.matches(event, kind, line_count)) return resolve(r);
         }
         const defaults = defaultRoutes(self.views);
-        for (defaults) |r| {
+        for (defaults[0 .. defaults.len - 1]) |r| {
             if (r.filter.matches(event, kind, line_count)) return resolve(r);
         }
-        unreachable; // the default tail has an empty filter
+        // The tail is the catch-all; taken without consulting its filter, so
+        // a route is total by construction.
+        comptime {
+            const tail = defaultRoutes(.{})[default_route_count - 1].filter;
+            std.debug.assert(tail.event == null and tail.kinds == null and tail.min_height == null and
+                tail.max_height == null and tail.level == null);
+        }
+        return resolve(defaults[defaults.len - 1]);
     }
 
     fn resolve(r: MsgRoute) RouteResult {

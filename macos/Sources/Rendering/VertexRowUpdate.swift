@@ -1,7 +1,8 @@
 /// What one on_vertices_row callback updates, decoded by the core's rule
 /// (zonvie_core_row_update, zonvie_frontend.h): MAIN replaces the rows,
-/// CURSOR without MAIN is cursor-only, and neither leaves both layers as they
-/// were. The Windows frontend consumes the same rule.
+/// CURSOR without MAIN is cursor-only. The core sets exactly one; `none` is
+/// only the decode of a word it never sends. The Windows frontend reads the
+/// raw bits and asserts that instead.
 enum VertexRowUpdate: Equatable {
     case main, cursorOnly, none
 

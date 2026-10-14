@@ -18,12 +18,15 @@ const COLS = 4;
 const HL_COUNT = 16;
 /// Grid 2 is an external window, grid 3 a split covering the main window.
 const GRIDS = [_]i64{ 2, 3 };
+/// grid_cursor_goto targets: the global grid and both window grids.
+const CURSOR_GRIDS = [_]i64{ 1, 2, 3 };
+const CursorPos = struct { grid: i64, row: u32, col: u32 };
 
 /// The cells as the spec defines them; only the highlight reaches vertices in
 /// the test Core (it has no glyph callbacks).
 const Cells = [GRIDS.len][ROWS][COLS]u32;
 
-fn setupCore(core: *Core) !void {
+fn setupCore(core: *Core, cursor: ?CursorPos) !void {
     var id: u32 = 1;
     while (id <= HL_COUNT) : (id += 1) {
         try core.hl.define(id, null, 0x100000 * id + 0x40, null, false, 0, .{}, false);
@@ -44,7 +47,8 @@ fn setupCore(core: *Core) !void {
     core.drawable_h_px = ROWS;
     core.cell_w_px = 1;
     core.cell_h_px = 1;
-    core.grid.cursor_visible = false;
+    core.grid.cursor_visible = cursor != null;
+    if (cursor) |c| core.grid.setCursor(c.grid, c.row, c.col);
 }
 
 fn put(core: *Core, cells: *Cells, gi: usize, row: u32, col: u32, hl: u32) void {
@@ -78,10 +82,10 @@ fn scroll(core: *Core, cells: *Cells, rng: std.Random, gi: usize, top: u32, bot:
 }
 
 /// What a consumer holds after a fresh Core draws `cells` from scratch.
-fn reference(cells: *const Cells) !struct { core: Core, model: Model } {
+fn reference(cells: *const Cells, cursor: ?CursorPos) !struct { core: Core, model: Model } {
     var core = Core.initForTest(std.testing.allocator);
     errdefer core.deinitForTest();
-    try setupCore(&core);
+    try setupCore(&core, cursor);
     for (cells, 0..) |g, gi| {
         for (g, 0..) |row, r| {
             for (row, 0..) |hl, c| core.grid.putCellGrid(GRIDS[gi], @intCast(r), @intCast(c), 'a' + hl, hl);
@@ -96,8 +100,12 @@ fn reference(cells: *const Cells) !struct { core: Core, model: Model } {
     return .{ .core = core, .model = model };
 }
 
-fn expectMatchesReference(m: *const Model, cells: *const Cells, seed: u64, step: usize) !void {
-    var ref = try reference(cells);
+fn expectMatchesReference(m: *const Model, cells: *const Cells, cursor: ?CursorPos, seed: u64, step: usize) !void {
+    if (m.cursorOwnerMismatch(if (cursor) |c| c.grid else null)) |why| {
+        std.debug.print("seed {x} step {d}: {s}\n", .{ seed, step, why });
+        return error.ModelDiffersFromSpec;
+    }
+    var ref = try reference(cells, cursor);
     defer {
         ref.model.deinit();
         ref.core.deinitForTest();
@@ -117,15 +125,18 @@ fn expectMatchesReference(m: *const Model, cells: *const Cells, seed: u64, step:
 
 /// Paths a sequence took, so the test can fail when the generator stops
 /// reaching the ones it exists for.
-const Reached = struct { shifts: u32 = 0, refusals: u32 = 0, checks: u32 = 0 };
+const Reached = struct { shifts: u32 = 0, refusals: u32 = 0, checks: u32 = 0, cursor_moves: u32 = 0 };
 
-fn runSequence(seed: u64, steps: usize, reached: *Reached) !void {
+/// `with_cursor`: the cursor is visible and grid_cursor_goto is mixed in;
+/// the cursor layer is then judged like the rows.
+fn runSequence(seed: u64, steps: usize, with_cursor: bool, reached: *Reached) !void {
     var prng = std.Random.DefaultPrng.init(seed);
     const rng = prng.random();
 
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
-    try setupCore(&core);
+    var cursor: ?CursorPos = if (with_cursor) .{ .grid = 2, .row = 0, .col = 0 } else null;
+    try setupCore(&core, cursor);
     var cells: Cells = undefined;
     for (&cells, 0..) |*g, gi| {
         for (g, 0..) |*row, r| {
@@ -141,7 +152,7 @@ fn runSequence(seed: u64, steps: usize, reached: *Reached) !void {
 
     for (0..steps) |step| {
         const gi = rng.uintLessThan(usize, GRIDS.len);
-        switch (rng.uintLessThan(u32, 10)) {
+        switch (rng.uintLessThan(u32, if (with_cursor) 11 else 10)) {
             0...2 => put(&core, &cells, gi, rng.uintLessThan(u32, ROWS), rng.uintLessThan(u32, COLS), rng.intRangeAtMost(u32, 1, HL_COUNT)),
             3...4 => {
                 // Full width: the shape the row shift carries.
@@ -160,6 +171,16 @@ fn runSequence(seed: u64, steps: usize, reached: *Reached) !void {
             },
             6 => m.refuse_next = true,
             7 => c_api.forceResendAll(&core),
+            10 => {
+                const c = CursorPos{
+                    .grid = CURSOR_GRIDS[rng.uintLessThan(usize, CURSOR_GRIDS.len)],
+                    .row = rng.uintLessThan(u32, ROWS),
+                    .col = rng.uintLessThan(u32, COLS),
+                };
+                core.grid.setCursor(c.grid, c.row, c.col);
+                cursor = c;
+                reached.cursor_moves += 1;
+            },
             else => {
                 const refusals = m.refusals;
                 try flush_ctx.onFlush(ROWS, COLS);
@@ -169,7 +190,7 @@ fn runSequence(seed: u64, steps: usize, reached: *Reached) !void {
                 }
                 // A refused bracket leaves the old frame on screen by design.
                 if (m.refusals == refusals) {
-                    try expectMatchesReference(&m, &cells, seed, step);
+                    try expectMatchesReference(&m, &cells, cursor, seed, step);
                     reached.checks += 1;
                 }
             },
@@ -179,7 +200,7 @@ fn runSequence(seed: u64, steps: usize, reached: *Reached) !void {
     m.refuse_next = false;
     try flush_ctx.onFlush(ROWS, COLS);
     try std.testing.expect(m.violation == null);
-    try expectMatchesReference(&m, &cells, seed, steps);
+    try expectMatchesReference(&m, &cells, cursor, seed, steps);
     reached.shifts += m.shifts;
     reached.refusals += m.refusals;
 }
@@ -188,10 +209,22 @@ test "random redraw sequences keep the consumer on the spec's cells" {
     var reached: Reached = .{};
     for (0..4) |i| {
         const seed = std.testing.random_seed +% i;
-        runSequence(seed, 200, &reached) catch |err| {
+        runSequence(seed, 200, false, &reached) catch |err| {
             std.debug.print("failing sequence seed {x}\n", .{seed});
             return err;
         };
     }
     try std.testing.expect(reached.shifts > 0 and reached.refusals > 0 and reached.checks > 0);
+}
+
+test "random redraw sequences with cursor moves keep the cursor layer on the spec's grid" {
+    var reached: Reached = .{};
+    for (0..4) |i| {
+        const seed = std.testing.random_seed +% i;
+        runSequence(seed, 200, true, &reached) catch |err| {
+            std.debug.print("failing cursor sequence seed {x}\n", .{seed});
+            return err;
+        };
+    }
+    try std.testing.expect(reached.cursor_moves > 0 and reached.checks > 0);
 }
