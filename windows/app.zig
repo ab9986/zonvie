@@ -13,7 +13,7 @@ const builtin = @import("builtin");
 pub const config_mod = @import("config.zig");
 const render_pipeline_helpers = @import("render_pipeline_helpers.zig");
 const external_windows = @import("ui/external_windows.zig");
-const scroll_ease = @import("scroll_ease.zig");
+const scroll_ease = core.scroll_ease;
 pub const PaintRetryState = render_pipeline_helpers.PaintRetryState;
 
 // Re-export core types used across modules
@@ -2255,7 +2255,7 @@ pub const GridEase = struct {
 
         if (!s_.moving()) self.dropRetained();
         self.easing = was_moving or s_.moving();
-        self.offset_px = @floatCast(s_.offset_px);
+        self.offset_px = @floatCast(s_.spring.offset_px);
     }
 
     /// Keep the buffers of the rows a scroll pushes out of the region, before
@@ -3910,7 +3910,7 @@ pub const LayerFramePlanParams = struct {
 
 /// What a frame's smooth scroll reads once for every layer.
 pub const LayerEaseInput = struct {
-    now_ns: i128,
+    now_ns: i64,
     /// 'mousescroll' ver, read live: it caps every arrival.
     mousescroll_ver: i32,
     large_jump: scroll_ease.LargeJumpBehavior,
@@ -3919,12 +3919,9 @@ pub const LayerEaseInput = struct {
     /// keeps current.
     pub fn of(app: *App) LayerEaseInput {
         return .{
-            .now_ns = core.clock.nowNs(),
+            .now_ns = @intCast(core.clock.nowNs()),
             .mousescroll_ver = @intCast(@min(core.zonvie_core_get_mousescroll_ver(app.corep), 32)),
-            .large_jump = switch (app.config.scroll.large_jump_behavior) {
-                .partial => .partial,
-                .snap => .snap,
-            },
+            .large_jump = app.config.scroll.large_jump_behavior,
         };
     }
 };

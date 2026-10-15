@@ -2,10 +2,6 @@ const std = @import("std");
 const core = @import("zonvie_core");
 const helpers = @import("render_pipeline_helpers.zig");
 
-test {
-    _ = @import("scroll_ease.zig");
-}
-
 test "retry delay doubles and saturates" {
     try std.testing.expectEqual(@as(u32, 32), helpers.nextBackoffDelayMs(16, 2000));
     try std.testing.expectEqual(@as(u32, 2000), helpers.nextBackoffDelayMs(1024, 2000));

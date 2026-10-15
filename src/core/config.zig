@@ -245,10 +245,7 @@ pub const Config = struct {
     ///   Falls back to overlay outside insert/replace modes (e.g. cmdline).
     pub const PreeditMode = enum(u8) { overlay = 0, extmark = 1 };
 
-    /// What a scroll batch larger than one wheel event ('mousescroll' ver)
-    /// does: `snap` lands it without easing, so page motion (CTRL-D) jumps as
-    /// on macOS; `partial` eases its capped part and lands the excess at once.
-    pub const LargeJumpBehavior = enum(u8) { partial = 0, snap = 1 };
+    pub const LargeJumpBehavior = @import("scroll_ease.zig").LargeJumpBehavior;
 
     pub const ScrollConfig = struct {
         large_jump_behavior: LargeJumpBehavior = .snap,

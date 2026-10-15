@@ -18,6 +18,7 @@ const pointer_target = @import("pointer_target.zig");
 const scrollbar_metrics = @import("scrollbar_metrics.zig");
 const frontend_rules = @import("frontend_rules.zig");
 const glow_chain = @import("glow_chain.zig");
+const scroll_ease = @import("scroll_ease.zig");
 
 const pairs = .{
     .{ c.zonvie_glyph_entry, c_api.GlyphEntry },
@@ -47,6 +48,7 @@ const pairs = .{
     .{ c.zonvie_saved_origin, frontend_rules.SavedOrigin },
     .{ c.zonvie_placement_memory, frontend_rules.PlacementMemory },
     .{ c.zonvie_blink, frontend_rules.Blink },
+    .{ c.zonvie_scroll_spring, scroll_ease.Spring },
     .{ c.zonvie_viewport_info, c_api.ViewportInfo },
     .{ c.zonvie_glow_pass, glow_chain.Pass },
     .{ c.zonvie_glow_chain, glow_chain.Chain },

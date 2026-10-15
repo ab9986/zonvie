@@ -2,12 +2,16 @@
 //! behind, and which scrolled-off rows stay drawable to fill the band it
 //! opens. Std-only, so the tests run on every host.
 //!
-//! Every grid_scroll a layer commits seeds its ease, whatever produced it
+//! Every grid_scroll a grid commits seeds its ease, whatever produced it
 //! (wheel, keys, scrollbar, a command), so there is one animation path. The
 //! offset is how far the content is still drawn from where the committed rows
 //! put it: positive draws it lower. A critically damped spring brings it back
 //! to zero, keeping its velocity across arrivals so a steady stream of
 //! scrolls moves at a steady speed instead of stepping at every arrival.
+//!
+//! `Spring` is what both frontends share through the C ABI
+//! (zonvie_scroll_spring in include/zonvie_frontend.h); `Ease` adds the
+//! bookkeeping a frontend that seeds from row-scroll regions needs.
 
 const std = @import("std");
 
@@ -19,7 +23,10 @@ pub const epsilon_px: f64 = 1.0;
 /// one ease may cover, since past it the band has nothing left to show.
 pub const retention_depth_rows: i32 = 8;
 
-pub const LargeJumpBehavior = enum { partial, snap };
+/// What a scroll batch larger than one wheel event ('mousescroll' ver)
+/// does: `snap` lands it without easing, so page motion (CTRL-D) jumps;
+/// `partial` eases its capped part and lands the excess at once.
+pub const LargeJumpBehavior = enum(u8) { partial = 0, snap = 1 };
 
 /// Rows an arrival may animate: 'mousescroll' ver, the rows one wheel event
 /// is worth, bounded by what retention can fill. ver 0 animates nothing.
@@ -38,30 +45,21 @@ pub fn admitsSeed(rows_delta: i32, live_ver: i32, mode: LargeJumpBehavior) bool 
     };
 }
 
-pub const Ease = struct {
+/// One grid's eased offset. Layout must match `zonvie_scroll_spring`.
+pub const Spring = extern struct {
     offset_px: f64 = 0,
     velocity_px_s: f64 = 0,
-    /// The previous tick, or 0 at rest so the first tick after a seed
-    /// integrates nothing: a seed must not be decayed over the idle time
-    /// before it arrived.
-    last_tick_ns: i128 = 0,
-    /// The row height the offset was built with; another one voids it.
-    row_h_px: i32 = 0,
-    /// The scroll region of the latest seed, half-open, in grid rows. Rows
-    /// outside it (a winbar) do not move.
-    region_start: u32 = 0,
-    region_end: u32 = 0,
+    /// The previous tick on a monotonic clock, or 0 at rest so the first
+    /// tick after a seed integrates nothing: a seed must not be decayed over
+    /// the idle time before it arrived.
+    last_tick_ns: i64 = 0,
 
-    pub fn moving(self: *const Ease) bool {
+    pub fn moving(self: *const Spring) bool {
         return self.offset_px != 0 or self.velocity_px_s != 0;
     }
 
-    pub fn reset(self: *Ease) void {
-        self.* = .{};
-    }
-
     /// Advance to `now_ns`. Runs before this frame's seed.
-    pub fn tick(self: *Ease, now_ns: i128) void {
+    pub fn tick(self: *Spring, now_ns: i64) void {
         if (!self.moving()) {
             self.last_tick_ns = 0;
             return;
@@ -78,9 +76,7 @@ pub const Ease = struct {
         const next_x = (x + a * dt_s) * f;
         const next_v = (v - a * spring_omega * dt_s) * f;
         if (@abs(next_x) < epsilon_px and @abs(next_v) < spring_omega * epsilon_px) {
-            self.offset_px = 0;
-            self.velocity_px_s = 0;
-            self.last_tick_ns = 0;
+            self.* = .{};
             return;
         }
         self.offset_px = next_x;
@@ -91,28 +87,20 @@ pub const Ease = struct {
     /// moved up) as offset, so the picture starts where it was. The sum is
     /// clamped to the cap; velocity is kept, unless the offset changes sign,
     /// where momentum toward the old side would overshoot. Returns whether
-    /// the ease took it.
+    /// the spring took it.
     pub fn seed(
-        self: *Ease,
-        now_ns: i128,
+        self: *Spring,
+        now_ns: i64,
         rows_delta: i32,
         row_h_px: i32,
-        region_start: u32,
-        region_end: u32,
         live_ver: i32,
         mode: LargeJumpBehavior,
     ) bool {
-        if (row_h_px <= 0 or region_end <= region_start) return false;
+        if (row_h_px <= 0) return false;
         // A refused batch leaves an ease in flight alone: clearing it would
         // collapse the offset in one frame whenever a scrollbar drag mixes
         // batches on both sides of the threshold.
         if (!admitsSeed(rows_delta, live_ver, mode)) return false;
-        if (self.row_h_px != row_h_px or self.region_start != region_start or self.region_end != region_end) {
-            self.reset();
-            self.row_h_px = row_h_px;
-            self.region_start = region_start;
-            self.region_end = region_end;
-        }
         const h: f64 = @floatFromInt(row_h_px);
         const limit = @as(f64, @floatFromInt(animatedCapRows(live_ver))) * h;
         const prev = self.offset_px;
@@ -121,6 +109,47 @@ pub const Ease = struct {
         self.offset_px = next;
         if (self.last_tick_ns == 0) self.last_tick_ns = now_ns;
         return true;
+    }
+};
+
+/// A spring seeded from row-scroll regions: another row height or region
+/// voids the offset, which was built against the old one.
+pub const Ease = struct {
+    spring: Spring = .{},
+    row_h_px: i32 = 0,
+    /// The scroll region of the latest seed, half-open, in grid rows. Rows
+    /// outside it (a winbar) do not move.
+    region_start: u32 = 0,
+    region_end: u32 = 0,
+
+    pub fn moving(self: *const Ease) bool {
+        return self.spring.moving();
+    }
+
+    pub fn reset(self: *Ease) void {
+        self.* = .{};
+    }
+
+    pub fn tick(self: *Ease, now_ns: i64) void {
+        self.spring.tick(now_ns);
+    }
+
+    pub fn seed(
+        self: *Ease,
+        now_ns: i64,
+        rows_delta: i32,
+        row_h_px: i32,
+        region_start: u32,
+        region_end: u32,
+        live_ver: i32,
+        mode: LargeJumpBehavior,
+    ) bool {
+        if (row_h_px <= 0 or region_end <= region_start) return false;
+        if (!admitsSeed(rows_delta, live_ver, mode)) return false;
+        if (self.row_h_px != row_h_px or self.region_start != region_start or self.region_end != region_end) {
+            self.* = .{ .row_h_px = row_h_px, .region_start = region_start, .region_end = region_end };
+        }
+        return self.spring.seed(now_ns, rows_delta, row_h_px, live_ver, mode);
     }
 };
 
@@ -145,33 +174,33 @@ fn expectNear(actual: f64, expected: f64, tolerance: f64) !void {
     try std.testing.expect(@abs(actual - expected) <= tolerance);
 }
 
-test "an ease settles to rest and then stays there" {
-    var e: Ease = .{};
-    try std.testing.expect(e.seed(1, 4, 20, 0, 30, 8, .partial));
-    try expectNear(e.offset_px, 80, 0);
-    var now: i128 = 1;
+test "a spring settles to rest and then stays there" {
+    var s: Spring = .{};
+    try std.testing.expect(s.seed(1, 4, 20, 8, .partial));
+    try expectNear(s.offset_px, 80, 0);
+    var now: i64 = 1;
     var frames: usize = 0;
-    while (e.moving()) : (frames += 1) {
+    while (s.moving()) : (frames += 1) {
         now += std.time.ns_per_s / 60;
-        e.tick(now);
+        s.tick(now);
         try std.testing.expect(frames < 60);
     }
     // About 200 ms at 60 Hz.
     try std.testing.expect(frames >= 8 and frames <= 20);
-    try std.testing.expectEqual(@as(i128, 0), e.last_tick_ns);
-    e.tick(now + std.time.ns_per_s);
-    try std.testing.expect(!e.moving());
+    try std.testing.expectEqual(@as(i64, 0), s.last_tick_ns);
+    s.tick(now + std.time.ns_per_s);
+    try std.testing.expect(!s.moving());
 }
 
 test "the first tick after a seed integrates nothing" {
-    var e: Ease = .{};
-    _ = e.seed(5 * std.time.ns_per_s, 1, 20, 0, 30, 3, .partial);
-    e.tick(5 * std.time.ns_per_s);
-    try expectNear(e.offset_px, 20, 0);
+    var s: Spring = .{};
+    _ = s.seed(5 * std.time.ns_per_s, 1, 20, 3, .partial);
+    s.tick(5 * std.time.ns_per_s);
+    try expectNear(s.offset_px, 20, 0);
 }
 
 test "the spring does not depend on the frame rate" {
-    var a: Ease = .{ .offset_px = 64, .velocity_px_s = -11, .last_tick_ns = 1 };
+    var a: Spring = .{ .offset_px = 64, .velocity_px_s = -11, .last_tick_ns = 1 };
     var b = a;
     a.tick(1 + 10 * std.time.ns_per_ms);
     a.tick(1 + 20 * std.time.ns_per_ms);
@@ -181,59 +210,62 @@ test "the spring does not depend on the frame rate" {
 }
 
 test "arrivals add offset and keep velocity" {
-    var e: Ease = .{ .offset_px = 4, .velocity_px_s = 17, .last_tick_ns = 1, .row_h_px = 20, .region_end = 30 };
-    try std.testing.expect(e.seed(2, 2, 20, 0, 30, 8, .partial));
-    try expectNear(e.offset_px, 44, 0);
-    try expectNear(e.velocity_px_s, 17, 0);
+    var s: Spring = .{ .offset_px = 4, .velocity_px_s = 17, .last_tick_ns = 1 };
+    try std.testing.expect(s.seed(2, 2, 20, 8, .partial));
+    try expectNear(s.offset_px, 44, 0);
+    try expectNear(s.velocity_px_s, 17, 0);
 }
 
 test "an arrival that flips the sign drops the velocity" {
-    var e: Ease = .{ .offset_px = -60, .velocity_px_s = 17, .last_tick_ns = 1, .row_h_px = 20, .region_end = 30 };
-    try std.testing.expect(e.seed(2, 20, 20, 0, 30, 3, .partial));
-    try expectNear(e.offset_px, 60, 0);
-    try expectNear(e.velocity_px_s, 0, 0);
+    var s: Spring = .{ .offset_px = -60, .velocity_px_s = 17, .last_tick_ns = 1 };
+    try std.testing.expect(s.seed(2, 20, 20, 3, .partial));
+    try expectNear(s.offset_px, 60, 0);
+    try expectNear(s.velocity_px_s, 0, 0);
 }
 
 test "the offset is capped by mousescroll ver and by retention depth" {
-    var e: Ease = .{};
-    _ = e.seed(1, 9, 20, 0, 30, 3, .partial);
-    try expectNear(e.offset_px, 60, 0);
-    e.reset();
-    _ = e.seed(1, -20, 20, 0, 30, 32, .partial);
-    try expectNear(e.offset_px, -160, 0);
+    var s: Spring = .{};
+    _ = s.seed(1, 9, 20, 3, .partial);
+    try expectNear(s.offset_px, 60, 0);
+    s = .{};
+    _ = s.seed(1, -20, 20, 32, .partial);
+    try expectNear(s.offset_px, -160, 0);
 }
 
 test "ver 0 animates nothing" {
-    var e: Ease = .{};
-    try std.testing.expect(!e.seed(1, 1, 20, 0, 30, 0, .partial));
-    try std.testing.expect(!e.moving());
+    var s: Spring = .{};
+    try std.testing.expect(!s.seed(1, 1, 20, 0, .partial));
+    try std.testing.expect(!s.moving());
 }
 
 test "snap refuses a batch past one wheel event and keeps an ease in flight" {
-    var e: Ease = .{ .offset_px = 20, .velocity_px_s = -30, .last_tick_ns = 1, .row_h_px = 20, .region_end = 30 };
-    try std.testing.expect(!e.seed(2, 4, 20, 0, 30, 3, .snap));
-    try expectNear(e.offset_px, 20, 0);
-    try expectNear(e.velocity_px_s, -30, 0);
-    try std.testing.expect(e.seed(2, -3, 20, 0, 30, 3, .snap));
+    var s: Spring = .{ .offset_px = 20, .velocity_px_s = -30, .last_tick_ns = 1 };
+    try std.testing.expect(!s.seed(2, 4, 20, 3, .snap));
+    try expectNear(s.offset_px, 20, 0);
+    try expectNear(s.velocity_px_s, -30, 0);
+    try std.testing.expect(s.seed(2, -3, 20, 3, .snap));
 }
 
 test "a new row height or region voids the old offset" {
-    var e: Ease = .{ .offset_px = 40, .velocity_px_s = 5, .last_tick_ns = 1, .row_h_px = 20, .region_end = 30 };
+    var e: Ease = .{ .spring = .{ .offset_px = 40, .velocity_px_s = 5, .last_tick_ns = 1 }, .row_h_px = 20, .region_end = 30 };
     _ = e.seed(2, 1, 22, 0, 30, 3, .partial);
-    try expectNear(e.offset_px, 22, 0);
-    try expectNear(e.velocity_px_s, 0, 0);
+    try expectNear(e.spring.offset_px, 22, 0);
+    try expectNear(e.spring.velocity_px_s, 0, 0);
+    e = .{ .spring = .{ .offset_px = 40, .velocity_px_s = 5, .last_tick_ns = 1 }, .row_h_px = 20, .region_end = 30 };
+    _ = e.seed(2, 1, 20, 0, 30, 3, .partial);
+    try expectNear(e.spring.velocity_px_s, 5, 0);
 }
 
 test "a steady stream of arrivals never jumps a row in one frame" {
-    var e: Ease = .{};
-    var now: i128 = 1;
+    var s: Spring = .{};
+    var now: i64 = 1;
     var previous: f64 = 0;
     for (0..180) |frame| {
         now += std.time.ns_per_s / 60;
-        e.tick(now);
-        if (frame % 6 == 0 and frame / 6 < 30) _ = e.seed(now, 1, 20, 0, 30, 8, .partial);
-        if (frame > 12) try std.testing.expect(@abs(e.offset_px - previous) <= 20);
-        previous = e.offset_px;
+        s.tick(now);
+        if (frame % 6 == 0 and frame / 6 < 30) _ = s.seed(now, 1, 20, 8, .partial);
+        if (frame > 12) try std.testing.expect(@abs(s.offset_px - previous) <= 20);
+        previous = s.offset_px;
     }
 }
 

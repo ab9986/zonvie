@@ -21,6 +21,7 @@ pub const flush_mod = @import("flush.zig");
 pub const render_layout = @import("render_layout.zig");
 pub const row_scroll = @import("row_scroll.zig");
 pub const damage_bands = @import("damage_bands.zig");
+pub const scroll_ease = @import("scroll_ease.zig");
 pub const cursor_rect = @import("cursor_rect.zig");
 pub const win_layout = @import("win_layout.zig");
 const msg_stack = @import("msg_stack.zig");
@@ -37,6 +38,7 @@ test {
     _ = @import("consumer_model.zig");
     _ = @import("redraw_fuzz_test.zig");
     _ = damage_bands;
+    _ = scroll_ease;
 }
 
 // Decoration flags (must match ZONVIE_DECO_* in zonvie_core.h)
@@ -2119,6 +2121,30 @@ pub export fn zonvie_blink_tick(b: *BlinkC) callconv(.c) u32 {
 
 pub export fn zonvie_blink_stop(b: *BlinkC) callconv(.c) void {
     b.stop();
+}
+
+pub export fn zonvie_scroll_spring_tick(s: *scroll_ease.Spring, now_ns: i64) callconv(.c) void {
+    s.tick(now_ns);
+}
+
+pub export fn zonvie_scroll_spring_seed(
+    s: *scroll_ease.Spring,
+    now_ns: i64,
+    rows_delta: i32,
+    row_h_px: i32,
+    mousescroll_ver: i32,
+    large_jump: u8,
+) callconv(.c) bool {
+    return s.seed(now_ns, rows_delta, row_h_px, mousescroll_ver, largeJump(large_jump));
+}
+
+pub export fn zonvie_scroll_ease_admits(rows_delta: i32, mousescroll_ver: i32, large_jump: u8) callconv(.c) bool {
+    return scroll_ease.admitsSeed(rows_delta, mousescroll_ver, largeJump(large_jump));
+}
+
+/// An unknown value is the default, snap.
+fn largeJump(v: u8) scroll_ease.LargeJumpBehavior {
+    return if (v == @intFromEnum(scroll_ease.LargeJumpBehavior.partial)) .partial else .snap;
 }
 
 /// Plan a window-layout operation (win_move / win_exchange / win_rotate /
