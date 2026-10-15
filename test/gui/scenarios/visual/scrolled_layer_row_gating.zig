@@ -179,8 +179,9 @@ pub fn run(alloc: std.mem.Allocator) !void {
         return error.NoLayerDraws;
     }
 
-    // The scroll itself: more than one row, so no ease seed is staged and the
-    // grid is never displaced. That is the shape that leaked.
+    // The scroll itself: multi-row steps, the shape that leaked. They ease
+    // under the default 'mousescroll', so retention is installed and must be
+    // pruned once the ease settles.
     const t_scroll = try app_log.nowMs(alloc, log_path);
     const topline_before = try g.evalInt("luaeval('vim.fn.line(\"w0\")')");
     var step: usize = 0;

@@ -22,7 +22,6 @@
 // as on total loss.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const driver = @import("../../driver.zig");
 const fixture = @import("fixture.zig");
 const visual = @import("../../visual.zig");
@@ -146,20 +145,11 @@ fn runPhase(
             std.debug.print("[gui] every shift was refused by the draw; the blit this guards never ran\n", .{});
             return error.ScrollBlitDidNotRun;
         }
-    } else if (builtin.os.tag == .windows) {
-        // Windows has no smooth-scroll ease, so nothing refuses a one-row
-        // blit as "smooth": the single phase must blit too.
-        const blits = try app_log.countLinesSince(alloc, log_path, "[layer_blit] gridId=", t_scroll);
-        std.debug.print("[gui] continuous_j_scroll_matches_jump[single]: blits accepted {d} (need 1)\n", .{blits});
-        if (blits == 0) {
-            std.debug.print("[gui] every shift was refused by the draw; the blit this guards never ran\n", .{});
-            return error.ScrollBlitDidNotRun;
-        }
     } else {
         // A held key's single-row steps must also seed the smooth-scroll ease,
         // or each row lands as a jump instead of easing in. The seed is staged
-        // only for |rowsDelta| == 1, so it belongs to this phase alone — the
-        // burst coalesces past it by design. Only one is required: the shift
+        // only for |rowsDelta| <= 'mousescroll' ver, so it belongs to this
+        // phase alone — the burst coalesces past it. Only one is required: the shift
         // count above already tolerates hints this scenario cannot pin down to
         // one row, and the failure this guards is the producer being
         // disconnected, which yields zero.

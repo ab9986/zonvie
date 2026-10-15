@@ -141,6 +141,9 @@ pub fn run(alloc: std.mem.Allocator) !void {
     try g.exec("execute('set laststatus=0 noruler noshowcmd showtabline=0 scrolloff=0 nowrap noswapfile')");
     // A blinking cursor alone produces a false diff between the two captures.
     try g.exec("execute('set guicursor=a:block-blinkon0')");
+    // A scroll of up to 'mousescroll' ver rows eases, and an eased frame
+    // refuses the blit; the 3-row steps below must stay past it.
+    try g.exec("execute('set mousescroll=ver:1')");
 
     // Every line differs across the full width, so a wrongly shifted row shows
     // instead of matching whatever it landed on.

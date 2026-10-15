@@ -2249,6 +2249,7 @@ pub const GridEase = struct {
             if (grid_id >= 2 and whole and
                 s_.seed(ein.now_ns, s.rows_delta, row_h_px, s.row_start, s.row_end, ein.mousescroll_ver, ein.large_jump))
             {
+                if (applog.isEnabled()) applog.appLog("[smooth_scroll_seed] gridId={d} rowsDelta={d}\n", .{ grid_id, s.rows_delta });
                 self.retainScrolledOut(row_vbs, s);
             }
         }
