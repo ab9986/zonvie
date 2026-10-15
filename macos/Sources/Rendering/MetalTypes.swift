@@ -263,13 +263,13 @@ struct RetainedScrollRow {
 /// class never calls back into them — but must then always take the two in
 /// that order.
 final class ScrollRetention {
-    /// The keyboard ease is clamped to two rows, so two retained rows always
-    /// cover its band. A trackpad gesture raises the depth to a wheel event's
-    /// worth of rows ('mousescroll' ver), which is how wide its band gets.
+    /// The ease covers at most a wheel event's worth of rows ('mousescroll'
+    /// ver; zonvie_scroll_spring_seed), so the depth follows ver. Never below
+    /// two, which a ver of 1 still needs while a held key outruns the ease.
     static let minDepthRows = 2
-    /// A wheel event worth more rows than this leaves part of its band to the
-    /// edge stretch.
-    static let maxDepthRows = 4
+    /// The spring's own cap (min(ver, 8) rows): a band no ease can open is
+    /// never retained for.
+    static let maxDepthRows = 8
     /// Round-robin over more buffers than can be live at once, so a capture
     /// never overwrites vertices a frame is still reading. Retained buffers
     /// are bound straight to the encoder and are not tracked by any in-flight
@@ -321,6 +321,7 @@ final class ScrollRetention {
     /// Grids the cap dropped rows for, since the caller last took them.
     private var evictedGrids: [Int64] = []
     private var depth = ScrollRetention.minDepthRows
+    private var ver = 0
 
     init(device: MTLDevice) {
         self.device = device
@@ -345,7 +346,16 @@ final class ScrollRetention {
         let clamped = Self.depthRows(forBandRows: rows)
         lock.lock()
         depth = clamped
+        ver = rows
         lock.unlock()
+    }
+
+    /// The 'mousescroll' ver the depth was last set from, unclamped: what
+    /// decides whether a scroll is seeded (stageSurfaceEaseSeed).
+    var mousescrollVer: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return ver
     }
 
     // MARK: - Flush lifecycle

@@ -652,22 +652,26 @@ func captureSurfaceLayerScrollStep(
     }
 
     if stepped {
-        stageSurfaceEaseSeed(gridId: gridId, rowsDelta: rowsDelta, lock: lock,
+        stageSurfaceEaseSeed(gridId: gridId, rowsDelta: rowsDelta,
+                             mousescrollVer: retention.mousescrollVer, lock: lock,
                              stagedSmoothScrollSeeds: &stagedSmoothScrollSeeds)
     }
     return stepped
 }
 
-/// Stage the sub-row ease seed for a retention step that was taken. Only a
-/// single-row step can be eased; anything larger lands whole. Every surface
-/// that seeds goes through here.
+/// Stage the sub-row ease seed for a retention step that was taken. A step of
+/// up to one wheel event's worth of rows ('mousescroll' ver) is eased; a
+/// larger one (page motion) lands whole — the core's rule, shared with
+/// Windows. Every surface that seeds goes through here.
 func stageSurfaceEaseSeed(
     gridId: Int64,
     rowsDelta: Int,
+    mousescrollVer: Int,
     lock: NSLock,
     stagedSmoothScrollSeeds: inout [(gridId: Int64, rowsDelta: Int)]
 ) {
-    guard abs(rowsDelta) == 1 else { return }
+    guard zonvie_scroll_ease_admits(Int32(clamping: rowsDelta), Int32(clamping: mousescrollVer),
+                                    UInt8(ZONVIE_LARGE_JUMP_SNAP)) else { return }
     lock.lock()
     stagedSmoothScrollSeeds.append((gridId: gridId, rowsDelta: rowsDelta))
     lock.unlock()

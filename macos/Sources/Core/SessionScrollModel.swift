@@ -165,25 +165,6 @@ final class SessionScrollModel {
     /// eases to epsilon in ~250ms.
     private static let scrollBounceDecayPerFrame: CGFloat = 0.75
 
-    /// Per-60fps-frame decay factor for the keyboard sub-row ease. Neovim
-    /// delivers whole rows, and the moment one lands drifts by a few ms
-    /// against the frame clock, so occasionally a frame gets none and the next
-    /// gets two. Holding the picture back by the scrolled distance and easing
-    /// it forward turns that into fractional motion. Steady-state lag is
-    /// h * d / (1 - d) — one row at 0.5, which is the price of covering the
-    /// jitter without reading as an animation.
-    ///
-    /// `ZONVIE_SMOOTH_SCROLL_DECAY` overrides it (0 < d < 1) so the ease can be
-    /// slowed until it is visible — at 0.5 it is deliberately too fast to read
-    /// as motion, which makes "is it animating at all?" impossible to answer by
-    /// eye. Values near 0.9 make one step take about half a second. The offset
-    /// is still clamped to what the retention ring covers, so a very slow decay
-    /// holds at that ceiling rather than easing from further away.
-    private static let smoothScrollDecayPerFrame: CGFloat = {
-        guard let raw = ProcessInfo.processInfo.environment["ZONVIE_SMOOTH_SCROLL_DECAY"],
-              let d = Double(raw), d > 0, d < 1 else { return 0.5 }
-        return CGFloat(d)
-    }()
 
     /// Rows each scrolled window's content has travelled upwards, accumulated
     /// from on_grid_scroll. Paired with the renderer's per-layer placement
@@ -224,7 +205,12 @@ final class SessionScrollModel {
     private var externalEaseGridScratch: Set<Int64> = []
     /// Snapshot of smoothScrollGrids for the decay loop, which removes from it.
     private var easeDecayScratch: [Int64] = []
-    private var lastSmoothScrollTickTime: CFAbsoluteTime = 0
+    /// The keyboard ease's spring per grid (zonvie_scroll_spring, the core's,
+    /// shared with Windows). Only its velocity and clock are kept here: the
+    /// offset is `scrollOffsetPx`, which other owners also write, and is
+    /// re-read every tick. Meaningful only for grids in smoothScrollGrids.
+    /// Guarded by scrollOffsetLock.
+    private var easeSprings: [Int64: zonvie_scroll_spring] = [:]
 
     /// Maximum visual overscroll (rubber-band depth), in cells. Shared by the
     /// renderer clamp (clampVisualScrollOffsetPx) and the rubber-band
@@ -1257,22 +1243,24 @@ final class SessionScrollModel {
         // to avoid deadlock when this is called from Zig thread (which holds grid_mu).
     }
 
-    /// Seed and decay the keyboard sub-row scroll ease. Seeding first and
-    /// decaying second settles at one row of lag; decaying first would settle
-    /// at two, which is past what the retention ring can cover.
+    /// Advance and seed the keyboard sub-row scroll ease: the core's spring
+    /// (zonvie_scroll_spring), the one Windows runs. Each grid's spring is
+    /// ticked before this frame's seed lands, so a seed is never decayed over
+    /// the idle time before it arrived.
     private func tickSmoothScroll() {
         guard GridSurfaceRenderer.smoothScrollEnabled, let renderer else { return }
         let rowHeightPx = CGFloat(renderer.cellHeightPx)
         guard rowHeightPx > 0 else { return }
 
         let now = CFAbsoluteTimeGetCurrent()
-        let elapsedFrames = lastSmoothScrollTickTime > 0
-            ? min(max((now - lastSmoothScrollTickTime) * 60.0, 0.0), 3.0)
-            : 1.0
-        lastSmoothScrollTickTime = now
+        let nowNs = Int64(clamping: DispatchTime.now().uptimeNanoseconds)
+        let ver = core?.getMouseScrollVer() ?? 0
+        // The band an eased step opens is as wide as a wheel event's rows, the
+        // most a seed can cover.
+        renderer.setRetentionDepthRows(ver)
 
-        // A seed exists only for a single-row step whose outgoing row was
-        // retained — the shape a held key produces. Page motion and
+        // A seed exists only for a step of up to 'mousescroll' ver rows whose
+        // outgoing rows were retained (stageSurfaceEaseSeed). Page motion and
         // non-fast-path redraws seed nothing and simply land where they land;
         // rows may still be retained for them, but with no offset to show
         // them in, the draw path prunes them unused.
@@ -1324,6 +1312,19 @@ final class SessionScrollModel {
 
         scrollOffsetLock.lock()
         let maxOffsetPx = rowHeightPx * CGFloat(renderer.retentionDepthRows)
+
+        // Tick before seeding. The offset is re-read: a gesture or a clear may
+        // have written it since the last tick.
+        easeDecayScratch.removeAll(keepingCapacity: true)
+        easeDecayScratch.append(contentsOf: smoothScrollGrids)
+        for gridId in easeDecayScratch {
+            var spring = easeSprings[gridId] ?? zonvie_scroll_spring()
+            spring.offset_px = Double(scrollOffsetPx[gridId] ?? 0)
+            zonvie_scroll_spring_tick(&spring, nowNs)
+            easeSprings[gridId] = spring
+            scrollOffsetPx[gridId] = CGFloat(spring.offset_px)
+        }
+
         for (gridId, rowsDelta) in seedScratch where rowsDelta != 0 {
             // A gesture-owned grid is already square: its rows were cancelled
             // against the distance the notification reported, which exists for
@@ -1334,11 +1335,17 @@ final class SessionScrollModel {
                   !gestureLookaheadGrids.contains(gridId),
                   !reconciledThisTick.contains(gridId) else { continue }
             // Content moved up by rowsDelta rows, so draw it that much lower
-            // and let the decay below carry it up over the next few frames.
-            // Not clamped here: the clamp belongs after the decay, or a frame
-            // that lands two rows at once has its whole jump clipped straight
-            // back onto the glass — the exact case the ease exists for.
-            scrollOffsetPx[gridId] = (scrollOffsetPx[gridId] ?? 0) + CGFloat(rowsDelta) * rowHeightPx
+            // and let the spring carry it up over the next few frames. A grid
+            // new to the ease starts its spring at rest: a velocity left from
+            // an earlier ease belongs to motion that is over.
+            var spring = smoothScrollGrids.contains(gridId)
+                ? (easeSprings[gridId] ?? zonvie_scroll_spring()) : zonvie_scroll_spring()
+            spring.offset_px = Double(scrollOffsetPx[gridId] ?? 0)
+            guard zonvie_scroll_spring_seed(&spring, nowNs, Int32(clamping: rowsDelta),
+                                            Int32(clamping: Int(rowHeightPx.rounded())), Int32(clamping: ver),
+                                            UInt8(ZONVIE_LARGE_JUMP_SNAP)) else { continue }
+            easeSprings[gridId] = spring
+            scrollOffsetPx[gridId] = CGFloat(spring.offset_px)
             smoothScrollGrids.insert(gridId)
         }
         // A payment is only good against the seed published alongside it, so
@@ -1351,26 +1358,30 @@ final class SessionScrollModel {
         // finger did not consume is handed to the ease: the row it stands for
         // has already been scrolled, so the picture animates the rest of the way
         // instead of sitting part-way into a row.
+        // The handed-over offset starts its spring at rest; the next tick
+        // starts its clock.
         if !gestureActive, !gestureLookaheadGrids.isEmpty {
             for gridId in gestureLookaheadGrids {
+                if !smoothScrollGrids.contains(gridId) { easeSprings[gridId] = zonvie_scroll_spring() }
                 smoothScrollGrids.insert(gridId)
             }
             gestureLookaheadGrids.removeAll(keepingCapacity: true)
         }
 
         if !smoothScrollGrids.isEmpty {
-            let decay = CGFloat(pow(Double(Self.smoothScrollDecayPerFrame), elapsedFrames))
             easeDecayScratch.removeAll(keepingCapacity: true)
             easeDecayScratch.append(contentsOf: smoothScrollGrids)
             for gridId in easeDecayScratch {
                 // Clamped to what the drawing surface's retention can cover:
                 // past that the vacated band has no row to show.
                 let limitPx = externalEaseGridScratch.contains(gridId) ? externalMaxOffsetPx : maxOffsetPx
-                let decayed = (scrollOffsetPx[gridId] ?? 0) * decay
-                let eased = max(-limitPx, min(limitPx, decayed))
-                if abs(eased) < Self.scrollOffsetEpsilon {
+                let offset = scrollOffsetPx[gridId] ?? 0
+                let eased = max(-limitPx, min(limitPx, offset))
+                let spring = easeSprings[gridId] ?? zonvie_scroll_spring()
+                if eased == 0 && spring.velocity_px_s == 0 {
                     scrollOffsetPx.removeValue(forKey: gridId)
                     smoothScrollGrids.remove(gridId)
+                    easeSprings.removeValue(forKey: gridId)
                 } else {
                     scrollOffsetPx[gridId] = eased
                 }

@@ -1466,7 +1466,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             // ease was already holding an offset — that one owes one. The
             // tick drops a seed for a grid a gesture owns.
             if isRoot, captured {
-                stageSurfaceEaseSeed(gridId: id, rowsDelta: pending.rowsDelta, lock: lock,
+                stageSurfaceEaseSeed(gridId: id, rowsDelta: pending.rowsDelta,
+                                     mousescrollVer: retention.mousescrollVer, lock: lock,
                                      stagedSmoothScrollSeeds: &stagedSmoothScrollSeeds)
             }
         }
