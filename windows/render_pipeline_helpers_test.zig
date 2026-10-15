@@ -2134,3 +2134,57 @@ test "pending scroll never stores a shift the paint cannot negate" {
     try std.testing.expect(helpers.accumulatePendingScroll(0, 0, std.math.minInt(i32) + 1, -1) == null);
     try std.testing.expect(helpers.accumulatePendingScroll(std.math.minInt(i32) + 1, -1, 0, 0) == null);
 }
+
+// Viewport-local top of a root row's slot drawn at `row` with a smooth-scroll
+// offset: what D3D clips against [0, viewport height].
+fn rootRowLocalTopPx(shift: helpers.RootRowShift, origin_row: i32, h_px: i32, ease_offset_px: f32) f32 {
+    return @as(f32, @floatFromInt(origin_row * h_px)) + shift.transform_dy_px + ease_offset_px;
+}
+
+test "a root row lands on its own row whether or not it eases" {
+    for ([_]bool{ false, true }) |eased| {
+        const s = helpers.rootRowShift(@floatFromInt(-3 * row_h_px), eased);
+        try std.testing.expectEqual(@as(f32, -60), s.viewport_dy_px + s.transform_dy_px);
+    }
+    // At rest the root keeps its viewport shift; only an eased row moves it
+    // into the transform.
+    try std.testing.expectEqual(@as(f32, -60), helpers.rootRowShift(-60, false).viewport_dy_px);
+    try std.testing.expectEqual(@as(f32, 0), helpers.rootRowShift(-60, true).viewport_dy_px);
+}
+
+test "an eased root row inside the grid is never outside its viewport" {
+    // Every slot origin, every row it may have moved to, every offset up to
+    // the ease's cap in either direction: wherever the row is drawn inside
+    // the grid, the viewport it is drawn under must hold it, or D3D clips it
+    // in whole-row bands the scissor cannot explain.
+    const rows: i32 = 12;
+    const grid_h_px: f32 = @floatFromInt(rows * row_h_px);
+    const cap_px: i32 = 8 * row_h_px;
+    var origin: i32 = 0;
+    while (origin < rows) : (origin += 1) {
+        var row: i32 = 0;
+        while (row < rows) : (row += 1) {
+            var off: i32 = -cap_px;
+            while (off <= cap_px) : (off += 5) {
+                const offset_px: f32 = @floatFromInt(off);
+                const row_top_px: f32 = @floatFromInt(row * row_h_px);
+                const drawn_top = row_top_px + offset_px;
+                if (drawn_top < 0 or drawn_top + @as(f32, @floatFromInt(row_h_px)) > grid_h_px) continue;
+                const s = helpers.rootRowShift(@floatFromInt((row - origin) * row_h_px), true);
+                const local = rootRowLocalTopPx(s, origin, row_h_px, offset_px);
+                try std.testing.expect(local >= 0);
+                try std.testing.expect(local + @as(f32, @floatFromInt(row_h_px)) <= grid_h_px);
+            }
+        }
+    }
+}
+
+test "a shifted viewport clips an eased edge slot" {
+    // Why eased rows leave the viewport alone: the last row's slot, moved up
+    // three rows and eased back down by them, is drawn inside the grid but
+    // past the bottom of a viewport shifted with it.
+    const rows: i32 = 12;
+    const s = helpers.rootRowShift(@floatFromInt(-3 * row_h_px), false);
+    const local = rootRowLocalTopPx(s, rows - 1, row_h_px, @floatFromInt(3 * row_h_px));
+    try std.testing.expect(local + @as(f32, @floatFromInt(row_h_px)) > @as(f32, @floatFromInt(rows * row_h_px)));
+}

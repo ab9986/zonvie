@@ -1038,6 +1038,25 @@ pub fn mainContentRightPx(content_width: ?u32, client_w: u32, x_offset: u32, sid
     return @intCast(x_offset + contentViewportWidthPx(content_width orelse client_w, x_offset, sidebar_right_w));
 }
 
+/// Where a root row's slot shift (row - slot.origin_row, in pixels) is
+/// applied. At rest the root shifts its viewport, as it always has; layers
+/// shift through the transform instead. A smooth-scroll offset added on top
+/// of a shifted viewport carries a slot near the grid's edge past that
+/// viewport, and D3D clips it there regardless of the scissor. So an eased row
+/// shifts through the transform, as a layer row does, under the unshifted
+/// viewport.
+pub const RootRowShift = struct {
+    viewport_dy_px: f32,
+    transform_dy_px: f32,
+};
+
+pub fn rootRowShift(row_dy_px: f32, eased: bool) RootRowShift {
+    return if (eased)
+        .{ .viewport_dy_px = 0, .transform_dy_px = row_dy_px }
+    else
+        .{ .viewport_dy_px = row_dy_px, .transform_dy_px = 0 };
+}
+
 pub const MainWindowSnap = struct {
     outer_w: i32,
     outer_h: i32,

@@ -2876,6 +2876,7 @@ fn drawMainRowFrame(
             .cursor_grid = cursor.grid,
             .cursor_rows = cursor.erase_rows,
         },
+        .ease = app_mod.LayerEaseInput.of(app),
         .frame = .{
             .root_grid_id = 1,
             .layers = &.{},
@@ -3037,6 +3038,10 @@ fn drawMainRowFrame(
             tbs_snapshot.layers.len,
         },
     );
+
+    // A smooth scroll still moving needs the next frame; the vblank-paced
+    // present keeps this loop at the display rate.
+    if (pass.ease_moving) _ = c.InvalidateRect(hwnd, null, c.FALSE);
 
     // --- Present ---
     var render_ok = false;

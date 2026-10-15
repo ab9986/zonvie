@@ -13,6 +13,7 @@ const builtin = @import("builtin");
 pub const config_mod = @import("config.zig");
 const render_pipeline_helpers = @import("render_pipeline_helpers.zig");
 const external_windows = @import("ui/external_windows.zig");
+const scroll_ease = @import("scroll_ease.zig");
 pub const PaintRetryState = render_pipeline_helpers.PaintRetryState;
 
 // Re-export core types used across modules
@@ -2171,6 +2172,151 @@ pub const RowVB = struct {
     // Upload is needed when uploaded_slot != mapping.slot or uploaded_ver != slot.ver.
     uploaded_slot: u16 = SLOT_NONE,
     uploaded_ver: u64 = 0,
+    /// What the buffer holds, so it can still be drawn once its slot is gone:
+    /// a scrolled-off row kept for smooth scrolling.
+    uploaded_len: usize = 0,
+    uploaded_origin_row: u32 = 0,
+};
+
+/// A row that scrolled out of a grid, kept drawable while a smooth scroll
+/// still shows the band it left. `row` is the grid row it now sits at,
+/// outside the scroll region.
+pub const RetainedRow = struct {
+    rvb: RowVB = .{},
+    row: i32 = 0,
+    live: bool = false,
+};
+
+/// One grid's smooth scroll on the surface that draws it (scroll_ease.zig),
+/// with the rows it keeps for the band the offset opens. UI thread only.
+pub const GridEase = struct {
+    spring: scroll_ease.Ease = .{},
+    /// This frame draws the grid eased: its whole scroll region, at
+    /// `offset_px`. The frame that brings the ease to rest is one too, so the
+    /// last offset drawn is zero.
+    easing: bool = false,
+    offset_px: f32 = 0,
+    /// Rows that scrolled out, on both sides of the region. Their buffers
+    /// came from the grid's row buffers and count toward the same bytes.
+    retained: [2 * scroll_ease.retention_depth_rows]RetainedRow = @splat(.{}),
+
+    pub fn moving(self: *const GridEase) bool {
+        return self.spring.moving();
+    }
+
+    /// The scroll region the offset moves, clamped to `row_limit`; empty when
+    /// nothing is eased.
+    pub fn region(self: *const GridEase, row_limit: usize) [2]u32 {
+        if (!self.easing) return .{ 0, 0 };
+        return .{
+            @intCast(@min(self.spring.region_start, row_limit)),
+            @intCast(@min(self.spring.region_end, row_limit)),
+        };
+    }
+
+    /// Advance the ease and settle whether this frame draws the grid eased.
+    /// `scroll` is what the grid committed since the last paint; `row_vbs`
+    /// must not have followed it yet, since the rows it pushes out are taken
+    /// from them. `whole` says the scroll is of the grid's current size: one
+    /// committed at another size cannot be given back and lands at once.
+    ///
+    /// Grid 1 never eases: it is the root, holding chrome and messages, and
+    /// reserved negative ids are UI the core owns.
+    fn plan(
+        self: *GridEase,
+        grid_id: i64,
+        scroll: ?LayerScroll,
+        whole: bool,
+        row_vbs: []RowVB,
+        row_limit: usize,
+        ein: LayerEaseInput,
+        row_h_px: i32,
+    ) void {
+        const s_ = &self.spring;
+        const was_moving = s_.moving();
+        s_.tick(ein.now_ns);
+        if (s_.row_h_px != 0 and (s_.row_h_px != row_h_px or s_.region_end > row_limit)) s_.reset();
+
+        if (scroll) |s| {
+            // Rows kept beside another region mean nothing beside this one.
+            if (s.row_start != s_.region_start or s.row_end != s_.region_end) self.dropRetained();
+            // Rows already kept travel with every scroll of the region.
+            for (&self.retained) |*r| {
+                if (!r.live) continue;
+                r.row = scroll_ease.shiftedRow(r.row, s.rows_delta);
+                r.live = scroll_ease.keepsRetained(r.row, s.row_start, s.row_end);
+            }
+            if (grid_id >= 2 and whole and
+                s_.seed(ein.now_ns, s.rows_delta, row_h_px, s.row_start, s.row_end, ein.mousescroll_ver, ein.large_jump))
+            {
+                self.retainScrolledOut(row_vbs, s);
+            }
+        }
+
+        if (!s_.moving()) self.dropRetained();
+        self.easing = was_moving or s_.moving();
+        self.offset_px = @floatCast(s_.offset_px);
+    }
+
+    /// Keep the buffers of the rows a scroll pushes out of the region, before
+    /// shiftRowVBs hands them to the band it vacated. Each swaps with a free
+    /// retained entry, so the byte total does not change.
+    fn retainScrolledOut(self: *GridEase, row_vbs: []RowVB, s: LayerScroll) void {
+        const shift: u32 = @intCast(@abs(s.rows_delta));
+        const first: u32 = if (s.rows_delta > 0) s.row_start else s.row_end - shift;
+        const end: usize = @min(@as(usize, first + shift), row_vbs.len);
+        var r: usize = first;
+        while (r < end) : (r += 1) {
+            const rvb = &row_vbs[r];
+            if (rvb.vb == null or rvb.uploaded_slot == SLOT_NONE or rvb.uploaded_len == 0) continue;
+            const row = scroll_ease.shiftedRow(@intCast(r), s.rows_delta);
+            if (!scroll_ease.keepsRetained(row, s.row_start, s.row_end)) continue;
+            const entry = for (&self.retained) |*e| {
+                if (!e.live) break e;
+            } else return;
+            const spare = entry.rvb;
+            entry.* = .{ .rvb = rvb.*, .row = row, .live = true };
+            rvb.* = .{ .vb = spare.vb, .vb_bytes = spare.vb_bytes };
+        }
+    }
+
+    /// Retained rows stop being drawn; their buffers stay for the next capture.
+    fn dropRetained(self: *GridEase) void {
+        for (&self.retained) |*r| r.live = false;
+    }
+
+    /// Draw the retained rows at the offset, under the scissor already set.
+    /// Returns how many failed.
+    fn drawRetained(self: *const GridEase, g: *d3d11.Renderer, origin_x: f32, origin_y: f32, w: f32, h: f32, row_h_px: i32) u32 {
+        var failed: u32 = 0;
+        for (&self.retained) |*r| {
+            if (!r.live) continue;
+            const vb = r.rvb.vb orelse continue;
+            const row_dy: f32 = @floatFromInt((r.row - @as(i32, @intCast(r.rvb.uploaded_origin_row))) * row_h_px);
+            g.setLayerTransformScrolled(origin_x, origin_y + row_dy, w, h, self.offset_px) catch {
+                failed += 1;
+                continue;
+            };
+            g.drawVB(vb, r.rvb.uploaded_len) catch {
+                failed += 1;
+            };
+        }
+        return failed;
+    }
+
+    fn release(self: *GridEase, budget: *RowVBPhysicalBudget, retained_bytes: *usize) void {
+        for (&self.retained) |*r| releaseRowVBs((&r.rvb)[0..1], budget, retained_bytes);
+        self.* = .{};
+    }
+
+    /// Device loss: hand out one retained buffer without calling COM.
+    fn detachOne(self: *GridEase) ?DetachedRowVB {
+        for (&self.retained) |*r| {
+            r.live = false;
+            if (detachOneRowVB((&r.rvb)[0..1])) |d| return d;
+        }
+        return null;
+    }
 };
 
 pub const RowVBPhysicalBudget = render_pipeline_helpers.RowVBPhysicalBudget;
@@ -2355,11 +2501,14 @@ pub const LayerPaintState = struct {
     /// Layer-local, like everything the layer transform draws.
     blit_clear_band: ?struct { top_px: i32, bottom_px: i32 } = null,
     last_drawn_rows: usize = 0,
+    /// The layer's smooth scroll; its buffers count toward the layer's.
+    ease: GridEase = .{},
 
     /// Release this state's buffers and free the entry for another grid.
     fn release(self: *LayerPaintState, budget: *RowVBPhysicalBudget, retained_bytes: *usize) void {
         releaseRowVBs(self.row_vbs.items, budget, retained_bytes);
         self.row_vbs.items.len = 0;
+        self.ease.release(budget, retained_bytes);
         if (self.draw_rows.bit_length > 0) self.draw_rows.unsetAll();
         self.grid_id = 0;
         self.draw_all = false;
@@ -2432,12 +2581,25 @@ pub const SurfacePaintState = struct {
     /// (planLayerFrame), reused so a paint does not allocate.
     damage_spans: std.ArrayListUnmanaged(core.damage_bands.Band) = .empty,
     bands: std.ArrayListUnmanaged(core.damage_bands.Band) = .empty,
+    /// The root grid's smooth scroll; its buffers count toward the root's.
+    /// Only an external window's root ever eases (GridEase.plan).
+    root_ease: GridEase = .{},
 
     pub fn layerState(self: *SurfacePaintState, grid_id: i64) ?*LayerPaintState {
         for (self.layers.items) |*s| {
             if (s.grid_id == grid_id) return s;
         }
         return null;
+    }
+
+    /// Some layer's smooth scroll has not come to rest: the surface owes
+    /// another frame even with nothing else to draw.
+    pub fn easeMoving(self: *const SurfacePaintState) bool {
+        if (self.root_ease.moving()) return true;
+        for (self.layers.items) |*s| {
+            if (s.grid_id != 0 and s.ease.moving()) return true;
+        }
+        return false;
     }
 
     /// Give every non-root layer of `layers` a paint state and free the states
@@ -2478,6 +2640,7 @@ pub const SurfacePaintState = struct {
         self.layers.deinit(alloc);
         self.damage_spans.deinit(alloc);
         self.bands.deinit(alloc);
+        self.root_ease.release(row_vb_budget, &self.row_vb_retained_bytes);
         releaseRowVBs(self.row_vbs.items, row_vb_budget, &self.row_vb_retained_bytes);
         self.row_vbs.deinit(alloc);
         self.scroll_rows_merge_scratch.deinit(alloc);
@@ -2582,8 +2745,10 @@ pub const WindowSurface = struct {
     /// holds app.mu.
     pub fn detachOneRecoveryVB(self: *WindowSurface) ?RecoveryVB {
         if (detachOneRowVB(self.paint.row_vbs.items)) |d| return .{ .buffer = d.buffer, .row_bytes = d.bytes };
+        if (self.paint.root_ease.detachOne()) |d| return .{ .buffer = d.buffer, .row_bytes = d.bytes };
         for (self.paint.layers.items) |*s| {
             if (detachOneRowVB(s.row_vbs.items)) |d| return .{ .buffer = d.buffer, .row_bytes = d.bytes, .layer = true };
+            if (s.ease.detachOne()) |d| return .{ .buffer = d.buffer, .row_bytes = d.bytes, .layer = true };
         }
         if (self.paint.cursor_vb) |vb| {
             self.paint.cursor_vb = null;
@@ -2843,6 +3008,8 @@ pub fn ensureRowVBReadyFromSlot(
         try g.uploadVertsToVB(vb.vb.?, src);
         vb.uploaded_slot = mapping.slot;
         vb.uploaded_ver = slot.ver;
+        vb.uploaded_len = src.len;
+        vb.uploaded_origin_row = slot.origin_row;
         return true;
     }
 
@@ -3047,6 +3214,10 @@ pub fn drawSurfaceRowsVBFromSlots(
     layer_origin_y_px: f32,
     /// See RowModeDrawParams.root_rows_may_be_empty.
     root_rows_may_be_empty: bool,
+    /// Set for rows of an eased scroll region: the caller set the region's
+    /// scissor and cleared it once, so each row is drawn at this offset with
+    /// neither, its pixels straddling row boundaries.
+    ease_offset_px: ?f32,
     log_enabled: bool,
     metrics: *SurfaceRowDrawMetrics,
 ) !void {
@@ -3080,6 +3251,11 @@ pub fn drawSurfaceRowsVBFromSlots(
 
         const slot = pool.slotPtrConst(mapping.slot);
         const src = slot.verts.items;
+        if (src.len == 0 and ease_offset_px != null) {
+            // The region's clear already left this row empty.
+            metrics.drawn_rows += 1;
+            continue;
+        }
         if (src.len == 0) {
             // Core sends vert_count==0 as "clear row" (flush.zig:2904).
             // Overwrite the band with the background so stale pixels go and
@@ -3140,6 +3316,7 @@ pub fn drawSurfaceRowsVBFromSlots(
             metrics.vb_upload_rows_bytes += @as(u64, @intCast(need_bytes));
         }
 
+        const row_shift = render_pipeline_helpers.rootRowShift(slotRowShiftPx(slot, row, row_h_px), ease_offset_px != null);
         if (ctx_ptr != null and rs_set_sc_fn != null and row_h_px > 0) {
             const top = y_offset + @as(i32, @intCast(row)) * row_h_px;
             const bottom = top + row_h_px;
@@ -3149,17 +3326,13 @@ pub fn drawSurfaceRowsVBFromSlots(
                 .right = content_right,
                 .bottom = bottom,
             };
-            rs_set_sc_fn.?(ctx_ptr, 1, &sc);
+            if (ease_offset_px == null) rs_set_sc_fn.?(ctx_ptr, 1, &sc);
 
             if (rs_set_vp_fn) |vp_fn| {
-                const origin_i32: i32 = @intCast(slot.origin_row);
-                const row_i32: i32 = @intCast(row);
-                const row_delta = row_i32 - origin_i32;
-                if (row_delta != 0) {
-                    const delta_px: f32 = @floatFromInt(row_delta * row_h_px);
+                if (row_shift.viewport_dy_px != 0) {
                     var vp: c.D3D11_VIEWPORT = .{
                         .TopLeftX = base_vp.x,
-                        .TopLeftY = base_vp.y + delta_px,
+                        .TopLeftY = base_vp.y + row_shift.viewport_dy_px,
                         .Width = base_vp.w,
                         .Height = base_vp.h,
                         .MinDepth = 0,
@@ -3196,7 +3369,7 @@ pub fn drawSurfaceRowsVBFromSlots(
         // (Only when a scissor limits the band to this row; the seed path
         // draws every row under a full-area scissor and a whole-surface
         // overwrite there would erase rows already drawn.)
-        if ((g.opacity < 1.0 or g.blur_enabled) and rs_set_sc_fn != null) {
+        if ((g.opacity < 1.0 or g.blur_enabled) and rs_set_sc_fn != null and ease_offset_px == null) {
             g.drawClearRowOverwrite() catch {
                 metrics.skipped_empty += 1;
                 metrics.failed_rows += 1;
@@ -3205,7 +3378,7 @@ pub fn drawSurfaceRowsVBFromSlots(
         }
         // Core row vertices are grid-local pixels against this viewport,
         // offset by where the layer sits inside it.
-        g.setLayerTransform(layer_origin_x_px, layer_origin_y_px, base_vp.w, base_vp.h) catch {
+        g.setLayerTransformScrolled(layer_origin_x_px, layer_origin_y_px + row_shift.transform_dy_px, base_vp.w, base_vp.h, ease_offset_px orelse 0) catch {
             metrics.skipped_empty += 1;
             metrics.failed_rows += 1;
             continue;
@@ -3300,30 +3473,75 @@ pub fn drawRowModeSetupAndRowsFromSlots(
         }
     }
 
-    try drawSurfaceRowsVBFromSlots(
-        g,
-        budget,
-        surface_retained_bytes,
-        row_map,
-        pool,
-        row_vbs,
-        rows_to_draw,
-        if (params.use_row_scissor) result.ctx_ptr else null,
-        if (params.use_row_scissor) result.rs_set_sc_fn else null,
-        if (params.use_row_scissor) rs_set_vp_fn else null,
-        base_vp,
-        params.x_offset,
-        params.y_offset,
-        params.content_right,
-        params.row_h_px,
-        params.layer_origin_x_px,
-        params.layer_origin_y_px,
-        params.root_rows_may_be_empty,
-        log_enabled,
-        &result.metrics,
-    );
+    // An eased root draws its scroll region apart: one scissor and one clear
+    // for the whole region, every row and retained row at the offset.
+    const eased_region: ?[2]u32 = blk: {
+        const ease = params.root_ease orelse break :blk null;
+        if (!params.use_row_scissor or result.rs_set_sc_fn == null) break :blk null;
+        const r = ease.region(row_map.len);
+        break :blk if (r[1] > r[0]) r else null;
+    };
+    const split: [2]usize = if (eased_region) |r| .{
+        std.sort.lowerBound(u32, rows_to_draw, r[0], orderU32),
+        std.sort.lowerBound(u32, rows_to_draw, r[1], orderU32),
+    } else .{ rows_to_draw.len, rows_to_draw.len };
+    const parts = [3][]const u32{ rows_to_draw[0..split[0]], rows_to_draw[split[0]..split[1]], rows_to_draw[split[1]..] };
+
+    for (parts, 0..) |part, pi| {
+        const eased = pi == 1 and eased_region != null;
+        if (eased) {
+            const r = eased_region.?;
+            var sc: c.D3D11_RECT = .{
+                .left = params.x_offset,
+                .top = params.y_offset + @as(i32, @intCast(r[0])) * params.row_h_px,
+                .right = params.content_right,
+                .bottom = params.y_offset + @as(i32, @intCast(r[1])) * params.row_h_px,
+            };
+            result.rs_set_sc_fn.?(result.ctx_ptr, 1, &sc);
+            g.drawClearRowOverwrite() catch {
+                result.metrics.failed_rows += 1;
+                return result;
+            };
+        }
+        if (part.len == 0 and !eased) continue;
+        try drawSurfaceRowsVBFromSlots(
+            g,
+            budget,
+            surface_retained_bytes,
+            row_map,
+            pool,
+            row_vbs,
+            part,
+            if (params.use_row_scissor) result.ctx_ptr else null,
+            if (params.use_row_scissor) result.rs_set_sc_fn else null,
+            if (params.use_row_scissor) rs_set_vp_fn else null,
+            base_vp,
+            params.x_offset,
+            params.y_offset,
+            params.content_right,
+            params.row_h_px,
+            params.layer_origin_x_px,
+            params.layer_origin_y_px,
+            params.root_rows_may_be_empty,
+            if (eased) params.root_ease.?.offset_px else null,
+            log_enabled,
+            &result.metrics,
+        );
+        if (eased) result.metrics.failed_rows += params.root_ease.?.drawRetained(
+            g,
+            params.layer_origin_x_px,
+            params.layer_origin_y_px,
+            base_vp.w,
+            base_vp.h,
+            params.row_h_px,
+        );
+    }
 
     return result;
+}
+
+fn orderU32(key: u32, item: u32) std.math.Order {
+    return std.math.order(key, item);
 }
 
 /// Detach one device-bound row buffer held by a grid drawn as a layer. These
@@ -3563,6 +3781,8 @@ pub const RowModeDrawParams = struct {
     content_x_offset: ?u32 = null,
     sidebar_right_width: ?u32 = null,
     tabbar_bg_color: ?[4]f32 = null,
+    /// The root grid's smooth scroll, when this frame draws it eased.
+    root_ease: ?*const GridEase = null,
 
     /// Compute bloom viewport from these params.
     pub fn bloomViewport(self: RowModeDrawParams, renderer_width: u32) struct { x: u32, y: u32, w: u32, h: u32 } {
@@ -3683,7 +3903,30 @@ pub const LayerFramePlanParams = struct {
     /// when the root did not shift. Every pixel inside it moved, including the
     /// layers drawn there, while the root only redraws the band it vacated.
     root_scroll_rect: ?c.RECT = null,
+    /// Smooth scrolling for this frame; null draws every layer at rest.
+    ease: ?LayerEaseInput = null,
     log_enabled: bool,
+};
+
+/// What a frame's smooth scroll reads once for every layer.
+pub const LayerEaseInput = struct {
+    now_ns: i128,
+    /// 'mousescroll' ver, read live: it caps every arrival.
+    mousescroll_ver: i32,
+    large_jump: scroll_ease.LargeJumpBehavior,
+
+    /// This frame's input. Lock-free: ver is an atomic the core's reporter
+    /// keeps current.
+    pub fn of(app: *App) LayerEaseInput {
+        return .{
+            .now_ns = core.clock.nowNs(),
+            .mousescroll_ver = @intCast(@min(core.zonvie_core_get_mousescroll_ver(app.corep), 32)),
+            .large_jump = switch (app.config.scroll.large_jump_behavior) {
+                .partial => .partial,
+                .snap => .snap,
+            },
+        };
+    }
 };
 
 /// Half-open, clamped to the set's length, so a caller working in layout rows
@@ -3781,6 +4024,14 @@ pub fn planLayerFrame(
         state.blit_clear_band = null;
         state.draw_scroll = if (dmg) |d| d.scroll else null;
         state.draw_blit_rect = null;
+        state.ease.easing = false;
+        if (p.ease) |ein| {
+            const whole = if (state.draw_scroll) |s| s.total_rows == layer.rows and s.total_cols == layer.cols else false;
+            state.ease.plan(layer.grid_id, state.draw_scroll, whole, state.row_vbs.items, row_limit, ein, h);
+        }
+        // An eased frame moves every row of the layer, which no copy of the
+        // previous frame's pixels can serve.
+        if (state.ease.easing) state.draw_all = true;
         // The row buffers follow the slots through the shift, so the rows
         // that only moved are not uploaded again.
         if (state.draw_scroll) |s| shiftRowVBs(state.row_vbs.items, s.rows_delta, s.row_start, s.row_end);
@@ -4016,16 +4267,13 @@ fn drawLayerRow(
     ri: usize,
     d: LayerRowDrawCtx,
 ) LayerRowOutcome {
-    if (d.rs_set_sc_fn) |f| {
-        const top = d.y_offset + d.layer.y_px + @as(i32, @intCast(ri)) * d.row_h_px;
-        var sc: c.D3D11_RECT = .{
-            .left = @max(d.x_offset, d.x_offset + d.layer.x_px),
-            .top = top,
-            .right = @min(d.content_right, d.x_offset + d.layer.x_px + d.layer_w_px),
-            .bottom = top + d.row_h_px,
-        };
-        if (sc.right <= sc.left or sc.bottom <= sc.top) return .{ .encoded = false };
-        f(d.ctx_ptr, 1, &sc);
+    // An eased row is drawn under its region's scissor, which drawEasedRegion
+    // set and cleared once: the row's pixels straddle row boundaries.
+    if (d.ease_offset_px == null) {
+        if (d.rs_set_sc_fn) |f| {
+            var sc = layerRowsScissor(d, @intCast(ri), @as(u32, @intCast(ri)) + 1) orelse return .{ .encoded = false };
+            f(d.ctx_ptr, 1, &sc);
+        }
     }
 
     const mapping = rows[ri];
@@ -4040,7 +4288,7 @@ fn drawLayerRow(
     // default-bg run (flush.zig, skip_default_bg), so no other pass
     // repaints the columns this layer's row no longer covers.
     var encoded = false;
-    if (g.opacity < 1.0 or g.blur_enabled or verts_len == 0) {
+    if (d.ease_offset_px == null and (g.opacity < 1.0 or g.blur_enabled or verts_len == 0)) {
         g.drawClearRowOverwrite() catch return .{ .encoded = encoded, .failed = true };
         encoded = true;
     }
@@ -4053,7 +4301,7 @@ fn drawLayerRow(
     // A row-shift hint moves a slot between rows without rewriting its
     // pixels, so offset it by the distance it moved.
     const row_dy = slotRowShiftPx(src.pool.slotPtrConst(mapping.slot), ri, d.row_h_px);
-    g.setLayerTransform(d.origin_x, d.origin_y + row_dy, d.base_vp.w, d.base_vp.h) catch
+    g.setLayerTransformScrolled(d.origin_x, d.origin_y + row_dy, d.base_vp.w, d.base_vp.h, d.ease_offset_px orelse 0) catch
         return .{ .encoded = encoded, .failed = true };
     g.drawVB(vb, verts_len) catch
         return .{ .encoded = encoded, .failed = true };
@@ -4073,6 +4321,63 @@ const LayerRowDrawCtx = struct {
     row_h_px: i32,
     ctx_ptr: ?*c.ID3D11DeviceContext,
     rs_set_sc_fn: ?RSSetScissorRectsFn,
+    /// Set while drawing an eased region's rows; see drawEasedRegion.
+    ease_offset_px: ?f32 = null,
+};
+
+/// The surface rectangle of rows [row_start, row_end) of a layer, clipped to
+/// the content area. Null when nothing of it is visible.
+fn layerRowsScissor(d: LayerRowDrawCtx, row_start: u32, row_end: u32) ?c.D3D11_RECT {
+    const top = d.y_offset + d.layer.y_px + @as(i32, @intCast(row_start)) * d.row_h_px;
+    const sc: c.D3D11_RECT = .{
+        .left = @max(d.x_offset, d.x_offset + d.layer.x_px),
+        .top = top,
+        .right = @min(d.content_right, d.x_offset + d.layer.x_px + d.layer_w_px),
+        .bottom = top + @as(i32, @intCast(row_end - row_start)) * d.row_h_px,
+    };
+    if (sc.right <= sc.left or sc.bottom <= sc.top) return null;
+    return sc;
+}
+
+/// An eased layer's scroll region: cleared once under one scissor, then every
+/// row and every retained row drawn at the ease offset. The scissor keeps the
+/// moved rows out of the margins around the region.
+fn drawEasedRegion(
+    g: *d3d11.Renderer,
+    src: LayerFrameSource,
+    state: *LayerPaintState,
+    rows: []const RowMapping,
+    region_start: u32,
+    region_end: u32,
+    d_: LayerRowDrawCtx,
+) LayerRowsOutcome {
+    var out: LayerRowsOutcome = .{};
+    const f = d_.rs_set_sc_fn orelse return out;
+    const sc = layerRowsScissor(d_, region_start, region_end) orelse return out;
+    var sc_mut = sc;
+    f(d_.ctx_ptr, 1, &sc_mut);
+    g.drawClearRowOverwrite() catch {
+        out.failed += 1;
+        return out;
+    };
+    var d = d_;
+    d.ease_offset_px = state.ease.offset_px;
+    for (region_start..region_end) |ri| out.add(drawLayerRow(g, src, state, rows, ri, d));
+    out.failed += state.ease.drawRetained(g, d.origin_x, d.origin_y, d.base_vp.w, d.base_vp.h, d.row_h_px);
+    return out;
+}
+
+/// Tallies of a run of drawLayerRow calls.
+const LayerRowsOutcome = struct {
+    encoded: u32 = 0,
+    failed: u32 = 0,
+    budget_exceeded: bool = false,
+
+    fn add(self: *LayerRowsOutcome, row: LayerRowOutcome) void {
+        if (row.encoded) self.encoded += 1;
+        if (row.failed) self.failed += 1;
+        if (row.budget_exceeded) self.budget_exceeded = true;
+    }
 };
 
 /// Draw the surface's non-root layers, back-to-front, on top of the root grid.
@@ -4128,7 +4433,23 @@ pub fn drawSurfaceLayers(
 
         var encoded: u32 = 0;
         var band_drawn = false;
-        if (state.draw_all) {
+        if (state.ease.easing and rs_set_sc_fn != null) {
+            const region_start, const region_end = state.ease.region(row_limit);
+            var tally: LayerRowsOutcome = .{};
+            for (0..row_limit) |ri| {
+                if (ri >= region_start and ri < region_end) continue;
+                tally.add(drawLayerRow(g, src, state, rows, ri, d));
+            }
+            if (region_end > region_start) {
+                const eased = drawEasedRegion(g, src, state, rows, region_start, region_end, d);
+                tally.encoded += eased.encoded;
+                tally.failed += eased.failed;
+                if (eased.budget_exceeded) tally.budget_exceeded = true;
+            }
+            encoded += tally.encoded;
+            failed_rows += tally.failed;
+            if (tally.budget_exceeded) budget_exceeded = true;
+        } else if (state.draw_all) {
             for (0..row_limit) |ri| {
                 const out = drawLayerRow(g, src, state, rows, ri, d);
                 if (out.encoded) encoded += 1;
@@ -4232,6 +4553,14 @@ pub const CursorOverlayParams = struct {
     /// needs no work; clearing/redrawing again would double-blend transparent
     /// row content.
     row_already_redrawn: bool = false,
+    /// The cursor's layer is easing this frame: the cursor moves with its
+    /// text, clipped to the eased region rather than to its own row.
+    cursor_ease: ?CursorEase = null,
+};
+
+pub const CursorEase = struct {
+    offset_px: f32,
+    scissor: c.D3D11_RECT,
 };
 
 /// Redraw the content of the row the cursor sits on, so a cleared band gets
@@ -4349,7 +4678,17 @@ pub fn drawCursorOverlay(g: *d3d11.Renderer, p: CursorOverlayParams) !void {
     if (p.row_already_redrawn) {
         if (shown.len != 0) {
             if (log_enabled) applog.appLog("[cursor-overlay] row already redrawn, draw cursor row={d}\n", .{cursor_row});
-            try g.setLayerTransform(cursor_ox, cursor_oy, layer_w, layer_h);
+            // An eased layer redrew every row, so only the eased cursor itself
+            // is owed, under the region's scissor.
+            var ease_px: f32 = 0;
+            if (p.cursor_ease) |e| {
+                ease_px = e.offset_px;
+                if (p.rs_set_sc_fn) |f| {
+                    var sc = e.scissor;
+                    f(p.ctx_ptr, 1, &sc);
+                }
+            }
+            try g.setLayerTransformScrolled(cursor_ox, cursor_oy, layer_w, layer_h, ease_px);
             try g.drawVB(vb, shown.len);
         } else if (log_enabled) {
             applog.appLog("[cursor-overlay] row already redrawn, blink off row={d}\n", .{cursor_row});
@@ -4474,6 +4813,8 @@ const BloomRowsContext = struct {
     /// Cursor vertices are grid-local; drawBloomPasses draws them right after
     /// this callback with the transform it leaves bound.
     cursor_layer_origin: [2]f32 = .{ 0, 0 },
+    /// The root's smooth-scroll offset, so its glow follows its text.
+    root_ease_offset_px: f32 = 0,
 };
 
 /// False when a transform could not be bound, so the extract is missing rows
@@ -4506,12 +4847,12 @@ fn drawBloomRowBuffers(
         const slot = ctx.pool.slotPtrConst(mapping.slot);
         if (slot.verts.items.len == 0) continue;
 
-        const row_delta = @as(i32, @intCast(row_index)) - @as(i32, @intCast(slot.origin_row));
+        const row_shift = render_pipeline_helpers.rootRowShift(slotRowShiftPx(slot, row_index, ctx.row_h_px), ctx.root_ease_offset_px != 0);
         var viewport: c.D3D11_VIEWPORT = .{
             .TopLeftX = viewport_x,
             // The shift is a full-resolution pixel distance, but the viewport
             // origin is in half-resolution extract pixels, hence the halving.
-            .TopLeftY = viewport_y + @as(f32, @floatFromInt(row_delta * ctx.row_h_px)) / 2.0,
+            .TopLeftY = viewport_y + row_shift.viewport_dy_px / 2.0,
             .Width = viewport_w,
             .Height = viewport_h,
             .MinDepth = 0,
@@ -4519,7 +4860,7 @@ fn drawBloomRowBuffers(
         };
         set_viewport(d3d_ctx, 1, &viewport);
         // Core row vertices are grid-local pixels against this viewport.
-        g.setLayerTransform(0, 0, extent_w_px, extent_h_px) catch return false;
+        g.setLayerTransformScrolled(0, row_shift.transform_dy_px, extent_w_px, extent_h_px, ctx.root_ease_offset_px) catch return false;
         g.drawVB(vb, slot.verts.items.len) catch return false;
     }
 
@@ -4564,7 +4905,9 @@ fn drawBloomRowBuffers(
                         if (rvb.uploaded_slot != mapping.slot or rvb.uploaded_ver != slot.ver) continue;
                         const vb = rvb.vb orelse continue;
                         const row_dy = slotRowShiftPx(slot, ri, ctx.row_h_px);
-                        g.setLayerTransform(origin_x, origin_y + row_dy, extent_w_px, extent_h_px) catch return false;
+                        // Glow follows the text through a smooth scroll.
+                        const ease_px: f32 = if (state.ease.easing) state.ease.offset_px else 0;
+                        g.setLayerTransformScrolled(origin_x, origin_y + row_dy, extent_w_px, extent_h_px, ease_px) catch return false;
                         g.drawVB(vb, slot.verts.items.len) catch return false;
                     }
                 }
@@ -4811,13 +5154,43 @@ pub fn drawSurfaceRowFrame(
     // the root's row, which is empty under ext_multigrid.
     var cursor_layer_row: ?LayerCursorRow = null;
     var cursor_layer_w_px: ?i32 = null;
-    if (!cursor_on_root) {
+    var cursor_ease: ?CursorEase = null;
+    if (cursor_on_root) {
+        if (in.draw_params.root_ease) |ease| {
+            const r = ease.region(in.row_map.len);
+            if (r[1] > r[0]) cursor_ease = .{ .offset_px = ease.offset_px, .scissor = .{
+                .left = in.draw_params.x_offset,
+                .top = in.draw_params.y_offset + @as(i32, @intCast(r[0])) * row_h_px,
+                .right = in.draw_params.content_right,
+                .bottom = in.draw_params.y_offset + @as(i32, @intCast(r[1])) * row_h_px,
+            } };
+        }
+    } else {
         for (in.layers) |layer| {
             if (layer.grid_id != in.cursor_grid) continue;
             cursor_layer_w_px = @as(i32, @intCast(layer.cols)) * cell_w_px;
-            const row = in.cursor_row orelse break;
             const src = in.layer_src orelse break;
             const state = src.paint.layerState(layer.grid_id) orelse break;
+            const region_start, const region_end = state.ease.region(src.rows(layer).len);
+            if (region_end > region_start) {
+                const ctx: LayerRowDrawCtx = .{
+                    .layer = layer,
+                    .layer_w_px = cursor_layer_w_px.?,
+                    .origin_x = 0,
+                    .origin_y = 0,
+                    .base_vp = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+                    .x_offset = in.draw_params.x_offset,
+                    .y_offset = in.draw_params.y_offset,
+                    .content_right = in.draw_params.content_right,
+                    .row_h_px = row_h_px,
+                    .ctx_ptr = null,
+                    .rs_set_sc_fn = null,
+                };
+                if (layerRowsScissor(ctx, region_start, region_end)) |sc| {
+                    cursor_ease = .{ .offset_px = state.ease.offset_px, .scissor = sc };
+                }
+            }
+            const row = in.cursor_row orelse break;
             const rows = src.rows(layer);
             if (row < rows.len and row < state.row_vbs.items.len) {
                 cursor_layer_row = .{ .row = row, .mapping = rows[row], .rvb = &state.row_vbs.items[row] };
@@ -4851,6 +5224,7 @@ pub fn drawSurfaceRowFrame(
         .rs_set_sc_fn = out.rows.rs_set_sc_fn,
         .last_painted_cursor_row = surface.last_painted_cursor_row,
         .row_already_redrawn = cursor_row_redrawn,
+        .cursor_ease = cursor_ease,
     }) catch |e| {
         out.cursor_overlay_failed = true;
         if (e == error.RowVBPhysicalBudgetExceeded) out.row_vb_budget_exceeded = true;
@@ -4913,6 +5287,7 @@ pub const RowPassInput = struct {
     preserve_back: bool,
     cell_w_px: i32,
     layer_present: ?RowPassLayerPresent = null,
+    ease: ?LayerEaseInput = null,
     /// The frame, minus what this pass settles: the redraw set and the layers.
     frame: RowFrameInput,
 };
@@ -4921,6 +5296,9 @@ pub const RowPassOutcome = struct {
     frame: RowFrameOutcome,
     /// The rectangle the root's GPU scroll copied, or null.
     scroll_damage: ?c.RECT,
+    /// A layer's smooth scroll has not come to rest: the driver paints
+    /// another frame after this one.
+    ease_moving: bool = false,
 };
 
 /// The row pass both paint drivers run, in one order: size the row VBs, shift
@@ -4945,8 +5323,24 @@ pub fn drawSurfaceRowPass(
         return error.OutOfMemory;
     try paint.syncLayers(app.alloc, &app.row_vb_budget, layers);
 
+    // The root's smooth scroll, planned before its row buffers follow the
+    // committed scroll: the rows it pushes out are taken from them.
+    const root_scroll: ?LayerScroll = if (in.snapshot.scroll_rect != null and in.snapshot.vb_shift != 0) .{
+        .row_start = in.snapshot.scroll_row_start,
+        .row_end = in.snapshot.scroll_row_end,
+        .rows_delta = in.snapshot.vb_shift,
+        .total_rows = in.total_rows,
+        .total_cols = 0,
+    } else null;
+    paint.root_ease.easing = false;
+    if (in.ease) |ein| {
+        const whole = if (root_scroll) |s| s.row_end <= in.total_rows else false;
+        paint.root_ease.plan(in.frame.root_grid_id, root_scroll, whole, paint.row_vbs.items, in.total_rows, ein, p.row_h_px);
+    }
+    const root_easing = paint.root_ease.easing;
+
     var scroll_damage: ?c.RECT = null;
-    if (in.preserve_back) {
+    if (in.preserve_back and !root_easing) {
         if (in.snapshot.scroll_rect) |sr| {
             const shift = applyScrollShift(
                 g,
@@ -4999,6 +5393,14 @@ pub fn drawSurfaceRowPass(
         // A frame that redraws every row still applies the staged shift, or
         // the stale slot order carries into the next partial frame.
         shiftRowVBs(paint.row_vbs.items, in.snapshot.vb_shift, in.snapshot.scroll_row_start, in.snapshot.scroll_row_end);
+        // An eased root moves every row, which no copy of the previous
+        // frame's pixels can serve; redrawing them all also erases the cursor
+        // the last frame baked in.
+        if (root_easing) {
+            if (paint.last_painted_cursor_grid == in.frame.root_grid_id) paint.last_painted_cursor_row = null;
+            if (!render_pipeline_helpers.mergeSortedRowsWithRange(app.alloc, rows_to_draw, &paint.scroll_rows_merge_scratch, 0, in.total_rows))
+                return error.OutOfMemory;
+        }
     }
 
     // The copy has to land before the rows below paint over the band it
@@ -5029,6 +5431,7 @@ pub fn drawSurfaceRowPass(
             .scroll_rows_merge_scratch = &paint.scroll_rows_merge_scratch,
             .root_rows = in.total_rows,
             .root_scroll_rect = scroll_damage,
+            .ease = in.ease,
             .log_enabled = in.frame.log_enabled,
         });
         if (in.layer_present) |lp| appendBandPresentRects(
@@ -5040,6 +5443,19 @@ pub fn drawSurfaceRowPass(
             lp.present,
         );
     }
+
+    // An eased frame presents on vblank, so the paints that drive the ease
+    // run at the display rate.
+    var ease_moving = paint.root_ease.moving();
+    if (root_easing) {
+        g.vsync_next_present = true;
+        in.frame.draw_params.root_ease = &paint.root_ease;
+    }
+    if (has_layers) for (layers[1..]) |layer| {
+        const state = paint.layerState(layer.grid_id) orelse continue;
+        if (state.ease.easing) g.vsync_next_present = true;
+        if (state.ease.moving()) ease_moving = true;
+    };
 
     in.frame.layers = layers;
     in.frame.layer_src = layer_src;
@@ -5054,7 +5470,7 @@ pub fn drawSurfaceRowPass(
         .last_painted_cursor_row = &paint.last_painted_cursor_row,
         .last_painted_cursor_grid = &paint.last_painted_cursor_grid,
     }, in.frame);
-    return .{ .frame = frame, .scroll_damage = scroll_damage };
+    return .{ .frame = frame, .scroll_damage = scroll_damage, .ease_moving = ease_moving };
 }
 
 /// Row-mode bloom path that reuses the already-uploaded row VBs. This keeps
@@ -5103,6 +5519,7 @@ pub fn drawBloomRowsOverlay(
         .layers = layers,
         .layer_src = layer_src,
         .cursor_layer_origin = cursor_layer_origin,
+        .root_ease_offset_px = if (draw_params.root_ease) |e| e.offset_px else 0,
     };
     const bvp = draw_params.bloomViewport(g.width);
     return g.drawBloomFromRowBuffers(&rows_ctx, drawBloomRowBuffers, cursor_verts, glow_intensity, bvp.x, bvp.y, bvp.w, bvp.h);

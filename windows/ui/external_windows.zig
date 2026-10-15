@@ -768,8 +768,9 @@ fn drawNormalExternalSurfaceRowMode(
     // A committed scroll is work too: acquireForPaint has already consumed
     // it, so returning here would lose the back_tex and row-VB shift for good.
     const has_scroll_work = tbs_snap.scroll_rect != null or tbs_snap.vb_shift != 0;
+    const has_ease_work = has_layers and ext_win.surf.paint.easeMoving();
     if (rows_to_draw.items.len == 0 and !force_full_rows and !has_cursor and
-        !has_scrollbar_work and !any_layer_dirty and !has_scroll_work)
+        !has_scrollbar_work and !any_layer_dirty and !has_scroll_work and !has_ease_work)
     {
         if (log_enabled) applog.appLog("[win] drawNormalExtRowMode: no dirty rows and no cursor, skip grid_id={d}\n", .{grid_id});
         ext_win.surf.paint.present_rects.clearRetainingCapacity();
@@ -813,6 +814,7 @@ fn drawNormalExternalSurfaceRowMode(
             .cursor_grid = tbs_snap.cursor_layer_grid_id,
             .cursor_rows = cursor_erase_rows,
         },
+        .ease = app_mod.LayerEaseInput.of(app),
         .frame = .{
             .root_grid_id = grid_id,
             .layers = &.{},
@@ -3518,6 +3520,9 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             present_facts.custom_shader,
             ext_win.surf.paint.present_rects.items.len,
         ));
+        // A smooth scroll still moving needs the next frame; the vblank-paced
+        // present keeps this loop at the display rate.
+        if (ext_win.surf.paint.easeMoving()) _ = c.InvalidateRect(hwnd, null, 0);
         if (present_gate.verdict == .refuse) {
             requeueExternalFullPaint(app, grid_id, hwnd);
             return;

@@ -367,6 +367,15 @@ frontend-owned physical storage:
 - Windows device-loss recovery continues until the device is rebuilt or the
   main HWND is torn down. Retries use exponential backoff capped at 30 seconds;
   after three failed attempts Zonvie warns once without terminating recovery.
+- Windows draws a slot whose row moved (`row != slot.origin_row`) in one of two
+  ways. A root grid at rest shifts the D3D viewport by the move; layers, and a
+  root grid while it smooth-scrolls, shift through the layer transform
+  (`slotRowShiftPx`) under the unshifted viewport. The asymmetry is
+  deliberate. Do not add a pixel offset (smooth scroll or anything else) on
+  top of a shifted viewport: D3D clips to the viewport whatever the scissor
+  says, so a slot whose origin is near the grid's edge loses whole-row bands
+  of the offset. `render_pipeline_helpers.rootRowShift` decides the placement
+  for the root's row and bloom draws; its tests pin the invariant.
 
 ## Development Features To Be Aware Of
 

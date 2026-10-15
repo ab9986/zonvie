@@ -11,7 +11,11 @@ cbuffer LayerTransform : register(b0) {
     float2 layer_scale;
     float2 layer_offset;
     float2 layer_origin_px;   // layer top-left in surface pixels
-    float2 layer_pad;
+    // How far a smooth scroll still draws this layer's content below where
+    // its rows put it, in pixels. Moves only DECO_SCROLLABLE vertices, so
+    // margins (winbar, float borders) stay put. Zero when nothing eases.
+    float layer_scroll_offset_px;
+    float layer_pad;
 };
 
 struct VSIn {
@@ -36,7 +40,9 @@ struct VSOut {
 
 VSOut VSMain(VSIn i) {
     VSOut o;
-    o.pos = float4(i.pos.xy * layer_scale + layer_offset, 0.0, 1.0);
+    float2 p = i.pos.xy;
+    if (i.deco_flags & (1u << 7)) p.y += layer_scroll_offset_px;  // DECO_SCROLLABLE
+    o.pos = float4(p * layer_scale + layer_offset, 0.0, 1.0);
     o.layer_origin = layer_origin_px;
     o.uv  = i.uv;
     o.col = i.col;

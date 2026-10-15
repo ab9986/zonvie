@@ -372,6 +372,10 @@ pub const Renderer = struct {
     layer_cb: ?*c.ID3D11Buffer = null,
     /// Last value written to layer_cb, so redundant updates are skipped.
     layer_cb_value: [8]f32 = .{ 1, 1, 0, 0, 0, 0, 0, 0 },
+    /// The next present waits for vblank. A smooth-scroll frame asks for it,
+    /// so the paint loop that drives the ease runs at the display rate
+    /// instead of spinning; every other present stays unthrottled.
+    vsync_next_present: bool = false,
     layer_cb_valid: bool = false,
 
     // User-supplied custom post-process shaders (Phase 2 macOS parity).
@@ -1382,16 +1386,18 @@ pub const Renderer = struct {
     /// device loss; on success marks the first present and rotates buffers.
     /// A failed Present1 disables swapchain1 for the Renderer's lifetime.
     fn presentSwapchain(self: *Renderer, sc: *c.IDXGISwapChain, params: *c.DXGI_PRESENT_PARAMETERS) bool {
+        const sync_interval: c.UINT = @intFromBool(self.vsync_next_present);
+        self.vsync_next_present = false;
         var hrp: c.HRESULT = -1;
         const present1_fn = if (self.swapchain1) |sc1p| sc1p.*.lpVtbl.*.Present1 else null;
         if (present1_fn) |present1| {
-            hrp = present1(self.swapchain1.?, 0, 0, params);
+            hrp = present1(self.swapchain1.?, sync_interval, 0, params);
             if (c.FAILED(hrp)) {
                 if (applog.isEnabled()) applog.appLog("[d3d] Present1 FAILED hr=0x{x}, disabling swapchain1\n", .{@as(u32, @bitCast(hrp))});
                 safeRelease(&self.swapchain1);
             }
         } else if (sc.*.lpVtbl.*.Present) |present| {
-            hrp = present(sc, 0, 0);
+            hrp = present(sc, sync_interval, 0);
         }
         if (c.FAILED(hrp)) {
             if (isDeviceLost(hrp)) self.device_lost = true;
@@ -3951,6 +3957,19 @@ pub const Renderer = struct {
         extent_w_px: f32,
         extent_h_px: f32,
     ) error{LayerTransformMapFailed}!void {
+        return self.setLayerTransformScrolled(origin_x_px, origin_y_px, extent_w_px, extent_h_px, 0);
+    }
+
+    /// setLayerTransform plus a smooth-scroll offset: `scroll_offset_px`
+    /// moves the layer's scrollable vertices down by that many pixels.
+    pub fn setLayerTransformScrolled(
+        self: *Renderer,
+        origin_x_px: f32,
+        origin_y_px: f32,
+        extent_w_px: f32,
+        extent_h_px: f32,
+        scroll_offset_px: f32,
+    ) error{LayerTransformMapFailed}!void {
         self.assertContextLocked();
         const value: [8]f32 = if (extent_w_px <= 0 or extent_h_px <= 0)
             .{ 1, 1, 0, 0, 0, 0, 0, 0 }
@@ -3961,7 +3980,7 @@ pub const Renderer = struct {
             1.0 - origin_y_px * 2.0 / extent_h_px,
             origin_x_px,
             origin_y_px,
-            0,
+            scroll_offset_px,
             0,
         };
         const ctx = self.ctx orelse return;
