@@ -1175,7 +1175,8 @@ ZONVIE_API void zonvie_core_update_layout_px_locked(
 
 ZONVIE_API void zonvie_core_send_input(zonvie_core *core, const unsigned char *data, size_t len);
 
-/* Timestamp helper for perf-log correlation across frontend/core stages. */
+/* Monotonic timestamp (ns, unspecified origin) for perf-log correlation
+ * across frontend/core stages. Only differences are meaningful. */
 ZONVIE_API int64_t zonvie_core_perf_now_ns(void);
 
 /* Build-time version string (from `git describe`), e.g. "v0.3.21" or

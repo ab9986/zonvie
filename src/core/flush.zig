@@ -470,10 +470,10 @@ fn touchGridVertexBudget(core: *Core, grid_id: i64, buf: *grid_mod.GridBuf) void
     if (buf.vertex_budget_touched) return;
     buf.vertex_budget_touched = true;
 
-    // Grid 1 is checked through computeVertexBudgetAggregate instead. The
-    // core-owned synthetic grids (negative ids: cmdline, popupmenu, message
-    // panels) are not linked and so escape the completed-frame check.
-    if (grid_id <= 0) return;
+    // Grid 1 is checked through computeVertexBudgetAggregate instead. Every
+    // other grid, core-owned negative ids included, is linked: the next
+    // beginVertexBudgetTransaction checks all of sub_grids, so the
+    // completed-frame check must cover the same set.
     if (grid_id == 1) return;
 
     buf.vertex_budget_touched_next = core.vertex_budget_touched_grid_head;
@@ -4543,8 +4543,8 @@ pub fn notifyExternalWindowChanges(self: *Core) void {
             // Reserve the known-map entry before invoking the frontend, so OOM
             // is a clean pre-callback abort rather than an opened window that
             // was never recorded (duplicate opens, lost closes on retry).
-            self.known_external_grids.ensureUnusedCapacity(self.alloc, 1) catch {
-                self.flush_aborted = true;
+            self.known_external_grids.ensureUnusedCapacity(self.alloc, 1) catch |err| {
+                abortFlushForRowError(self, err);
                 return;
             };
         }
@@ -4762,8 +4762,8 @@ fn sendGridCursor(
         if (cur_row < buf.rows and cursor_col < buf.cols) {
             out.clearRetainingCapacity();
             // Estimate: 6 cursor bg + 6 cursor text + block element quads
-            out.ensureTotalCapacity(self.alloc, 48) catch {
-                self.flush_aborted = true;
+            out.ensureTotalCapacity(self.alloc, 48) catch |err| {
+                abortFlushForRowError(self, err);
                 return false;
             };
 
@@ -4798,8 +4798,8 @@ fn sendGridCursor(
                 .bg_rgb = if (attr) |a| a.bg else self.hl.default_fg,
                 .fg_rgb = if (attr) |a| a.fg else self.hl.default_bg,
                 .cell = cursor_cell,
-            }) catch blk: {
-                self.flush_aborted = true;
+            }) catch |err| blk: {
+                abortFlushForRowError(self, err);
                 break :blk CursorEmitResult.aborted;
             };
             switch (emitted) {
@@ -4829,8 +4829,8 @@ fn sendGridCursor(
             // to under the block) sits in a shelf the row mirror never
             // recorded; cursor_verts is the buffer the collector scans.
             self.cursor_verts.clearRetainingCapacity();
-            self.cursor_verts.appendSlice(self.alloc, out.items) catch {
-                self.flush_aborted = true;
+            self.cursor_verts.appendSlice(self.alloc, out.items) catch |err| {
+                abortFlushForRowError(self, err);
                 return false;
             };
 
@@ -9017,6 +9017,22 @@ test "a completed flush that leaves a sub-grid above its surface limit is reject
     defer finishVertexBudgetTransaction(&core, false);
     try replaceGridSurfaceRowVertexCount(&core, 2, sg, 1, 6);
     try std.testing.expectError(error.VertexBudgetExceededPerSurface, validateCompletedVertexBudget(&core));
+}
+
+test "a core-owned negative-id grid over the surface limit fails the completed-frame check" {
+    // beginVertexBudgetTransaction treats any sub-grid over the limit as an
+    // invariant violation, so the completed-frame check must cover the same
+    // grids or the next flush ends the session for a frame this one committed.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(-3, 1, 4);
+    try beginVertexBudgetTransaction(&core);
+    defer finishVertexBudgetTransaction(&core, false);
+    const sg = core.grid.sub_grids.getPtr(-3).?;
+    touchGridVertexBudget(&core, -3, sg);
+    sg.surface_vertex_count = MAX_VERTICES_PER_SURFACE + 1;
+    try std.testing.expectError(error.VertexBudgetExceededPerSurface, validateCompletedVertexBudget(&core));
+    sg.surface_vertex_count = 0;
 }
 
 test "a touched list naming a missing grid is reported as an invariant violation, not a budget overflow" {
@@ -13927,6 +13943,44 @@ test "message timeout conversion rejects invalid values and saturates" {
     try std.testing.expectEqual(@as(?i128, null), messageTimeoutNs(std.math.nan(f32)));
 }
 
+test "a cursor allocation failure is reported as OOM and stays retryable" {
+    // zonvie_core.h on_callback_error: OOM is reported for any allocation the
+    // flush could not make. The cursor layer is part of the flush.
+    const State = struct {
+        oom_reports: u32 = 0,
+        fn onRow(ctx: ?*anyopaque, grid_id: i64, row_start: u32, row_count: u32, verts: ?[*]const c_api.Vertex, vert_count: usize, flags: u32, total_rows: u32, total_cols: u32) callconv(.c) void {
+            _ = .{ ctx, grid_id, row_start, row_count, verts, vert_count, flags, total_rows, total_cols };
+        }
+        fn onError(ctx: ?*anyopaque, code: u32, component: [*]const u8, component_len: usize) callconv(.c) void {
+            _ = .{ component, component_len };
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (code == @intFromEnum(c_api.CallbackErrorCode.oom)) self.oom_reports += 1;
+        }
+    };
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var core = Core.initForTest(failing.allocator());
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 1, 4);
+    core.grid.cursor_row = 0;
+    core.grid.cursor_col = 0;
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_callback_error = State.onError;
+
+    // row_verts has no capacity yet, so the cursor's first allocation fails.
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    var retry = false;
+    var reset = false;
+    try std.testing.expect(!sendGridCursor(&core, State.onRow, 1, &core.grid.main_buf, true, false, &retry, &reset));
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+
+    try std.testing.expect(core.flush_aborted);
+    try std.testing.expectEqual(@as(u32, 1), state.oom_reports);
+    try std.testing.expect(core.flush_retryable);
+}
+
 // ---------------------------------------------------------------------------
 // Emoji cluster caching: equal keys must name equal pictures
 //
@@ -15759,6 +15813,24 @@ test "a zero-cell external grid never opened gets no surface layout" {
     core.cb.on_surface_layout = State.onLayout;
     core.cb.on_external_window = State.onOpen;
 
+    // Positive control: the same setup at a usable shape does open and lay
+    // out grid 2, so the zero counts below are about the zero shape.
+    {
+        var probe = Core.initForTest(std.testing.allocator);
+        defer probe.deinitForTest();
+        try probe.grid.resize(4, 8);
+        var probe_state = State{};
+        probe.ctx = &probe_state;
+        probe.cb.on_surface_layout = State.onLayout;
+        probe.cb.on_external_window = State.onOpen;
+        try probe.grid.resizeGrid(2, 3, 8);
+        try std.testing.expect(try probe.grid.setWinExternalPos(2, 42));
+        notifyExternalWindowChanges(&probe);
+        notifySurfaceLayouts(&probe);
+        try std.testing.expectEqual(@as(u32, 1), probe_state.opens);
+        try std.testing.expect(probe_state.saw_layout_for_2);
+    }
+
     try core.grid.resizeGrid(2, 3, 0);
     try std.testing.expect(try core.grid.setWinExternalPos(2, 42));
 
@@ -15801,6 +15873,14 @@ test "an open external grid at a zero-cell shape gets no on_vertices_row" {
     var state = State{};
     core.ctx = &state;
     core.cb.on_vertices_row = State.onRow;
+
+    // Positive control: at its usable 2x1 shape grid 2 does receive rows.
+    {
+        var probe_flush = FlushCtx{ .core = &core };
+        try probe_flush.onFlush(2, 1);
+        try std.testing.expect(state.grid2_calls > 0);
+        state.grid2_calls = 0;
+    }
 
     try core.grid.resizeGrid(2, 2, 0);
     // Every grid re-decides its cursor layer, which sends a clear to any

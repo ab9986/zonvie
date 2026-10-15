@@ -3432,19 +3432,22 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             // and repaints the whole surface and keeps no damage list, so
             // it is a forced-full frame with no rects: the gate presents it
             // to every swapchain buffer.
-            const decorated_gate = render_pipeline_helpers.presentGate(.{
-                // Metrics were checked before the draw; a full redraw from
-                // scratch has no snapshotted row layout to go stale.
-                .layout_ok = true,
-                .metrics_ok = true,
-                .force_full_rows = true,
-                .preserve_back = false,
-                .rows = 0,
-                .rows_to_draw = 0,
-                .skipped_empty = 0,
-                .custom_shader = g.custom_shader_pipelines.items.len != 0,
-                .present_rects = 0,
-            });
+            var decorated_metrics_ok = true;
+            {
+                app.mu.lockUncancelable(core.clock.io());
+                defer app.mu.unlock(core.clock.io());
+                decorated_metrics_ok = app.shared_metrics_gen == shared_metrics_gen_snapshot;
+            }
+            const decorated_gate = render_pipeline_helpers.presentGate(
+                render_pipeline_helpers.decoratedPresentGateInputs(
+                    decorated_metrics_ok,
+                    g.custom_shader_pipelines.items.len != 0,
+                ),
+            );
+            if (decorated_gate.verdict == .refuse) {
+                requeueExternalFullPaint(app, grid_id, hwnd);
+                return;
+            }
             std.debug.assert(decorated_gate.verdict == .present and decorated_gate.full);
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow draw succeeded, presenting\n", .{});
             g.presentFromBack(&.{}, decorated_gate.full) catch |e| {

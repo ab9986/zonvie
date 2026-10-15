@@ -90,6 +90,8 @@ pub fn wheelReachesNeovim(grid_id: i64) bool {
 ///
 /// Returns null when nothing matches; the caller then keeps its own surface's
 /// grid and the unshifted position, which is what both frontends already did.
+/// An external surface's own root (is_external = 1) is never returned: it is
+/// that fallback.
 pub fn resolve(
     comptime Grid: type,
     grids: []const Grid,
@@ -212,6 +214,16 @@ test "a float another surface hosts is not hit-testable here, whatever its numbe
     root4.placed_by_surface = 4;
     const own = [_]Candidate{ root4, hosted };
     try testing.expectEqual(@as(i64, 5), resolve(Candidate, &own, 4, 15, 25, false).?.grid_id);
+}
+
+test "an external surface's own root resolves to null and is left to the caller" {
+    // nvim_core builds external roots with is_external = 1 and
+    // placed_by_surface = their own id.
+    var root4 = win(4, 0, 0, 40, 100);
+    root4.placed_by_surface = 4;
+    root4.is_external = 1;
+    const grids = [_]Candidate{root4};
+    try testing.expect(resolve(Candidate, &grids, 4, 5, 5, false) == null);
 }
 
 test "a float showing all of its content lets a wheel event through" {

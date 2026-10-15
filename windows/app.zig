@@ -1182,9 +1182,23 @@ pub const TripleBufferedSurface = struct {
                 if (pending_rect.left == flush_rect.left and pending_rect.right == flush_rect.right and
                     pending_rect.top == flush_rect.top and pending_rect.bottom == flush_rect.bottom)
                 {
-                    self.pending_scroll_dy_px += self.flush_scroll_dy_px;
-                    self.pending_vb_shift += self.flush_vb_shift;
-                    // row_start/end unchanged: same region by definition
+                    if (render_pipeline_helpers.accumulatePendingScroll(
+                        self.pending_scroll_dy_px,
+                        self.flush_scroll_dy_px,
+                        self.pending_vb_shift,
+                        self.flush_vb_shift,
+                    )) |sum| {
+                        self.pending_scroll_dy_px = sum.dy_px;
+                        self.pending_vb_shift = sum.vb_shift;
+                        // row_start/end unchanged: same region by definition
+                    } else {
+                        self.pending_scroll_rect = null;
+                        self.pending_scroll_dy_px = 0;
+                        self.pending_vb_shift = 0;
+                        self.pending_scroll_row_start = 0;
+                        self.pending_scroll_row_end = 0;
+                        self.pending_paint_full = true;
+                    }
                 } else {
                     // Different scroll region: invalidate optimization, fall back to full paint.
                     self.pending_scroll_rect = null;
@@ -2790,7 +2804,7 @@ fn ensureBudgetedRowVertexBuffer(
     const new_bytes = d3d11.Renderer.plannedExternalVertexBufferCapacity(
         old_bytes,
         need_bytes,
-    ) orelse return error.VertexBufferTooLarge;
+    ) orelse return error.RowVBPhysicalBudgetExceeded; // no single buffer can hold this row
     var reservation = try budget.reserveGrowth(
         surface_retained_bytes.*,
         old_bytes,
@@ -4592,8 +4606,9 @@ pub fn releasePaintSnapshot(
 /// fires into the recovery gate. The external driver used to arm one anyway;
 /// the main driver never did.
 ///
-/// `app.mu` must be free: the surface flag is taken under it, the TBS flag
-/// under rotation_mu, never nested.
+/// `app.mu` must be free: the surface flag is taken under it, then the TBS
+/// flag under rotation_mu. Lock order is app.mu before rotation_mu; nothing
+/// may take app.mu while holding rotation_mu.
 pub fn failSurfacePaint(
     app: *App,
     ws: *WindowSurface,
@@ -4605,7 +4620,9 @@ pub fn failSurfacePaint(
 }
 
 /// Make the next paint of `ws` a full one. `app.mu` must be free: the surface
-/// flag is taken under it, the TBS flag under rotation_mu, never nested.
+/// flag is taken under it, then the TBS flag under rotation_mu. Lock order is
+/// app.mu before rotation_mu; nothing may take app.mu while holding
+/// rotation_mu.
 pub fn requestSurfaceFullPaint(app: *App, ws: *WindowSurface) void {
     app.mu.lockUncancelable(core.clock.io());
     ws.surface.paint_full = true;

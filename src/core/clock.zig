@@ -69,10 +69,22 @@ pub fn io() std.Io {
     return g_io;
 }
 
-/// Wall-clock nanoseconds since the Unix epoch (`Clock.real`). This is the exact
-/// behavioral equivalent of Zig 0.15's `std.time.nanoTimestamp()` and is the
-/// single drop-in replacement used project-wide for that call. Returns `i128`.
+/// Monotonic nanoseconds (`Clock.awake`), for intervals and deadlines only:
+/// the origin is unspecified, so never treat the value as a calendar time.
+/// Monotonic so a wall-clock step (manual change, NTP step) cannot stall or
+/// mass-fire msg auto-hide, retry, and throttle deadlines.
 pub fn nowNs() i128 {
     ensureInit();
-    return std.Io.Timestamp.now(g_io, .real).nanoseconds;
+    return std.Io.Timestamp.now(g_io, .awake).nanoseconds;
+}
+
+test "nowNs reads the monotonic clock, not the settable wall clock" {
+    // Deadlines (msg auto-hide, glyph/atlas retry, msg scroll throttle) are
+    // computed from nowNs; a wall-clock step backwards would stall them for
+    // the size of the step.
+    const before = std.Io.Timestamp.now(io(), .awake).nanoseconds;
+    const x = nowNs();
+    const after = std.Io.Timestamp.now(io(), .awake).nanoseconds;
+    try std.testing.expect(before <= x);
+    try std.testing.expect(x <= after);
 }

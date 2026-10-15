@@ -2097,3 +2097,36 @@ test "content scissor clamps a negative dirty origin to the render target's orig
     try std.testing.expectEqual(tr(0, 0, 40, 45), helpers.contentScissor(TestRect, 10, 20, 100, 50, tr(-30, -30, 30, 25)));
     try std.testing.expectEqual(tr(5, 15, 40, 45), helpers.contentScissor(TestRect, 10, 20, 100, 50, tr(-5, -5, 30, 25)));
 }
+
+test "a decorated surface presents a full frame when metrics held" {
+    const g = helpers.presentGate(helpers.decoratedPresentGateInputs(true, false));
+    try std.testing.expectEqual(helpers.PresentVerdict.present, g.verdict);
+    try std.testing.expect(g.full);
+}
+
+test "a decorated surface drawn across a metrics change is refused" {
+    // The border, icon, and cell size are read live during the draw, while
+    // the vertices come from the committed set; a metrics change in between
+    // mixes the two in one frame.
+    const g = helpers.presentGate(helpers.decoratedPresentGateInputs(false, false));
+    try std.testing.expectEqual(helpers.PresentVerdict.refuse, g.verdict);
+}
+
+test "pending scroll accumulates same-region shifts" {
+    const r = helpers.accumulatePendingScroll(-32, -16, -2, -1).?;
+    try std.testing.expectEqual(@as(i32, -48), r.dy_px);
+    try std.testing.expectEqual(@as(i32, -3), r.vb_shift);
+}
+
+test "pending scroll that would overflow asks for a full paint instead" {
+    // A minimized window never paints, so same-region scrolls accumulate
+    // without bound; an i32 wrap would blit by a garbage offset.
+    try std.testing.expect(helpers.accumulatePendingScroll(std.math.maxInt(i32), 1, 0, 0) == null);
+    try std.testing.expect(helpers.accumulatePendingScroll(0, 0, std.math.minInt(i32), -1) == null);
+}
+
+test "pending scroll never stores a shift the paint cannot negate" {
+    // app.zig negates vb_shift_rows; -minInt(i32) traps.
+    try std.testing.expect(helpers.accumulatePendingScroll(0, 0, std.math.minInt(i32) + 1, -1) == null);
+    try std.testing.expect(helpers.accumulatePendingScroll(std.math.minInt(i32) + 1, -1, 0, 0) == null);
+}

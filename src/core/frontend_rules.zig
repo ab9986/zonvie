@@ -245,8 +245,10 @@ pub const SurfaceFrameDecision = extern struct {
     /// The render pass loads (keeps) the previous back buffer instead of
     /// clearing it. Windows: preserve_back.
     loads_previous_contents: bool,
-    /// No reuse arm is open to this frame at all: a guard refused, or the
-    /// surface blends and has no two-pass path. Every row is redrawn.
+    /// No reuse arm is open to this frame's rows: a guard refused, or the
+    /// surface blends and has no two-pass path. Meaningful only when
+    /// skips_surface_pass is false; under blur without two-pass it can be set
+    /// together with skips_surface_pass and loads_previous_contents.
     /// Windows: force_full_rows. On macOS the same fact reaches the plan.
     redraws_everything: bool,
     row_pass_plan: RowPassPlan,

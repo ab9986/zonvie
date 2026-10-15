@@ -1238,6 +1238,36 @@ pub fn externalPresentGateInputs(
     };
 }
 
+/// The decorated driver's gate inputs. A decorated draw clears and repaints
+/// the whole surface and keeps no damage list, so it is a forced-full frame
+/// with no rects; only the metrics can make it unpresentable.
+pub fn decoratedPresentGateInputs(metrics_ok: bool, custom_shader: bool) PresentGateInputs {
+    return .{
+        .layout_ok = true,
+        .metrics_ok = metrics_ok,
+        .force_full_rows = true,
+        .preserve_back = false,
+        .rows = 0,
+        .rows_to_draw = 0,
+        .skipped_empty = 0,
+        .custom_shader = custom_shader,
+        .present_rects = 0,
+    };
+}
+
+pub const PendingScroll = struct { dy_px: i32, vb_shift: i32 };
+
+/// Merge a flush's same-region scroll into the pending one. Null when either
+/// sum leaves i32 or is minInt(i32), which the paint cannot negate: the shift
+/// can no longer be blitted and the caller falls back to a full paint, as for
+/// a different region.
+pub fn accumulatePendingScroll(pending_dy_px: i32, flush_dy_px: i32, pending_vb_shift: i32, flush_vb_shift: i32) ?PendingScroll {
+    const dy = std.math.add(i32, pending_dy_px, flush_dy_px) catch return null;
+    const vb = std.math.add(i32, pending_vb_shift, flush_vb_shift) catch return null;
+    if (dy == std.math.minInt(i32) or vb == std.math.minInt(i32)) return null;
+    return .{ .dy_px = dy, .vb_shift = vb };
+}
+
 /// The main row driver's facts. Every field is required: main always has a
 /// seed and always answers whether the frame reached back_tex.
 pub const MainPresentFacts = struct {

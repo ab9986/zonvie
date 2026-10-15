@@ -1588,12 +1588,12 @@ pub const Renderer = struct {
     }
 
     pub fn plannedExternalVertexBufferCapacity(current_bytes: usize, need_bytes: usize) ?usize {
-        // Must match MAX_VERTEX_BYTES_PER_CALLBACK in src/core/flush.zig. The
-        // core rejects an oversized row itself (a deliberate, accounted
-        // failure); if this ceiling is lower, the core instead hands us a
-        // payload we cannot allocate and the row fails as a D3D error on every
-        // retry. Growth is geometric to avoid a CreateBuffer/Release pair for
-        // every small high-water bump.
+        // Per-buffer ceiling, equal to macOS surfaceMaxVertexBufferCapacity.
+        // The core's MAX_VERTEX_BYTES_PER_CALLBACK (flush.zig) is a larger
+        // nvim-ending backstop. A row above this ceiling is refused before
+        // the row-VB budget is consulted and before any D3D call; the caller
+        // reports it as a row-VB budget failure. Growth is geometric to avoid
+        // a CreateBuffer/Release pair for every small high-water bump.
         const max_buffer_bytes: usize = 256 * 1024 * 1024;
         return render_pipeline_helpers.geometricBufferCapacity(
             current_bytes,
