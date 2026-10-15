@@ -80,6 +80,7 @@ pub const Config = struct {
     font: FontConfig = .{},
     window: WindowConfig = .{},
     scrollbar: ScrollbarConfig = .{},
+    scroll: ScrollConfig = .{},
     cmdline: CmdlineConfig = .{},
     popup: PopupConfig = .{},
     messages: MessagesConfig = .{},
@@ -244,6 +245,15 @@ pub const Config = struct {
     ///   Falls back to overlay outside insert/replace modes (e.g. cmdline).
     pub const PreeditMode = enum(u8) { overlay = 0, extmark = 1 };
 
+    /// What a scroll batch larger than one wheel event ('mousescroll' ver)
+    /// does: `snap` lands it without easing, so page motion (CTRL-D) jumps as
+    /// on macOS; `partial` eases its capped part and lands the excess at once.
+    pub const LargeJumpBehavior = enum(u8) { partial = 0, snap = 1 };
+
+    pub const ScrollConfig = struct {
+        large_jump_behavior: LargeJumpBehavior = .snap,
+    };
+
     pub const InputConfig = struct {
         /// Swap the `:` and `;` keys at the frontend input layer. Applies to
         /// single keypresses only (paste/IME commits are unaffected).
@@ -382,6 +392,16 @@ pub const Config = struct {
             if (s.show_mode) |m| self.scrollbar.show_mode = alloc.dupe(u8, m) catch self.scrollbar.show_mode;
             if (s.opacity) |o| self.scrollbar.opacity = @max(0.0, @min(1.0, o));
             if (s.delay) |d| self.scrollbar.delay = @max(0.1, @min(10.0, d));
+        }
+
+        if (cfg.scroll) |s| {
+            if (s.large_jump_behavior) |v| {
+                if (std.mem.eql(u8, v, "snap")) {
+                    self.scroll.large_jump_behavior = .snap;
+                } else if (std.mem.eql(u8, v, "partial")) {
+                    self.scroll.large_jump_behavior = .partial;
+                }
+            }
         }
 
         if (cfg.cmdline) |cmd| {
@@ -808,6 +828,7 @@ const TomlConfig = struct {
     font: ?TomlFont = null,
     window: ?TomlWindow = null,
     scrollbar: ?TomlScrollbar = null,
+    scroll: ?TomlScroll = null,
     cmdline: ?TomlCmdline = null,
     popup: ?TomlPopup = null,
     messages: ?TomlMessages = null,
@@ -840,6 +861,10 @@ const TomlWindow = struct {
     opacity: ?f32 = null,
     blur: ?bool = null,
     blur_radius: ?i32 = null,
+};
+
+const TomlScroll = struct {
+    large_jump_behavior: ?[]const u8 = null,
 };
 
 const TomlScrollbar = struct {
@@ -977,6 +1002,13 @@ else "") ++
     \\        opacity         Scrollbar opacity (0.0-1.0)
     \\        delay           Seconds before hiding in "scroll" mode
     \\
+    \\
+    ++ (if (is_windows)
+    \\    [scroll]
+    \\        large_jump_behavior  "snap" or "partial" (default: "snap")
+    \\
+    \\
+else "") ++
     \\    [cmdline]
     \\        external        Enable external command line UI
     \\        copy_button     Copy button on the external cmdline (default: true)
@@ -1119,6 +1151,22 @@ fn parseForTest(alloc: std.mem.Allocator, toml_src: []const u8) !Config {
     errdefer cfg.deinit();
     try cfg.parseToml(toml_src);
     return cfg;
+}
+
+test "scroll.large_jump_behavior parses both values and ignores unknown ones" {
+    var partial = try parseForTest(std.testing.allocator,
+        \\[scroll]
+        \\large_jump_behavior = "partial"
+    );
+    defer partial.deinit();
+    try std.testing.expectEqual(Config.LargeJumpBehavior.partial, partial.scroll.large_jump_behavior);
+
+    var unknown = try parseForTest(std.testing.allocator,
+        \\[scroll]
+        \\large_jump_behavior = "bogus"
+    );
+    defer unknown.deinit();
+    try std.testing.expectEqual(Config.LargeJumpBehavior.snap, unknown.scroll.large_jump_behavior);
 }
 
 test "declaring one route keeps the defaults for other events" {
