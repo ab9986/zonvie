@@ -811,7 +811,7 @@ pub const Core = struct {
     flush_retryable: bool = true,
 
     /// Set when an atlas reset is detected during the DEFERRED external-grid
-    /// pass (sendExternalGridVertices, runs after on_flush_end's LIFO defer
+    /// pass (emitGrids, runs after on_flush_end's LIFO defer
     /// ordering puts it before the callback but after the main row-mode loop
     /// already dispatched this flush's main vertices with pre-reset UVs).
     /// markAllDirty() alone only schedules a correct resend for the NEXT

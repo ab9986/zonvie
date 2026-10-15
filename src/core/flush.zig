@@ -3718,7 +3718,7 @@ pub const FlushCtx = struct {
 
         // Inside the flush bracket so the msg_show (ext_float) grid is
         // registered in external_grids and gets vertices from
-        // sendExternalGridVertices (below) in the same flush; run only after
+        // emitGrids (below) in the same flush; run only after
         // handleRedraw returns (rpc_session.zig), the new
         // msg grid shows a blank window until the next user event.
         // The anchor first: the frontends place what this sends against it.
@@ -3771,7 +3771,7 @@ pub const FlushCtx = struct {
                 }
                 const t_ext: i128 = if (perf_enabled) clock.nowNs() else 0;
                 if (!ctx.core.flush_aborted and !ctx.core.flush_atlas_corrupted) {
-                    atlas_reset = sendExternalGridVertices(ctx.core, &cursor_grid_notified, &cursor_sync, glow_enabled, glow_all, glow_hl_ids);
+                    atlas_reset = emitGrids(ctx.core, &cursor_grid_notified, &cursor_sync, glow_enabled, glow_all, glow_hl_ids);
                 }
                 // At most once per flush, by the last attempt that reaches the
                 // external pass.
@@ -3880,7 +3880,7 @@ pub const FlushCtx = struct {
             // Grid 1 owes rows exactly when a row is dirty. Sub-grids gate on
             // sg.dirty, a superset that also admits a zero-row shape; grid 1
             // handles that shape in the n_cells == 0 branch above. Grid 1's
-            // cursor is not this pass's: sendExternalGridVertices emits every
+            // cursor is not this pass's: emitGrids emits every
             // grid's, grid 1's included, by one rule.
             const need_main: bool = ctx.core.grid.main_buf.anyDirty();
 
@@ -4921,7 +4921,8 @@ const ExtCursorSync = struct {
     rev: u64 = 0,
 };
 
-/// Generate and send vertices for external grids.
+/// Generate and send rows for every grid in `emit_grid_ids` (all but grid 1,
+/// which emitMainSurface owns), and the cursor for every grid including grid 1.
 ///
 /// WARNING: This function invokes frontend callbacks (on_vertices_row,
 /// on_cursor_grid_changed) while grid_mu is held. Frontend callbacks
@@ -4935,7 +4936,7 @@ const ExtCursorSync = struct {
 /// consumed is reported in `sync` for the caller to apply once the emission
 /// completes; `cursor_grid_notified` keeps a restart from repeating
 /// on_cursor_grid_changed.
-fn sendExternalGridVertices(
+fn emitGrids(
     self: *Core,
     cursor_grid_notified: *bool,
     sync: *ExtCursorSync,
@@ -4944,7 +4945,7 @@ fn sendExternalGridVertices(
     ext_glow_all: bool,
     ext_glow_hl_ids: ?*std.AutoHashMap(u32, void),
 ) bool {
-    self.log.write("[sendExternalGridVertices] called, known_external_grids.count={d}\n", .{self.known_external_grids.count()});
+    self.log.write("[emitGrids] called, known_external_grids.count={d}\n", .{self.known_external_grids.count()});
 
     // Check if cursor changed (position or grid) - do this first, before early returns
     const cursor_grid = self.grid.cursor_grid;
@@ -4975,7 +4976,7 @@ fn sendExternalGridVertices(
     const cursor_grid_changed = root_route.grid_changed;
     var ext_cursor_retry_required = false;
 
-    self.log.write("[sendExternalGridVertices] cursor_grid={d} cursor_rev={d} last_grid={d} last_rev={d} changed={} grid_changed={}\n", .{
+    self.log.write("[emitGrids] cursor_grid={d} cursor_rev={d} last_grid={d} last_rev={d} changed={} grid_changed={}\n", .{
         cursor_grid, cursor_rev, self.cursor_owner.grid, self.cursor_owner.rev, cursor_changed, cursor_grid_changed,
     });
 
@@ -5013,7 +5014,7 @@ fn sendExternalGridVertices(
     }
 
     if (cursor_on_closed_grid and owner_is_external_root) {
-        self.log.write("[sendExternalGridVertices] cursor on closed grid, forcing redraw of last_grid={d}\n", .{self.cursor_owner.grid});
+        self.log.write("[emitGrids] cursor on closed grid, forcing redraw of last_grid={d}\n", .{self.cursor_owner.grid});
     }
 
     // Window activation only matters for external grid windows, and without
@@ -6940,17 +6941,14 @@ pub fn renderMsgGridFromCache(self: *Core, scroll_offset: u32) bool {
 /// Runs the message grid's local-scroll vertex send wrapped in the same
 /// on_flush_begin/on_flush_end bracket as the normal onFlush() path.
 ///
-/// handleMsgGridScroll/processPendingMsgScroll used to call
-/// sendExternalGridVertices directly, with no on_flush_begin/
-/// on_flush_end around it. Both frontends' triple-buffer write-set open/
+/// The bracket is required: both frontends' triple-buffer write-set open/
 /// commit/InvalidateRect logic lives in those callbacks (Windows: TBS
 /// commit + InvalidateRect, both gated on on_flush_end; macOS:
 /// beginFlush()/commitFlush(), including the atlas front-buffer swap and
-/// per-ExternalGridView atlas snapshot update). Without the bracket, the
-/// scroll's vertex data was composed but never actually published on
-/// Windows (no commit, no repaint), and on macOS a new glyph ensured along
-/// the way could leave committed vertex UVs pointing at an atlas
-/// generation the frontend never swapped to.
+/// per-ExternalGridView atlas snapshot update). Without it, the vertices
+/// are never published on Windows, and on macOS a glyph ensured along the
+/// way can leave committed UVs pointing at an atlas generation the frontend
+/// never swapped to.
 /// Returns true if the scroll was actually committed. False means the
 /// caller must keep msg_scroll_pending set so the scroll is retried.
 fn runMsgGridScrollFlush(self: *Core, offset: u32) bool {
