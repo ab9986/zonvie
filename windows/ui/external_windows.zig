@@ -768,7 +768,8 @@ fn drawNormalExternalSurfaceRowMode(
     // A committed scroll is work too: acquireForPaint has already consumed
     // it, so returning here would lose the back_tex and row-VB shift for good.
     const has_scroll_work = tbs_snap.scroll_rect != null or tbs_snap.vb_shift != 0;
-    const has_ease_work = has_layers and ext_win.surf.paint.easeMoving();
+    // The root eases without layers too, and only the row pass ticks it.
+    const has_ease_work = ext_win.surf.paint.easeMoving();
     if (rows_to_draw.items.len == 0 and !force_full_rows and !has_cursor and
         !has_scrollbar_work and !any_layer_dirty and !has_scroll_work and !has_ease_work)
     {
