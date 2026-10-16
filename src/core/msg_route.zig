@@ -99,6 +99,33 @@ pub fn isInteractivePrompt(kind: []const u8) bool {
         std.mem.eql(u8, kind, "number_prompt");
 }
 
+/// The colour family a message panel draws a `kind` in; each frontend maps it
+/// to its RGB, `normal` being Normal's foreground. Values are ABI
+/// (ZONVIE_MSG_TONE_*).
+pub const MsgTone = enum(u8) { normal = 0, err = 1, warn = 2, prompt = 3, search = 4 };
+
+pub fn toneForKind(kind: []const u8) MsgTone {
+    return switch (levelForKind(kind)) {
+        .err => .err,
+        .warn => .warn,
+        .info => if (isInteractivePrompt(kind) or isReturnPrompt(kind))
+            .prompt
+        else if (std.mem.eql(u8, kind, "search_count"))
+            .search
+        else
+            .normal,
+    };
+}
+
+test "toneForKind" {
+    try std.testing.expectEqual(MsgTone.err, toneForKind("rpc_error"));
+    try std.testing.expectEqual(MsgTone.warn, toneForKind("wmsg"));
+    try std.testing.expectEqual(MsgTone.prompt, toneForKind("number_prompt"));
+    try std.testing.expectEqual(MsgTone.prompt, toneForKind("return_prompt"));
+    try std.testing.expectEqual(MsgTone.search, toneForKind("search_count"));
+    try std.testing.expectEqual(MsgTone.normal, toneForKind("echo"));
+}
+
 /// A route predicate. All present fields must match (logical AND); absent
 /// fields match anything.
 pub const MsgFilter = struct {
@@ -129,6 +156,14 @@ pub const MsgFilter = struct {
         return true;
     }
 };
+
+test "height bounds are inclusive, as noice's message/filter.lua compares them" {
+    const f: MsgFilter = .{ .min_height = 3, .max_height = 5 };
+    try std.testing.expect(f.matches(.msg_show, "", 3));
+    try std.testing.expect(f.matches(.msg_show, "", 5));
+    try std.testing.expect(!f.matches(.msg_show, "", 2));
+    try std.testing.expect(!f.matches(.msg_show, "", 6));
+}
 
 pub const RouteOpts = struct {
     /// Explicitly do not display. Distinct from "no route matched", which
@@ -233,10 +268,17 @@ pub const Router = struct {
             if (r.filter.matches(event, kind, line_count)) return resolve(r);
         }
         const defaults = defaultRoutes(self.views);
-        for (defaults) |r| {
+        for (defaults[0 .. defaults.len - 1]) |r| {
             if (r.filter.matches(event, kind, line_count)) return resolve(r);
         }
-        unreachable; // the default tail has an empty filter
+        // The tail is the catch-all; taken without consulting its filter, so
+        // a route is total by construction.
+        comptime {
+            const tail = defaultRoutes(.{})[default_route_count - 1].filter;
+            std.debug.assert(tail.event == null and tail.kinds == null and tail.min_height == null and
+                tail.max_height == null and tail.level == null);
+        }
+        return resolve(defaults[defaults.len - 1]);
     }
 
     fn resolve(r: MsgRoute) RouteResult {

@@ -257,9 +257,10 @@ def check_trace(path):
     return 0
 
 
-def capture_trace(path, seconds):
+def capture_trace(path, seconds, floats):
     env = dict(os.environ)
     env.setdefault("ZONVIE_TRACE_CONFIG", "Release")
+    env["ZONVIE_TRACE_FLOATS"] = str(floats)
     command = [
         sys.executable,
         str(REPO / "test" / "perf" / "run_trace.py"),
@@ -290,11 +291,18 @@ def main():
         default=DEFAULT_TRACE,
         help=f"capture output (default: {DEFAULT_TRACE})",
     )
+    parser.add_argument(
+        "--floats",
+        type=int,
+        choices=range(4),
+        default=0,
+        help="fixed 20x10 floats over the scrolling area (default: 0)",
+    )
     args = parser.parse_args()
 
     trace = args.trace.resolve() if args.trace else args.output.resolve()
     if args.trace is None:
-        if capture_trace(trace, args.seconds) != 0:
+        if capture_trace(trace, args.seconds, args.floats) != 0:
             return 1
     if not trace.exists():
         print(f"FAIL: trace not found: {trace}", file=sys.stderr)
