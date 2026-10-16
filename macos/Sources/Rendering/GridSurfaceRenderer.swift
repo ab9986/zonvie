@@ -605,7 +605,7 @@ func stageSurfaceRowScroll(
 /// come from — so the two conditions live together, once.
 ///
 /// `cellHeightPx` is the height the rows are captured at. `lock` is the
-/// caller's because the two surfaces still have different numbers of locks.
+/// calling surface's own.
 ///
 /// Returns true when a step was staged or was already staged for this grid in
 /// this bracket, which is what the seed below is gated on.
@@ -1369,12 +1369,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// rect, scroll offsets and retention, the committed layer list, the
     /// shader cursor state, and `hasPresentedOnce`.
     ///
-    /// One lock where ExternalGridView has three, and it stays that way:
-    /// measured under a sustained 30 Hz scroll this lock was taken 19,764
-    /// times and found already held 49 — 0.248%, against 0.204% for the
-    /// busiest of the external surface's three. The count is a legibility
-    /// difference, not a performance one. What each of theirs guards, and the
-    /// single ordering rule between them, is written at their declarations.
+    /// One lock, as ExternalGridView has: measured under a sustained 30 Hz
+    /// scroll it was taken 19,764 times and found already held 49 — 0.248%.
     ///
     /// Cell metrics and `linespace` are NOT here: they live on
     /// SharedRenderResources behind a leaf lock, because reading cell height
@@ -1683,10 +1679,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     // pass. The pure parts are already shared free functions in
     // MetalTypes.swift, which take the lock and a `lockHeld` flag so two
     // surfaces can share code without sharing a lock; what is left is each
-    // class's adapter. This class keeps ONE lock where ExternalGridView keeps
-    // three: splitting it would make commitFlush hold two at once, because the
-    // retention publish there has to be atomic with the vertex publish.
-    // Audit 2026-08-25, finding 037.
+    // class's adapter. This class keeps one lock: splitting it would make
+    // commitFlush hold two at once, because the retention publish there has
+    // to be atomic with the vertex publish.
     // Fixed-size capacity ledger. Row callbacks only raise scalar entries;
     // the retry worker provisions Swift metadata and Metal buffers after the
     // flush bracket closes and before it reacquires the core grid lock.

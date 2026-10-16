@@ -1,6 +1,6 @@
 //! Checks every extern struct the core shares with frontends against its
-//! declaration in include/zonvie_core.h or include/zonvie_frontend.h, as the
-//! C compiler lays it out. Fields are matched by position, since several Zig
+//! declaration in include/zonvie_core.h, include/zonvie_frontend.h or
+//! include/zonvie_hbft.h, as the C compiler lays it out. Fields are matched by position, since several Zig
 //! names differ from C.
 
 const std = @import("std");
@@ -149,6 +149,16 @@ test "extern structs and callbacks match include/zonvie_core.h" {
     checkCallbacks(&failures);
     try std.testing.expectEqual(@as(usize, 0), failures);
     try std.testing.expectEqual(@as(u32, c.ZONVIE_CALLBACKS_ABI_VERSION), c_api.CALLBACKS_ABI_VERSION);
+}
+
+// Separate import: zonvie_hbft.h declares the C bridge's functions, which
+// c_api.zig does not export, so it stays out of the export check above.
+const hbft = @cImport(@cInclude("zonvie_hbft.h"));
+
+test "zonvie_core_parse_font_features writes zonvie_font_feature (zonvie_hbft.h)" {
+    var failures: usize = 0;
+    checkStruct(hbft.zonvie_font_feature, c_api.FontFeatureC, &failures);
+    try std.testing.expectEqual(@as(usize, 0), failures);
 }
 
 /// Every header #define / anonymous-enum value that has a Zig twin, and the

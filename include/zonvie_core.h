@@ -209,6 +209,9 @@ typedef void (*zonvie_on_vertices_row_fn)(
      clearing a different grid must not clear the current owner's cursor.
    - A row or cursor layer may arrive more than once within one flush
      bracket (an atlas reset restarts the emission); the last send wins.
+   - verts is valid only for the duration of the call: the core reuses the
+     buffer for the next send. Copy what you keep before returning; "apply on
+     commit" applies to that copy.
    A MAIN callback with row_count=0, verts=NULL, and vert_count=0 publishes
    a layout-only zero-cell transition. total_rows/total_cols are authoritative,
    and at least one is zero. It clears the logical MAIN surface without
@@ -412,7 +415,10 @@ typedef struct zonvie_layer {
    pixels a placement change exposes or covers (a layer moved, resized,
    restacked, added or removed) are the frontend's to repaint, from the
    previous layout and this one: the core does not dirty the rows under a
-   layer for it. */
+   layer for it.
+
+   layers is valid only for the duration of the call: the core refills the
+   same buffer for the next surface. Copy it before returning. */
 typedef void (*zonvie_on_surface_layout_fn)(
     void* ctx,
     int64_t surface_id,
@@ -907,6 +913,11 @@ typedef struct zonvie_callbacks {
        on_flush_begin: called before vertex generation starts.
        on_flush_end: called after all vertices (rows + cursor + external grids) are submitted.
        Frontend can use these to implement triple buffering / atomic commit.
+
+       Every callback inside the bracket runs synchronously on the core thread
+       with grid_mu held. From there, call only APIs documented as safe under
+       grid_mu (the *_locked variants and those noted for on_flush_end); an API
+       that takes grid_mu itself self-deadlocks.
 
        Callbacks fired inside the bracket fall into two classes:
        - TRANSACTIONAL: on_vertices_row (row and cursor updates),
