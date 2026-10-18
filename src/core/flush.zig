@@ -19491,3 +19491,20 @@ test "planAbortRetime moves elapsed deadlines only, and the throttle only once i
     try std.testing.expectEqual(core.msg_show_auto_hide_at, core.msg_history_retry_at);
     try std.testing.expectEqual(before_hist_hide, core.msg_history_auto_hide_at);
 }
+
+test "typing into the ext-cmdline stamps the new cell under the cmdline grid" {
+    var core = try initCmdlineTestCore();
+    defer core.deinitForTest();
+    core.grid.shader_inputs_enabled = true;
+
+    try core.grid.setCmdlineShow(&.{.{ .hl_id = 0, .text = "a" }}, 1, ':', "", 0, 1, 0);
+    notifyCmdlineChanges(&core);
+    core.grid.resetCellStamps();
+
+    try core.grid.setCmdlineShow(&.{.{ .hl_id = 0, .text = "ab" }}, 2, ':', "", 0, 1, 0);
+    notifyCmdlineChanges(&core);
+
+    try std.testing.expect(!core.grid.cell_stamp_clear);
+    try std.testing.expectEqual(@as(usize, 1), core.grid.cell_stamp_count);
+    try std.testing.expectEqual(@as(i16, @intCast(grid_mod.CMDLINE_GRID_ID)), core.grid.cell_stamps[0].grid);
+}

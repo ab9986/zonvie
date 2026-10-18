@@ -1862,8 +1862,12 @@ fn onGridResize(
         if (t[0] != .int or t[1] != .int or t[2] != .int) continue;
 
         const grid_id = checkedGridId(t[0].int) orelse continue;
-        // Not a keystroke edit: this grid's texture is stale.
-        grid.noteNonEditRedraw(grid_id);
+        // Not a keystroke edit: this grid's texture is stale. A float
+        // (or a grid not shown yet) only overlays the main window, so
+        // resizing it moves none of the text a ghost sits on.
+        const overlay = isOverlayGrid(grid, grid_id) and
+            (grid.win_layer.contains(grid_id) or grid.bufForConst(grid_id) == null);
+        if (!overlay) grid.noteNonEditRedraw(grid_id);
 
         const width = checkedU32(t[1].int) orelse continue;
         const height = checkedU32(t[2].int) orelse continue;
@@ -1936,8 +1940,11 @@ fn onGridDestroy(
             log.write("grid_destroy: rejected attempt to destroy main grid (grid_id=1)\n", .{});
             continue;
         }
-        // Not a keystroke edit: this grid's texture is stale.
-        grid.noteNonEditRedraw(grid_id);
+        // Not a keystroke edit: this grid's texture is stale. A float's
+        // text was only drawn over the main window; whether the main
+        // window's own text moved is told by win_pos, not by this.
+        if (!isOverlayGrid(grid, grid_id) or grid.external_grids.contains(grid_id))
+            grid.noteNonEditRedraw(grid_id);
         try grid.destroyGrid(grid_id);
     }
 }
@@ -2056,13 +2063,18 @@ fn onWinPos(
     }
 }
 
+/// A grid other than the main one that the cursor is not on: its
+/// placement can change what is drawn over the main window, never where
+/// the main window's own text sits.
+fn isOverlayGrid(grid: *const Grid, grid_id: i64) bool {
+    return grid_id != 1 and grid_id != grid.cursor_grid;
+}
+
 fn onWinHideClose(
     grid: *Grid,
     tuples: []mp.Value,
     ev_tag: RedrawEvent,
 ) !void {
-    // Not a keystroke edit: a window left the composited layout.
-    grid.noteNonEditRedraw(1);
     // win_hide/win_close: [grid]
     const is_close = ev_tag == .win_close;
     for (tuples) |tv| {
@@ -2070,6 +2082,10 @@ fn onWinHideClose(
         const t = tv.arr;
         if (t.len < 1 or t[0] != .int) continue;
         const grid_id = checkedGridId(t[0].int) orelse continue;
+        // Not a keystroke edit: a window left the composited layout. A
+        // float going away uncovers text that never moved.
+        if (!(isOverlayGrid(grid, grid_id) and grid.win_layer.contains(grid_id)))
+            grid.noteNonEditRedraw(1);
         // Track if a composited (non-external, non-float) editor window
         // is being closed. The promotion logic uses this to detect when
         // Neovim re-composites grid 2 as a fallback in the same batch.
@@ -2147,10 +2163,6 @@ fn onWinFloatPos(
     log: *Logger,
     tuples: []mp.Value,
 ) !void {
-    // Not a keystroke edit: a composited float moved on the main
-    // window's texture.
-    grid.noteNonEditRedraw(1);
-
     // Observed (older nvim): [grid, win, anchor, anchor_grid, anchor_row, anchor_col, mouse_enabled, zindex]
     // Docs (newer nvim):     [grid, win, anchor, anchor_grid, anchor_row, anchor_col, mouse_enabled,
     //                         zindex, compindex, screen_row, screen_col]
@@ -2169,6 +2181,10 @@ fn onWinFloatPos(
         const grid_id = checkedGridId(t[0].int) orelse continue;
         const win_id = t[1].int;
         const zindex = t[7].int;
+        // A float overlays the main window without moving its text, so
+        // placing one (a completion popup, every few keystrokes) keeps the
+        // smoke. Only a float holding the cursor carries ghosts of its own.
+        if (!isOverlayGrid(grid, grid_id)) grid.noteNonEditRedraw(1);
 
         // Optional fields (newer form)
         var compindex: i64 = 0;
@@ -2283,12 +2299,6 @@ fn onWinExternalPos(
     log: *Logger,
     tuples: []mp.Value,
 ) !void {
-    // Not a keystroke edit for the MAIN texture: whatever this
-    // grid had there as a composited float is stale. The
-    // external window's own texture is in its own coordinates
-    // and keeps its stamps — Neovim resends this event freely
-    // while a float is being typed into.
-    grid.noteNonEditRedraw(1);
     // win_external_pos: [grid, win]
     // Marks a grid as "external" - to be displayed in a separate top-level window.
     for (tuples) |tv| {
@@ -2310,7 +2320,15 @@ fn onWinExternalPos(
             },
             else => return err,
         };
-        _ = is_new; // Callback notification is handled by nvim_core after redraw processing
+        // Callback notification is handled by nvim_core after redraw processing.
+        // A grid that just left the main window takes whatever it had
+        // composited there with it, so the main texture is stale. Neovim also
+        // resends this event for a window that is already external, in
+        // nearly every flush while one exists; that changes nothing on the
+        // main window and must not erase the smoke of a keystroke typed there.
+        // The external window's own texture is in its own coordinates and
+        // keeps its stamps either way.
+        if (is_new) grid.noteNonEditRedraw(1);
     }
 }
 
@@ -5531,4 +5549,143 @@ test "opt-out: nothing is recorded while shader inputs are disabled" {
 
     try std.testing.expectEqual(@as(usize, 0), grid.cell_stamp_count);
     try std.testing.expect(!grid.cell_stamp_clear);
+}
+
+test "a resent win_external_pos does not clear the main window's stamps" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(4, 20);
+    try grid.resizeGrid(7, 3, 10);
+    _ = try grid.setWinExternalPos(7, 1000);
+    armCellStamps(&grid, "insert");
+    grid.cursor_grid = 1;
+    grid.cursor_row = 0;
+
+    // Neovim resends win_external_pos for a window that is already external
+    // in the flush that follows a keystroke in the main window. Nothing
+    // moved on the main window, so the keystroke's stamp must survive.
+    const cells = [_]mp.Value{try testCell(arena, "a", 0, null)};
+    var events = [_]mp.Value{
+        try testGridLineEvent(arena, 1, 0, 3, &cells),
+        (try testIntEvent(arena, "win_external_pos", &.{ 7, 1000 }))[0],
+    };
+    try runRedrawEvents(&grid, &hl, arena, &events);
+
+    try std.testing.expect(!grid.cellStampGridCleared(1));
+    try std.testing.expectEqual(@as(usize, 1), grid.cell_stamp_count);
+}
+
+test "a window that newly becomes external clears the main window's stamps" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(4, 20);
+    try grid.resizeGrid(7, 3, 10);
+    armCellStamps(&grid, "insert");
+
+    // Grid 7 leaves the main window: whatever it had composited there is gone.
+    var events = [_]mp.Value{(try testIntEvent(arena, "win_external_pos", &.{ 7, 1000 }))[0]};
+    try runRedrawEvents(&grid, &hl, arena, &events);
+
+    try std.testing.expect(grid.cellStampGridCleared(1));
+}
+
+fn testFloatPosEvent(arena: std.mem.Allocator, grid_id: i64) ![]mp.Value {
+    const t = try arena.alloc(mp.Value, 8);
+    t[0] = .{ .int = grid_id };
+    t[1] = .{ .int = 1000 + grid_id }; // win
+    t[2] = .{ .str = "NW" };
+    t[3] = .{ .int = 1 }; // anchor_grid
+    t[4] = .{ .int = 1 }; // anchor_row
+    t[5] = .{ .int = 2 }; // anchor_col
+    t[6] = .{ .bool = true }; // mouse_enabled
+    t[7] = .{ .int = 50 }; // zindex
+    return testEvent(arena, "win_float_pos", t);
+}
+
+test "a popup float opening and closing keeps the main window's stamps" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(4, 20);
+    armCellStamps(&grid, "insert");
+    grid.cursor_grid = 1;
+    grid.cursor_row = 0;
+
+    // A completion popup opens with the keystroke: the float only overlays
+    // the main window, so the typed cell's stamp must survive.
+    const cells = [_]mp.Value{try testCell(arena, "a", 0, null)};
+    var line = [_]mp.Value{try testGridLineEvent(arena, 1, 0, 3, &cells)};
+    try runRedrawEvents(&grid, &hl, arena, &line);
+    try runRedrawEvents(&grid, &hl, arena, try testIntEvent(arena, "grid_resize", &.{ 8, 10, 3 }));
+    try runRedrawEvents(&grid, &hl, arena, try testFloatPosEvent(arena, 8));
+    try std.testing.expect(!grid.cellStampGridCleared(1));
+    try std.testing.expectEqual(@as(usize, 1), grid.cell_stamp_count);
+
+    // The next keystroke closes it again.
+    grid.resetCellStamps();
+    const cells2 = [_]mp.Value{try testCell(arena, "b", 0, null)};
+    var line2 = [_]mp.Value{try testGridLineEvent(arena, 1, 0, 4, &cells2)};
+    try runRedrawEvents(&grid, &hl, arena, &line2);
+    try runRedrawEvents(&grid, &hl, arena, try testIntEvent(arena, "grid_resize", &.{ 8, 12, 3 }));
+    try runRedrawEvents(&grid, &hl, arena, try testIntEvent(arena, "win_close", &.{8}));
+    try runRedrawEvents(&grid, &hl, arena, try testIntEvent(arena, "grid_destroy", &.{8}));
+    try std.testing.expect(!grid.cellStampGridCleared(1));
+    try std.testing.expectEqual(@as(usize, 1), grid.cell_stamp_count);
+}
+
+test "moving the float that holds the cursor clears the main window's stamps" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(4, 20);
+    try grid.resizeGrid(8, 1, 10);
+    try runRedrawEvents(&grid, &hl, arena, try testFloatPosEvent(arena, 8));
+    armCellStamps(&grid, "insert");
+    grid.cursor_grid = 8;
+
+    // The ghosts typed into this float sit where the float was.
+    try runRedrawEvents(&grid, &hl, arena, try testFloatPosEvent(arena, 8));
+    try std.testing.expect(grid.cellStampGridCleared(1));
+}
+
+test "closing a split window clears the main window's stamps" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(4, 20);
+    try grid.resizeGrid(3, 2, 20);
+    try runRedrawEvents(&grid, &hl, arena, try testIntEvent(arena, "win_pos", &.{ 3, 1003, 2, 0, 20, 2 }));
+    armCellStamps(&grid, "insert");
+    grid.cursor_grid = 1;
+
+    // The windows left behind resize into the closed one's rows.
+    try runRedrawEvents(&grid, &hl, arena, try testIntEvent(arena, "win_close", &.{3}));
+    try std.testing.expect(grid.cellStampGridCleared(1));
 }
