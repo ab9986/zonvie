@@ -198,7 +198,12 @@ const shadertoy_epilogue =
     \\    vec2 fragCoord = iWindowOffset + vUV * iWindowSize;
     \\    vec4 color = vec4(0.0, 0.0, 0.0, 1.0);
     \\    mainImage(color, fragCoord);
-    \\#ifdef ZONVIE_PRESERVE_ALPHA
+    \\#if defined(ZONVIE_PRESERVE_ALPHA) && defined(ZONVIE_SHADER_ALPHA)
+    \\    // A shader that `#define`s ZONVIE_SHADER_ALPHA owns the alpha: it
+    \\    // returns premultiplied rgba, normally the terminal's alpha, raised
+    \\    // where it paints something that must not let the blur through.
+    \\    zonvie_fragColor = color;
+    \\#elif defined(ZONVIE_PRESERVE_ALPHA)
     \\    // Preserve the terminal's alpha so window transparency/blur shows
     \\    // through the shader. backTex is premultiplied, so this matches the
     \\    // non-shader copy path for passthrough/tint shaders. Caveats: alpha is
@@ -626,4 +631,22 @@ test "compile Shadertoy-style mainImage source to HLSL with auto-wrap" {
     try std.testing.expect(std.mem.indexOf(u8, out, "register(b1)") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "register(t0)") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "register(s0)") != null);
+}
+
+test "ZONVIE_SHADER_ALPHA hands the alpha to the shader under preserve_alpha" {
+    // The colour the shader writes, alpha included, reaches the output only
+    // when the shader opted in; plain preserve_alpha replaces the alpha with
+    // the terminal's.
+    const body =
+        \\void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+        \\    fragColor = vec4(texture(iChannel0, fragCoord / iResolution.xy).rgb, 0.375);
+        \\}
+    ;
+    const owned = try compileGlslToTarget(std.testing.allocator, "#define ZONVIE_PRESERVE_ALPHA 1\n#define ZONVIE_SHADER_ALPHA 1\n" ++ body, .msl);
+    defer std.testing.allocator.free(owned);
+    try std.testing.expect(std.mem.indexOf(u8, owned, "out.zonvie_fragColor = color;") != null);
+
+    const pinned = try compileGlslToTarget(std.testing.allocator, "#define ZONVIE_PRESERVE_ALPHA 1\n" ++ body, .msl);
+    defer std.testing.allocator.free(pinned);
+    try std.testing.expect(std.mem.indexOf(u8, pinned, "out.zonvie_fragColor = color;") == null);
 }
