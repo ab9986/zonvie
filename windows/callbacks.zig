@@ -2185,11 +2185,19 @@ pub fn onCellAgeStamps(
     if (app.renderer == null) return;
     const r = &app.renderer.?;
     // iTime base: the same origin updateCustomShaderUniforms uses, so the
-    // shader can compute `iTime - stamp` directly.
+    // shader can compute `iTime - stamp` directly. External renderers copy
+    // the main one's shader start, so the same `now` holds for them.
     const now = r.shaderTimeNow();
     const slice: []const core.zonvie_cell_stamp =
         if (stamps != null and n > 0) stamps.?[0..n] else &.{};
-    r.applyCellAgeStamps(slice, clear != 0, now);
+    r.applyCellAgeStamps(1, slice, clear != 0, now);
+    // Each external window keeps its own texture, indexed by its own grid.
+    var it = app.external_windows.iterator();
+    while (it.next()) |entry| {
+        const ext = entry.value_ptr.*;
+        if (ext.is_pending_close) continue;
+        ext.renderer.applyCellAgeStamps(entry.key_ptr.*, slice, clear != 0, now);
+    }
 }
 
 pub fn onLineSpace(ctx: ?*anyopaque, linespace_px: i32) callconv(.c) void {

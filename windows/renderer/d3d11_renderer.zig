@@ -2688,8 +2688,10 @@ pub const Renderer = struct {
     }
 
     /// Apply one flush's stamps. Called from the core thread via
-    /// on_cell_age_stamps; touches only the CPU mirror.
-    pub fn applyCellAgeStamps(self: *Renderer, stamps: []const core.zonvie_cell_stamp, clear: bool, now: f32) void {
+    /// on_cell_age_stamps; touches only the CPU mirror. `grid` is the stamp
+    /// grid this renderer's texture holds: 1 for the main window, otherwise
+    /// the external window's grid id. Stamps for other grids are skipped.
+    pub fn applyCellAgeStamps(self: *Renderer, grid: i64, stamps: []const core.zonvie_cell_stamp, clear: bool, now: f32) void {
         self.cell_age_mu.lockUncancelable(core.clock.io());
         defer self.cell_age_mu.unlock(core.clock.io());
         if (self.cell_age_cols == 0 or self.cell_age_rows == 0) return;
@@ -2700,11 +2702,9 @@ pub const Renderer = struct {
         }
         if (now <= 0) return;
         for (stamps) |st| {
-            // Only the main window keeps a cell-age texture on Windows;
-            // stamps for external windows (grid != 1) have nowhere to go.
-            if (st.grid != 1) continue;
+            if (st.grid != grid) continue;
             if (st.count == 0) {
-                // Clear marker for the main texture.
+                // Clear marker for this texture.
                 @memset(self.cell_age_values, 0);
                 self.cell_age_dirty = true;
                 continue;
@@ -2717,10 +2717,9 @@ pub const Renderer = struct {
             if (col_start >= col_end) continue;
             var col = col_start;
             while (col < col_end) : (col += 1) self.cell_age_values[base + col] = now;
-            // Per stamp, not per call: a list carrying only external-window
-            // stamps (which this frontend drops) must not advance the MAIN
-            // window's iTimeLastEdit, and a call that stamped nothing must
-            // not force a full texture upload.
+            // Per stamp, not per call: a list carrying only other grids'
+            // stamps must not advance this window's iTimeLastEdit, and a
+            // call that stamped nothing must not force a full texture upload.
             self.cell_age_last_edit = now;
             self.cell_age_dirty = true;
         }

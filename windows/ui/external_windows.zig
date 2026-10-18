@@ -3150,8 +3150,8 @@ pub fn syncExternalShaderFrame(app: *App, hwnd: c.HWND, g_sh: *d3d11.Renderer, c
             g_sh.shader_cursor_style = main_r3.shader_cursor_style;
             g_sh.shader_prev_cursor_style = main_r3.shader_prev_cursor_style;
         }
-        // iCellSize. The core stamps only grid 1 for this frontend, so an
-        // external window's cell-age grid stays empty and reads "never edited".
+        // iCellSize, which also sizes this window's cell-age grid; the core
+        // stamps it under this window's grid id.
         g_sh.cell_w_px = app.cell_w_px;
         g_sh.cell_h_px = app.rowHeightPx();
     }
