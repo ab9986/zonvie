@@ -3153,7 +3153,7 @@ pub fn syncExternalShaderFrame(app: *App, hwnd: c.HWND, g_sh: *d3d11.Renderer, c
         // iCellSize. The core stamps only grid 1 for this frontend, so an
         // external window's cell-age grid stays empty and reads "never edited".
         g_sh.cell_w_px = app.cell_w_px;
-        g_sh.cell_h_px = app.cell_h_px;
+        g_sh.cell_h_px = app.rowHeightPx();
     }
     g_sh.shader_screen_w = screen_w;
     g_sh.shader_screen_h = screen_h;

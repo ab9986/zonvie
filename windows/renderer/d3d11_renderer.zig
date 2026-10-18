@@ -428,7 +428,8 @@ pub const Renderer = struct {
     shader_wants_prev_frame: bool = false,
     /// Cell metrics, blink state and grid origin mirrored from the app by the
     /// UI thread before each shaded draw, for iCellSize, iCursorVisible,
-    /// iGridOrigin and the cell-age grid.
+    /// iGridOrigin and the cell-age grid. `cell_h_px` is the grid row
+    /// height, 'linespace' included, so cell lookups track the drawn rows.
     cell_w_px: u32 = 0,
     cell_h_px: u32 = 0,
     cursor_blink_on: bool = true,

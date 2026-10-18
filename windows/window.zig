@@ -2301,7 +2301,7 @@ fn drawMainFrame(hwnd: c.HWND, app: *App, g: *d3d11.Renderer, in: MainFrameInput
     // The chain renders over the full backbuffer, so iGridOrigin is where
     // the grid sits inside it: past the in-client tab bar or sidebar.
     g.cell_w_px = app.cell_w_px;
-    g.cell_h_px = app.cell_h_px;
+    g.cell_h_px = app.rowHeightPx();
     g.cursor_blink_on = app.cursor_blink.visible;
     g.shader_grid_origin = .{
         @floatFromInt(geom.content_x_offset orelse 0),
