@@ -136,12 +136,15 @@ const shadertoy_preamble =
     \\// Wrapper type + `texture()` overload: user code keeps writing
     \\// `texture(iChannel0, uv)` with a screen-space `uv`, and we
     \\// translate that to this window's local backTex UV under the hood.
+    \\// The wrappers sample LOD 0 explicitly: the textures have no mips, and
+    \\// an implicit-gradient sample inside a loop with divergent control
+    \\// flow forces D3DCompile to unroll it, which can hang for minutes.
     \\struct zonvie_iChannel0_t { int _d; };
     \\const zonvie_iChannel0_t iChannel0 = zonvie_iChannel0_t(0);
     \\vec4 texture(zonvie_iChannel0_t _ch, vec2 screen_uv) {
     \\    vec2 local_px = screen_uv * iResolution.xy - iWindowOffset;
     \\    vec2 local_uv = local_px / iWindowSize;
-    \\    return texture(zonvie_iChannel0Tex, local_uv);
+    \\    return textureLod(zonvie_iChannel0Tex, local_uv, 0.0);
     \\}
     \\vec4 textureLod(zonvie_iChannel0_t _ch, vec2 screen_uv, float lod) {
     \\    vec2 local_px = screen_uv * iResolution.xy - iWindowOffset;
@@ -156,7 +159,7 @@ const shadertoy_preamble =
     \\vec4 texture(zonvie_iPrevFrame_t _ch, vec2 screen_uv) {
     \\    vec2 local_px = screen_uv * iResolution.xy - iWindowOffset;
     \\    vec2 local_uv = local_px / iWindowSize;
-    \\    return texture(zonvie_iPrevFrameTex, local_uv);
+    \\    return textureLod(zonvie_iPrevFrameTex, local_uv, 0.0);
     \\}
     \\
     \\// Age of the cell under a screen-space pixel, in seconds, or a large
@@ -647,6 +650,29 @@ test "compile Shadertoy-style mainImage source to HLSL with auto-wrap" {
     try std.testing.expect(std.mem.indexOf(u8, out, "register(b1)") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "register(t0)") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "register(s0)") != null);
+}
+
+test "screen-space texture wrappers never emit an implicit-gradient Sample" {
+    // A gradient sample under divergent control flow makes D3DCompile try
+    // to unroll the enclosing loop; with a variable trip count it hangs.
+    const glsl =
+        \\void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+        \\    vec3 acc = vec3(0.0);
+        \\    int n = int(iTime) & 7;
+        \\    for (int i = 0; i < n; i++) {
+        \\        vec2 uv = (fragCoord + vec2(float(i), 0.0)) / iResolution.xy;
+        \\        vec3 c = texture(iChannel0, uv).rgb;
+        \\        if (c.r < 0.5) continue;
+        \\        acc += c + texture(iPrevFrame, uv).rgb;
+        \\    }
+        \\    fragColor = vec4(acc, 1.0);
+        \\}
+    ;
+    const out = try compileGlslToTarget(std.testing.allocator, glsl, .hlsl);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, ".Sample(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "zonvie_iChannel0Tex.SampleLevel(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "zonvie_iPrevFrameTex.SampleLevel(") != null);
 }
 
 test "ZONVIE_SHADER_ALPHA hands the alpha to the shader under preserve_alpha" {
