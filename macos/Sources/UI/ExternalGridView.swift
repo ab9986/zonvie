@@ -3429,13 +3429,11 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             && mainTerminalView?.renderer != nil
         // This window's iCellAge: the core stamps an external window under
         // its own grid id, in that grid's coordinates (see zonvie_cell_stamp).
-        var editInputs: SurfaceEditInputs? = nil
-        if runsChain, shared.shaderWantsEditInputs {
-            editInputs = SurfaceEditInputs(
-                feedback: customShaderFeedback,
-                cellAge: shared.cellAge.texture(
-                    grid: gridId, cols: Int(gridCols), rows: Int(gridRows), device: shared.device)
-            )
+        let editInputs: SurfaceEditInputs? = !runsChain ? nil : SurfaceEditInputs.make(
+            shared: shared, feedback: customShaderFeedback
+        ) {
+            shared.cellAge.texture(
+                grid: gridId, cols: Int(gridCols), rows: Int(gridRows), device: shared.device)
         }
         // Where this grid starts in this window's drawable: a decorated
         // surface insets its viewport for its icon/padding (the same mapping

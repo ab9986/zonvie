@@ -425,12 +425,15 @@ pub const Renderer = struct {
     // Allocated only when a loaded shader references them, so a shader-less
     // or plain-shader configuration costs exactly what it did before.
     shader_wants_edit_inputs: bool = false,
-    /// Cell metrics mirrored from the app, for iCellSize and the cell-age
-    /// grid. The renderer does not otherwise track them.
+    shader_wants_prev_frame: bool = false,
+    /// Cell metrics, blink state and grid origin mirrored from the app by the
+    /// UI thread before each shaded draw, for iCellSize, iCursorVisible,
+    /// iGridOrigin and the cell-age grid.
     cell_w_px: u32 = 0,
     cell_h_px: u32 = 0,
-    /// Cursor blink visibility mirrored from the app, for iCursorVisible.
     cursor_blink_on: bool = true,
+    /// Top-left of the grid in backbuffer px; iCurrentCursor shares the space.
+    shader_grid_origin: [2]f32 = .{ 0, 0 },
     shader_owns_cursor: bool = false,
     /// Feedback pair: the LAST pass writes here instead of the backbuffer so
     /// the NEXT frame can sample it as iPrevFrame; a copy then moves it to
@@ -761,6 +764,19 @@ pub const Renderer = struct {
         for (&self.custom_shader_pong_rtv) |*r| safeRelease(r);
         for (&self.custom_shader_pong_tex) |*t| safeRelease(t);
         safeRelease(&self.custom_shader_uniforms_cb);
+        self.releaseFeedbackTextures();
+        safeRelease(&self.cell_age_srv);
+        safeRelease(&self.cell_age_tex);
+        {
+            // The core thread writes the mirror under cell_age_mu; callers
+            // detach the renderer from `app.renderer` under app.mu first.
+            self.cell_age_mu.lockUncancelable(core.clock.io());
+            defer self.cell_age_mu.unlock(core.clock.io());
+            if (self.cell_age_values.len != 0) self.alloc.free(self.cell_age_values);
+            self.cell_age_values = &.{};
+            self.cell_age_cols = 0;
+            self.cell_age_rows = 0;
+        }
 
         safeRelease(&self.vb);
         safeRelease(&self.rs);
@@ -2915,6 +2931,7 @@ pub const Renderer = struct {
         self.custom_shader_pipelines.clearRetainingCapacity();
         self.any_custom_shader_needs_animation = false;
         self.shader_wants_edit_inputs = false;
+        self.shader_wants_prev_frame = false;
         self.shader_owns_cursor = false;
 
         if (!cfg.shaders.enabled or cfg.shaders.paths.len == 0) return;
@@ -2937,12 +2954,22 @@ pub const Renderer = struct {
             };
             if (pipeline.needs_animation) self.any_custom_shader_needs_animation = true;
             if (pipeline.uses_edit_inputs) self.shader_wants_edit_inputs = true;
+            if (pipeline.uses_prev_frame) self.shader_wants_prev_frame = true;
             if (pipeline.owns_cursor) self.shader_owns_cursor = true;
         }
         applog.appLog(
             "[CustomShader] loaded {d}/{d} custom shaders, anyNeedsAnimation={}\n",
             .{ self.custom_shader_pipelines.items.len, cfg.shaders.paths.len, self.any_custom_shader_needs_animation },
         );
+    }
+
+    /// True when a `@zonvie-owns-cursor` shader can draw the cursor now, so
+    /// the native cursor and its glow must not be drawn. The shader draws
+    /// every shape from iCurrentCursor; until a rect is published the native
+    /// pass stays in charge.
+    pub fn shaderDrawsCursorNow(self: *const Renderer) bool {
+        return self.shader_owns_cursor and self.custom_shader_pipelines.items.len > 0 and
+            self.shader_cursor_current[2] > 0 and self.shader_cursor_current[3] > 0;
     }
 
     const CustomShaderCompileError = error{
@@ -3159,6 +3186,7 @@ pub const Renderer = struct {
             .pixel_shader = ps_out,
             .needs_animation = core.frontend_rules.shaderNeedsAnimation(glsl),
             .uses_edit_inputs = core.frontend_rules.shaderUsesEditInputs(glsl),
+            .uses_prev_frame = core.frontend_rules.shaderUsesPrevFrame(glsl),
             .owns_cursor = core.frontend_rules.shaderOwnsCursor(glsl),
         };
     }
@@ -3295,13 +3323,11 @@ pub const Renderer = struct {
         u.iCurrentCursorColor = self.shader_cursor_current_color;
         u.iPreviousCursorColor = self.shader_cursor_previous_color;
         u.iTimeCursorChange = self.shader_cursor_change_time;
-        // Zonvie edit-effect uniforms. iGridOrigin is (0,0): the main grid
-        // starts at the window's top-left and the cell-age grid is indexed in
-        // that same screen space (see ensureCellAgeGrid).
+        // Zonvie edit-effect uniforms. The cell-age grid is indexed in grid
+        // cells, so the shader maps fragCoord through iGridOrigin.
         u.iCellSize[0] = @floatFromInt(self.cell_w_px);
         u.iCellSize[1] = @floatFromInt(self.cell_h_px);
-        u.iGridOrigin[0] = 0;
-        u.iGridOrigin[1] = 0;
+        u.iGridOrigin = self.shader_grid_origin;
         u.iTimeLastEdit = self.cell_age_last_edit;
         u.iCursorVisible = if (self.cursor_blink_on) 1 else 0;
         u.iCurrentCursorStyle = self.shader_cursor_style;
@@ -3390,14 +3416,14 @@ pub const Renderer = struct {
         var cell_age_srv_bind: ?*c.ID3D11ShaderResourceView = null;
         var feedback_rtv_target: ?*c.ID3D11RenderTargetView = null;
         var feedback_src_tex: ?*c.ID3D11Texture2D = null;
-        if (self.shader_wants_edit_inputs) {
+        if (self.shader_wants_edit_inputs and self.cell_w_px > 0 and self.cell_h_px > 0) {
+            const cols = (self.width + self.cell_w_px - 1) / self.cell_w_px;
+            const rows = (self.height + self.cell_h_px - 1) / self.cell_h_px;
+            self.ensureCellAgeGrid(@max(1, cols), @max(1, rows));
+            cell_age_srv_bind = self.ensureCellAgeTexture(ctx, ctx_vtbl);
+        }
+        if (self.shader_wants_prev_frame) {
             self.ensureFeedbackTextures();
-            if (self.cell_w_px > 0 and self.cell_h_px > 0) {
-                const cols = (self.width + self.cell_w_px - 1) / self.cell_w_px;
-                const rows = (self.height + self.cell_h_px - 1) / self.cell_h_px;
-                self.ensureCellAgeGrid(@max(1, cols), @max(1, rows));
-                cell_age_srv_bind = self.ensureCellAgeTexture(ctx, ctx_vtbl);
-            }
             if (self.feedback_rtv[self.feedback_index]) |w| {
                 if (self.feedback_srv[1 - self.feedback_index]) |r| {
                     feedback_rtv_target = w;

@@ -465,7 +465,7 @@ const thymer_reference_glsl =
     \\        }
     \\    }
     \\    if ((iCurrentCursorStyle == 2 || iCurrentCursorStyle == 3) && iCursorVisible != 0) {
-    \\        vec2 p = fragCoord - vec2(iCurrentCursor.x, iCurrentCursor.y) - iGridOrigin;
+    \\        vec2 p = fragCoord - vec2(iCurrentCursor.x, iCurrentCursor.y);
     \\        float sd = sdRoundBox(p, iCurrentCursor.zw * 0.5, 1.5);
     \\        float a = 1.0 - smoothstep(-0.5, 0.5, sd);
     \\        base.rgb = mix(base.rgb, iCurrentCursorColor.rgb, a);
@@ -519,12 +519,28 @@ test "Thymer reference shader compiles to MSL with the Zonvie edit inputs" {
     defer std.testing.allocator.free(out);
     try std.testing.expect(out.len > 0);
     try std.testing.expect(std.mem.indexOf(u8, out, "metal_stdlib") != null);
+    // The slots CustomShaderPipeline.swift binds: iPrevFrame at 2, iCellAge at 3.
+    try expectDeclaredAt(out, "iPrevFrame", "[[texture(2)]]");
+    try expectDeclaredAt(out, "iCellAge", "[[texture(3)]]");
 }
 
 test "Thymer reference shader compiles to HLSL with the Zonvie edit inputs" {
     const out = try compileGlslToTarget(std.testing.allocator, thymer_reference_glsl, .hlsl);
     defer std.testing.allocator.free(out);
     try std.testing.expect(out.len > 0);
+    // The slots d3d11_renderer.zig binds with PSSetShaderResources(2|3).
+    try expectDeclaredAt(out, "iPrevFrame", "register(t2)");
+    try expectDeclaredAt(out, "iCellAge", "register(t3)");
+}
+
+/// Fails unless some line of `out` declares `name` with `binding`.
+fn expectDeclaredAt(out: []const u8, name: []const u8, binding: []const u8) !void {
+    var it = std.mem.splitScalar(u8, out, '\n');
+    while (it.next()) |line| {
+        if (std.mem.indexOf(u8, line, name) != null and std.mem.indexOf(u8, line, binding) != null) return;
+    }
+    std.debug.print("no line declares {s} at {s}\n", .{ name, binding });
+    return error.TestExpectedBinding;
 }
 
 test "Ghostty cursor_blaze shape still compiles against the extended preamble" {

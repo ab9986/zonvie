@@ -156,9 +156,12 @@ final class SharedRenderResources {
     /// the loaded chain, so they belong with it.
     var customShaderPostProcess: ZonvieConfig.ShaderPostProcess = .afterBloom
     var anyCustomShaderNeedsAnimation: Bool = false
-    /// True when a loaded shader reads the Zonvie edit inputs. Gates every
-    /// feedback/cell-age allocation and upload, on every surface.
+    /// True when a loaded shader reads the cell-age inputs. Gates every
+    /// cell-age allocation and upload, on every surface.
     private(set) var shaderWantsEditInputs: Bool = false
+    /// True when a loaded shader reads iPrevFrame. Gates the feedback pair
+    /// and its copy pass, on every surface.
+    private(set) var shaderWantsPrevFrame: Bool = false
     /// True when a loaded shader declared `@zonvie-owns-cursor`.
     private(set) var shaderOwnsCursor: Bool = false
     /// Fired when the loaded chain starts or stops reading the edit inputs.
@@ -1456,6 +1459,7 @@ extension SharedRenderResources {
         customShaderPipelinesDecorated.removeAll()
         anyCustomShaderNeedsAnimation = false
         shaderWantsEditInputs = false
+        shaderWantsPrevFrame = false
         shaderOwnsCursor = false
         // Only ask the core to build stamp lists when a shader reads them,
         // and drop the stores when none does, so an unused input costs no
@@ -1479,6 +1483,7 @@ extension SharedRenderResources {
             customShaderPipelines.append(loaded)
             if loaded.needsAnimation { anyCustomShaderNeedsAnimation = true }
             if loaded.usesEditInputs { shaderWantsEditInputs = true }
+            if loaded.usesPrevFrame { shaderWantsPrevFrame = true }
             if loaded.ownsCursor { shaderOwnsCursor = true }
         }
         // Decorated variant: always opaque (preserve_alpha OFF). Only a

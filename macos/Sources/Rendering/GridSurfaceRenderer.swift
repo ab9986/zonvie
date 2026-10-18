@@ -402,11 +402,24 @@ enum SurfaceDrawablePresentation {
 }
 
 /// The Zonvie edit-effect inputs one surface hands its chain: its own
-/// feedback pair (iPrevFrame) and its cell-age texture (iCellAge, nil until
-/// its store is sized). Nil as a whole when no loaded shader reads them.
+/// feedback pair (iPrevFrame, nil unless a shader reads it) and its cell-age
+/// texture (iCellAge, nil until its store is sized or when no shader reads
+/// it). Nil as a whole when no loaded shader reads either.
 struct SurfaceEditInputs {
-    let feedback: SurfaceFeedbackTextures
+    let feedback: SurfaceFeedbackTextures?
     let cellAge: MTLTexture?
+
+    /// Nil when the loaded chain reads neither input.
+    static func make(
+        shared: SharedRenderResources,
+        feedback: SurfaceFeedbackTextures,
+        cellAge: () -> MTLTexture?
+    ) -> SurfaceEditInputs? {
+        guard shared.shaderWantsEditInputs || shared.shaderWantsPrevFrame else { return nil }
+        return SurfaceEditInputs(
+            feedback: shared.shaderWantsPrevFrame ? feedback : nil,
+            cellAge: shared.shaderWantsEditInputs ? cellAge() : nil)
+    }
 }
 
 @discardableResult
@@ -4672,17 +4685,16 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // drawable, indexed with the shader's own formula
         // ((fragCoord - iGridOrigin) / iCellSize), so it only has to cover the
         // window, not agree with Neovim's grid size.
-        var editInputs: SurfaceEditInputs? = nil
-        if runsChain, shared.shaderWantsEditInputs {
+        let editInputs: SurfaceEditInputs? = !runsChain ? nil : SurfaceEditInputs.make(
+            shared: shared, feedback: customShaderFeedback
+        ) {
             let cw = cellWidthPx, ch = cellHeightPx
-            let cellAge: MTLTexture? = (cw > 0 && ch > 0)
-                ? shared.cellAge.texture(
-                    grid: 1,
-                    cols: max(1, Int((Float(view.drawableSize.width) / cw).rounded(.up))),
-                    rows: max(1, Int((Float(view.drawableSize.height) / ch).rounded(.up))),
-                    device: shared.device)
-                : nil
-            editInputs = SurfaceEditInputs(feedback: customShaderFeedback, cellAge: cellAge)
+            guard cw > 0, ch > 0 else { return nil }
+            return shared.cellAge.texture(
+                grid: 1,
+                cols: max(1, Int((Float(view.drawableSize.width) / cw).rounded(.up))),
+                rows: max(1, Int((Float(view.drawableSize.height) / ch).rounded(.up))),
+                device: shared.device)
         }
         let cursorVisible = f.cursorBlink && f.cursorCount > 0
         return encodeSurfaceBackBufferToDrawable(

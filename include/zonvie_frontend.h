@@ -771,17 +771,25 @@ ZONVIE_API size_t zonvie_core_escape_path_for_cmdline(
    Pure — no core pointer, no lock. */
 ZONVIE_API bool zonvie_core_shader_needs_animation(const char *source, size_t len);
 
-/* Whether a custom shader's source reads any Zonvie edit-effect input
-   (iPrevFrame, iCellAge, iCellSize, iGridOrigin, iTimeLastEdit). Frontends
-   allocate the feedback pair and the cell-age texture, and opt in with
+/* Whether a custom shader's source reads the cell-age inputs (iCellAge, the
+   zonvieCellAge wrapper, iCellSize, iGridOrigin, iTimeLastEdit). Frontends
+   allocate the cell-age texture, and opt in with
    zonvie_core_set_shader_inputs_enabled, only when a loaded shader does.
 
    Pure — no core pointer, no lock. */
 ZONVIE_API bool zonvie_core_shader_uses_edit_inputs(const char *source, size_t len);
 
+/* Whether a custom shader's source reads iPrevFrame. Frontends allocate the
+   feedback pair, and render the last pass into it plus a copy to the
+   drawable, only when a loaded shader does.
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API bool zonvie_core_shader_uses_prev_frame(const char *source, size_t len);
+
 /* Whether a custom shader's source carries the `@zonvie-owns-cursor` token:
-   the frontend then skips its native pass for bar/underline cursors and
-   leaves them to the shader. Block cursors stay native.
+   once iCurrentCursor holds a non-empty rect, the frontend skips its native
+   cursor pass and cursor glow for every shape, block included, and leaves
+   the cursor to the shader.
 
    Pure — no core pointer, no lock. */
 ZONVIE_API bool zonvie_core_shader_owns_cursor(const char *source, size_t len);
@@ -981,7 +989,10 @@ typedef struct zonvie_shader_uniforms {
        block so shaders compiled against the 160-byte layout keep reading the
        same offsets.
        iCellSize/iGridOrigin let a shader map fragCoord to a grid cell, which
-       is what the iCellAge sampler is indexed by.
+       is what the iCellAge sampler is indexed by:
+       cell = floor((fragCoord - iGridOrigin) / iCellSize). iGridOrigin is
+       the surface's grid top-left in the same drawable space as fragCoord
+       and iCurrentCursor, so cursor maths needs no iGridOrigin term.
        iTimeLastEdit is the iTime of the most recent cell stamp, so a shader
        can skip all per-cell work outside its effect window.
        iCursorVisible/iCurrentCursorStyle/iPreviousCursorStyle mirror
@@ -989,7 +1000,7 @@ typedef struct zonvie_shader_uniforms {
        Ghostty's renderer cursor style enum: 0 block, 1 block_hollow, 2 bar,
        3 underline, 4 lock. Zonvie emits only 0/2/3. */
     float    iCellSize[2];            /* 160..167  cell (w, h) in drawable px */
-    float    iGridOrigin[2];          /* 168..175  main grid top-left, drawable px */
+    float    iGridOrigin[2];          /* 168..175  surface grid top-left, drawable px */
     float    iTimeLastEdit;           /* 176..179 */
     int32_t  iCursorVisible;          /* 180..183  0 while blink-off */
     int32_t  iCurrentCursorStyle;     /* 184..187 */

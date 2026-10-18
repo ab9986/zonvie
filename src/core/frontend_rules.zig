@@ -976,18 +976,23 @@ pub fn shaderNeedsAnimation(source: []const u8) bool {
     return containsAnyWord(source, &.{ "iTime", "iTimeDelta", "iFrame", "iFrameRate", "iDate" });
 }
 
-/// Whether a shader reads any Zonvie edit-effect input. Gates allocation of
-/// the feedback pair and the cell-age texture, so a shader that does not use
-/// them costs exactly what it did before.
+/// Whether a shader reads the cell-age inputs. Gates the core's stamp lists
+/// and the cell-age texture. `zonvieCellAge` is the preamble's wrapper around
+/// iCellAge, so a shader that only calls it still needs the texture bound.
 pub fn shaderUsesEditInputs(source: []const u8) bool {
-    return containsAnyWord(source, &.{ "iPrevFrame", "iCellAge", "iCellSize", "iGridOrigin", "iTimeLastEdit" });
+    return containsAnyWord(source, &.{ "iCellAge", "zonvieCellAge", "iCellSize", "iGridOrigin", "iTimeLastEdit" });
+}
+
+/// Whether a shader reads iPrevFrame. Gates the feedback pair and the copy
+/// pass it costs, so a cell-age-only shader still renders straight into the
+/// drawable.
+pub fn shaderUsesPrevFrame(source: []const u8) bool {
+    return containsAnyWord(source, &.{"iPrevFrame"});
 }
 
 /// Whether a shader opts into drawing the cursor itself with the
 /// `@zonvie-owns-cursor` comment token. The frontend then skips its native
-/// cursor pass for bar/underline cursors; block cursors stay native because
-/// the native pass inverts the glyph beneath them and a post-process shader
-/// has no per-cell colours to reproduce that.
+/// cursor pass and glow for every shape, block included.
 pub fn shaderOwnsCursor(source: []const u8) bool {
     return std.mem.indexOf(u8, source, "@zonvie-owns-cursor") != null;
 }
@@ -1022,8 +1027,16 @@ test "a shader animates when it reads a per-frame uniform as a whole word" {
 test "a shader uses the edit inputs only when it names one as a whole word" {
     try std.testing.expect(shaderUsesEditInputs("float a = texelFetch(iCellAge, c, 0).r;"));
     try std.testing.expect(shaderUsesEditInputs("vec2 cs = iCellSize;"));
+    try std.testing.expect(shaderUsesEditInputs("float a = zonvieCellAge(fragCoord) + iTime;"));
     try std.testing.expect(!shaderUsesEditInputs("float myiCellAge = 1.0;"));
     try std.testing.expect(!shaderUsesEditInputs("fragColor = vec4(sin(iTime));"));
+    try std.testing.expect(!shaderUsesEditInputs("vec4 p = texture(iPrevFrame, uv);"));
+}
+
+test "a shader uses iPrevFrame only when it names it" {
+    try std.testing.expect(shaderUsesPrevFrame("vec4 p = texture(iPrevFrame, uv);"));
+    try std.testing.expect(!shaderUsesPrevFrame("float a = texelFetch(iCellAge, c, 0).r;"));
+    try std.testing.expect(!shaderUsesPrevFrame("vec4 myiPrevFrame;"));
 }
 
 test "a shader owns the cursor only with the opt-in token" {

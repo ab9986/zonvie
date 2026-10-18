@@ -21,11 +21,12 @@ final class CustomShaderPipeline {
     /// flag the shader would execute only when Neovim flushes, producing
     /// a static image for shaders whose output depends on `iTime`.
     let needsAnimation: Bool
-    /// True when the source references any Zonvie edit-effect input
-    /// (`iPrevFrame` / `iCellAge` / ...). Aggregated by SharedRenderResources
-    /// so the feedback pair and cell-age texture are allocated only when
-    /// something actually reads them.
+    /// True when the source reads the cell-age inputs. Aggregated by
+    /// SharedRenderResources so the cell-age texture and the core's stamp
+    /// lists exist only when something reads them.
     let usesEditInputs: Bool
+    /// True when the source reads `iPrevFrame`. Gates the feedback pair.
+    let usesPrevFrame: Bool
     /// True when the source declared `@zonvie-owns-cursor`.
     let ownsCursor: Bool
 
@@ -34,12 +35,14 @@ final class CustomShaderPipeline {
         pipelineState: MTLRenderPipelineState,
         needsAnimation: Bool,
         usesEditInputs: Bool,
+        usesPrevFrame: Bool,
         ownsCursor: Bool
     ) {
         self.sourcePath = sourcePath
         self.pipelineState = pipelineState
         self.needsAnimation = needsAnimation
         self.usesEditInputs = usesEditInputs
+        self.usesPrevFrame = usesPrevFrame
         self.ownsCursor = ownsCursor
     }
 
@@ -55,6 +58,13 @@ final class CustomShaderPipeline {
     static func detectUsesEditInputs(in source: String) -> Bool {
         var source = source
         return source.withUTF8 { zonvie_core_shader_uses_edit_inputs($0.baseAddress, $0.count) }
+    }
+
+    /// Whether the shader reads iPrevFrame: the core's rule, shared with
+    /// Windows.
+    static func detectUsesPrevFrame(in source: String) -> Bool {
+        var source = source
+        return source.withUTF8 { zonvie_core_shader_uses_prev_frame($0.baseAddress, $0.count) }
     }
 
     /// Whether the shader opts into drawing the cursor: the core's rule,
@@ -136,13 +146,15 @@ final class CustomShaderPipeline {
 
         let needsAnimation = detectNeedsAnimation(in: glslSource)
         let usesEditInputs = detectUsesEditInputs(in: glslSource)
+        let usesPrevFrame = detectUsesPrevFrame(in: glslSource)
         let ownsCursor = detectOwnsCursor(in: glslSource)
-        ZonvieCore.appLog("[CustomShader] loaded \(sourcePath) (needsAnimation=\(needsAnimation) editInputs=\(usesEditInputs) ownsCursor=\(ownsCursor))")
+        ZonvieCore.appLog("[CustomShader] loaded \(sourcePath) (needsAnimation=\(needsAnimation) editInputs=\(usesEditInputs) prevFrame=\(usesPrevFrame) ownsCursor=\(ownsCursor))")
         return CustomShaderPipeline(
             sourcePath: sourcePath,
             pipelineState: pipelineState,
             needsAnimation: needsAnimation,
             usesEditInputs: usesEditInputs,
+            usesPrevFrame: usesPrevFrame,
             ownsCursor: ownsCursor
         )
     }

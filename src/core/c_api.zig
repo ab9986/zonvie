@@ -2110,6 +2110,11 @@ pub export fn zonvie_core_shader_uses_edit_inputs(source: ?[*]const u8, len: usi
     return frontend_rules.shaderUsesEditInputs(s[0..len]);
 }
 
+pub export fn zonvie_core_shader_uses_prev_frame(source: ?[*]const u8, len: usize) callconv(.c) bool {
+    const s = source orelse return false;
+    return frontend_rules.shaderUsesPrevFrame(s[0..len]);
+}
+
 pub export fn zonvie_core_shader_owns_cursor(source: ?[*]const u8, len: usize) callconv(.c) bool {
     const s = source orelse return false;
     return frontend_rules.shaderOwnsCursor(s[0..len]);

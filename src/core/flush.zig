@@ -3602,13 +3602,14 @@ pub const FlushCtx = struct {
             }
         }
         // Hand the frontend this flush's cell-age stamps. Registered AFTER
-        // the on_flush_end defer and BEFORE the external-grid one, so LIFO
-        // runs it after vertices are submitted and before on_flush_end —
-        // the ordering the ABI documents. Always drains, so an aborted flush
-        // does not leak stamps into the next one.
-        defer {
+        // the on_flush_end defer, so LIFO runs it after vertices are
+        // submitted and before on_flush_end —
+        // the ordering the ABI documents. An aborted flush keeps its stamps
+        // and clear markers, like the grid_scroll events below: its rows stay
+        // dirty, so they reach the frontend with the flush that commits them.
+        defer if (!ctx.core.flush_aborted) {
             const g = &ctx.core.grid;
-            if (g.shader_inputs_enabled and !ctx.core.flush_aborted) {
+            if (g.shader_inputs_enabled) {
                 if (ctx.core.cb.on_cell_age_stamps) |cb| {
                     if (g.cell_stamp_clear) {
                         // Bulk update: whatever ghost is on any texture no
@@ -3625,7 +3626,7 @@ pub const FlushCtx = struct {
                 }
             }
             g.resetCellStamps();
-        }
+        };
         // Grid scroll events are NOT dispatched or cleared — they are preserved
         // for the retry flush so smooth-scroll offsets stay in sync with vertices.
         if (ctx.core.flush_aborted) {
@@ -19507,4 +19508,90 @@ test "typing into the ext-cmdline stamps the new cell under the cmdline grid" {
     try std.testing.expect(!core.grid.cell_stamp_clear);
     try std.testing.expectEqual(@as(usize, 1), core.grid.cell_stamp_count);
     try std.testing.expectEqual(@as(i16, @intCast(grid_mod.CMDLINE_GRID_ID)), core.grid.cell_stamps[0].grid);
+}
+
+test "an aborted flush hands its stamps and clear markers to the flush that commits its rows" {
+    const State = struct {
+        core: *Core,
+        abort: bool = false,
+        deliveries: usize = 0,
+        got: [8]grid_mod.CellStamp = undefined,
+        got_len: usize = 0,
+
+        fn onBegin(ctx: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (self.abort) self.core.flush_aborted = true;
+        }
+
+        fn onStamps(ctx: ?*anyopaque, stamps: ?[*]const grid_mod.CellStamp, n: usize, clear: i32) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            _ = clear;
+            self.deliveries += 1;
+            self.got_len = @min(n, self.got.len);
+            if (stamps) |s| @memcpy(self.got[0..self.got_len], s[0..self.got_len]);
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 1, 4);
+    core.drawable_w_px = 4;
+    core.drawable_h_px = 1;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    core.grid.shader_inputs_enabled = true;
+
+    var state = State{ .core = &core };
+    core.ctx = &state;
+    core.cb.on_flush_begin = State.onBegin;
+    core.cb.on_cell_age_stamps = State.onStamps;
+
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(1, 1);
+    state.deliveries = 0;
+
+    // A keystroke stamps grid 1; the frontend refuses the flush. The retry
+    // commits the row and must carry the stamp.
+    core.grid.putCell(0, 1, 'x', 0);
+    core.grid.stampEditedCells(1, 0, 1, 1);
+    state.abort = true;
+    try flush_ctx.onFlush(1, 1);
+    try std.testing.expect(core.flush_aborted);
+    try std.testing.expectEqual(@as(usize, 0), state.deliveries);
+    state.abort = false;
+    try flush_ctx.onFlush(1, 1);
+    try std.testing.expect(!core.flush_aborted);
+    try std.testing.expectEqual(@as(usize, 1), state.deliveries);
+    try std.testing.expectEqual(@as(usize, 1), state.got_len);
+    try std.testing.expectEqual(grid_mod.CellStamp{ .row = 0, .col = 1, .count = 1, .grid = 1 }, state.got[0]);
+    try std.testing.expectEqual(@as(usize, 0), core.grid.cell_stamp_count);
+
+    // A scroll's clear marker survives a refused flush the same way, or the
+    // retry commits scrolled text under ghosts left at their old rows.
+    state.deliveries = 0;
+    core.grid.putCell(0, 2, 'y', 0);
+    core.grid.noteNonEditRedraw(1);
+    state.abort = true;
+    try flush_ctx.onFlush(1, 1);
+    try std.testing.expectEqual(@as(usize, 0), state.deliveries);
+    state.abort = false;
+    try flush_ctx.onFlush(1, 1);
+    try std.testing.expectEqual(@as(usize, 1), state.deliveries);
+    try std.testing.expectEqual(@as(usize, 1), state.got_len);
+    try std.testing.expectEqual(grid_mod.CellStamp{ .row = 0, .col = 0, .count = 0, .grid = 1 }, state.got[0]);
+
+    // No retry: the next Neovim batch scrolls before anything commits. The
+    // kept stamp would sit on text that has moved, so the batch's clear
+    // marker must drop it rather than let it leak into that flush.
+    state.deliveries = 0;
+    core.grid.putCell(0, 3, 'z', 0);
+    core.grid.stampEditedCells(1, 0, 3, 1);
+    state.abort = true;
+    try flush_ctx.onFlush(1, 1);
+    state.abort = false;
+    core.grid.noteNonEditRedraw(1);
+    try flush_ctx.onFlush(1, 1);
+    try std.testing.expectEqual(@as(usize, 1), state.deliveries);
+    try std.testing.expectEqual(@as(usize, 1), state.got_len);
+    try std.testing.expectEqual(grid_mod.CellStamp{ .row = 0, .col = 0, .count = 0, .grid = 1 }, state.got[0]);
 }

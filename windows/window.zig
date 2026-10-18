@@ -2297,6 +2297,17 @@ fn drawMainFrame(hwnd: c.HWND, app: *App, g: *d3d11.Renderer, in: MainFrameInput
     const geom = mainContentGeom(hwnd, app, in.snap.row_h_px);
     renderMainChromeTextures(app, geom.client);
 
+    // Edit-effect shader inputs, on the UI thread that draws with them.
+    // The chain renders over the full backbuffer, so iGridOrigin is where
+    // the grid sits inside it: past the in-client tab bar or sidebar.
+    g.cell_w_px = app.cell_w_px;
+    g.cell_h_px = app.cell_h_px;
+    g.cursor_blink_on = app.cursor_blink.visible;
+    g.shader_grid_origin = .{
+        @floatFromInt(geom.content_x_offset orelse 0),
+        @floatFromInt(geom.content_y_offset orelse 0),
+    };
+
     if (!in.snap.row_mode) return drawMainFlatFrame(hwnd, app, g, in, geom);
     return drawMainRowFrame(hwnd, app, g, in, geom, resized_before_draw);
 }
@@ -2900,12 +2911,12 @@ fn drawMainRowFrame(
             .cursor_grid = cursor.grid,
             .cursor_erase_rows = cursor.erase_rows,
             .cursor_layer_origin = cursor.layer_origin,
-            .blink_visible = app.cursor_blink.visible,
+            .blink_visible = app.cursor_blink.visible and !g.shaderDrawsCursorNow(),
             .force_full_rows = force_full_rows,
             .glow = if (in.glow.enabled) app_mod.RowFrameGlow{
                 .intensity = in.glow.intensity,
                 .radius_scale = in.glow.radius_scale,
-                .cursor_visible = app.cursor_blink.visible,
+                .cursor_visible = app.cursor_blink.visible and !g.shaderDrawsCursorNow(),
             } else null,
             .draw_params = row_draw_params,
             .log_enabled = log_enabled,
@@ -4649,7 +4660,11 @@ pub export fn WndProc(
                         // WM_PAINT returns early for an iconic window too. The
                         // visible external windows above keep animating.
                         if (c.IsIconic(hwnd) == 0) {
-                            if (app.renderer) |*r| r.presentShaderAnimationFrame();
+                            if (app.renderer) |*r| {
+                                // A blink toggle repaints without a flush.
+                                r.cursor_blink_on = app.cursor_blink.visible;
+                                r.presentShaderAnimationFrame();
+                            }
                         }
                         if (app.renderer) |*r| anim_dev_lost = anim_dev_lost or r.device_lost;
 

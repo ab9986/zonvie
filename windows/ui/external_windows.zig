@@ -3147,12 +3147,20 @@ pub fn syncExternalShaderFrame(app: *App, hwnd: c.HWND, g_sh: *d3d11.Renderer, c
             g_sh.shader_cursor_current_color = main_r3.shader_cursor_current_color;
             g_sh.shader_cursor_previous_color = main_r3.shader_cursor_previous_color;
             g_sh.shader_cursor_change_time = main_r3.shader_cursor_change_time;
+            g_sh.shader_cursor_style = main_r3.shader_cursor_style;
+            g_sh.shader_prev_cursor_style = main_r3.shader_prev_cursor_style;
         }
+        // iCellSize. The core stamps only grid 1 for this frontend, so an
+        // external window's cell-age grid stays empty and reads "never edited".
+        g_sh.cell_w_px = app.cell_w_px;
+        g_sh.cell_h_px = app.cell_h_px;
     }
     g_sh.shader_screen_w = screen_w;
     g_sh.shader_screen_h = screen_h;
     g_sh.shader_window_offset_x = off_x;
     g_sh.shader_window_offset_y = off_y;
+    g_sh.shader_grid_origin = .{ off_x, off_y };
+    g_sh.cursor_blink_on = app.cursor_blink.visible;
 }
 
 pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
@@ -3297,7 +3305,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
         const cursor_items = render_pipeline_helpers.cursorVertsForFrame(
             app_mod.Vertex,
             tbs_cursor.verts.items,
-            app.cursor_blink.visible,
+            app.cursor_blink.visible and !g.shaderDrawsCursorNow(),
         );
         if (cursor_items.len > 0) {
             ext_win.paint_scratch.ensureUnusedCapacity(app.alloc, cursor_items.len) catch {
@@ -3309,7 +3317,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
         vert_count = ext_win.paint_scratch.items.len;
     }
 
-    const cursor_blink_visible = app.cursor_blink.visible;
+    const cursor_blink_visible = app.cursor_blink.visible and !g.shaderDrawsCursorNow();
 
     // Dirty state snapshot from TBS (row-mode normal windows only).
     const dirty_row_keys = &ext_win.surf.paint.dirty_row_keys;
