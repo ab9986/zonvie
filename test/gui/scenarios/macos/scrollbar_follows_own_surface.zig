@@ -80,9 +80,9 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // Gate: the main window has to have reported a knob position at all, or
     // "it did not move" proves nothing.
     const t0 = try app_log.nowMs(alloc, log_path);
-    const focus_mark = try app_log.lineMark(alloc, log_path);
+    // z_main is already current, so Neovim redraws nothing for this and no
+    // frame can be waited on; the <C-e> below is gated by its own report.
     try g.exec("luaeval('(function() vim.api.nvim_set_current_win(_G.z_main) return 1 end)()')");
-    try app_log.waitAfter(alloc, log_path, frame_marker, focus_mark, 10_000);
     try g.remoteSend("<C-e>");
     const main_seen = blk: {
         var timer = gui_io.Timer.start();
