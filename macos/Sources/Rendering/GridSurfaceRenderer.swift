@@ -4716,6 +4716,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     windowSize: view.drawableSize,
                     backingScale: backingScale,
                     cursorVisible: cursorVisible,
+                    cmdlineCursorVisible: f.cursorBlink,
                     lastLoggedCursor: &lastLoggedShaderCursor
                 )
             },

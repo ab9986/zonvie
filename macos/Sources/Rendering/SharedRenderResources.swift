@@ -368,7 +368,11 @@ final class SharedRenderResources {
     /// `cursorVisible` says whether the cursor is drawn on the surface being
     /// shaded this frame. iCurrentCursor is one global rect handed to every
     /// surface, so without it a shader that owns the cursor paints it on every
-    /// window whose drawable covers that screen position. `gridOrigin` and
+    /// window whose drawable covers that screen position. `cmdlineCursorVisible`
+    /// also counts the cursor as on this surface while it sits on the
+    /// ext-cmdline: that window always lies over the main window, so the
+    /// cursor's light spills past its edge while the body it would paint
+    /// stays under the cmdline's own. `gridOrigin` and
     /// `cellAgeGrid` place this surface's iCellAge texture: the main window's
     /// (grid 1) starts at its drawable's top-left; an external window's is
     /// indexed by its own grid.
@@ -379,6 +383,7 @@ final class SharedRenderResources {
         backingScale: CGFloat,
         timing: SurfaceShaderTiming? = nil,
         cursorVisible: Bool,
+        cmdlineCursorVisible: Bool = false,
         gridOrigin: CGPoint = .zero,
         cellAgeGrid: Int64 = 1,
         lastLoggedCursor: inout (Float, Float, Float, Float)
@@ -445,10 +450,13 @@ final class SharedRenderResources {
         uniforms.iPreviousCursorColor = cursor.previousColor
         uniforms.iTimeCursorChange = cursor.changeTimeSec
         // Zonvie edit-effect uniforms; cellHeightPx is the row height,
-        // 'linespace' included.
+        // 'linespace' included. Decided from the same snapshot as the rect so
+        // the two cannot disagree for a frame.
+        let visible = cursorVisible ||
+            (cmdlineCursorVisible && cursor.gridId == ZonvieCore.cmdlineGridId)
         zonvie_shader_fill_edit_uniforms(
             &uniforms, cellWidthPx, cellHeightPx, Float(gridOrigin.x), Float(gridOrigin.y),
-            cellAge.lastEdit(grid: cellAgeGrid), cursorVisible, shaderWantsEditInputs)
+            cellAge.lastEdit(grid: cellAgeGrid), visible, shaderWantsEditInputs)
         // Shadertoy iDate: (year, month [1..12], day, seconds-in-day).
         // Shadertoy's howto lists the fields as "Year, month, day,
         // time in seconds" without specifying month indexing. Forward
