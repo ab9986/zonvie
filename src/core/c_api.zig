@@ -27,6 +27,7 @@ pub const win_layout = @import("win_layout.zig");
 const msg_stack = @import("msg_stack.zig");
 pub const glow_chain = @import("glow_chain.zig");
 pub const frontend_rules = @import("frontend_rules.zig");
+pub const cell_age_store = @import("cell_age_store.zig");
 pub const msgpack = @import("msgpack.zig");
 pub const rpc_encode = @import("rpc_encode.zig");
 pub const redraw_handler = @import("redraw_handler.zig");
@@ -39,6 +40,7 @@ test {
     _ = @import("redraw_fuzz_test.zig");
     _ = damage_bands;
     _ = scroll_ease;
+    _ = cell_age_store;
 }
 
 // Decoration flags (must match ZONVIE_DECO_* in zonvie_core.h)
@@ -3682,6 +3684,137 @@ pub const zonvie_cell_stamp = grid_mod.CellStamp;
 
 comptime {
     std.debug.assert(@sizeOf(zonvie_cell_stamp) == 8);
+}
+
+pub export fn zonvie_cell_age_create() callconv(.c) ?*cell_age_store.Stores {
+    const s = std.heap.c_allocator.create(cell_age_store.Stores) catch return null;
+    s.* = .init(std.heap.c_allocator);
+    return s;
+}
+
+pub export fn zonvie_cell_age_destroy(s: ?*cell_age_store.Stores) callconv(.c) void {
+    const p = s orelse return;
+    p.deinit();
+    std.heap.c_allocator.destroy(p);
+}
+
+pub export fn zonvie_cell_age_apply(
+    s: *cell_age_store.Stores,
+    stamps: ?[*]const zonvie_cell_stamp,
+    n: usize,
+    clear: bool,
+    now: f32,
+) callconv(.c) void {
+    const slice: []const zonvie_cell_stamp = if (stamps != null and n > 0) stamps.?[0..n] else &.{};
+    s.apply(slice, clear, now);
+}
+
+pub export fn zonvie_cell_age_sync(
+    s: *cell_age_store.Stores,
+    grid: i64,
+    cols: u32,
+    rows: u32,
+    force: bool,
+    cache: *cell_age_store.SyncCache,
+    out_values: *?[*]const f32,
+) callconv(.c) i32 {
+    var v: []const f32 = &.{};
+    const r = s.sync(grid, cols, rows, force, cache, &v);
+    out_values.* = if (r == .dirty) v.ptr else null;
+    return @intFromEnum(r);
+}
+
+pub export fn zonvie_cell_age_end_upload(s: *cell_age_store.Stores) callconv(.c) void {
+    s.endUpload();
+}
+
+pub export fn zonvie_cell_age_drop(s: *cell_age_store.Stores, grid: i64) callconv(.c) void {
+    s.drop(grid);
+}
+
+pub export fn zonvie_cell_age_remove_all(s: *cell_age_store.Stores) callconv(.c) void {
+    s.removeAll();
+}
+
+pub export fn zonvie_cell_age_surface_grid(
+    surface_w_px: f32,
+    surface_h_px: f32,
+    cell_w_px: f32,
+    row_h_px: f32,
+    out_cols: *u32,
+    out_rows: *u32,
+) callconv(.c) void {
+    const g = cell_age_store.surfaceGrid(surface_w_px, surface_h_px, cell_w_px, row_h_px);
+    out_cols.* = g.cols;
+    out_rows.* = g.rows;
+}
+
+/// Classify a cursor rect into Ghostty's cursor style enum from what is on
+/// screen: narrower than half a cell is a bar, shorter than half a cell an
+/// underline, anything else a block (also before the first font load).
+fn cursorStyleForRect(rect: [4]f32, cell_w_px: f32, row_h_px: f32) i32 {
+    if (cell_w_px <= 0 or row_h_px <= 0) return 0;
+    if (rect[2] < cell_w_px * 0.5) return 2;
+    if (rect[3] < row_h_px * 0.5) return 3;
+    return 0;
+}
+
+/// Fill the edit-effect tail of `u` (iCellSize through iPreviousCursorStyle)
+/// for one surface. Call after iCurrentCursor/iPreviousCursor are set: the
+/// styles are classified from them. `row_h_px` is the grid row height,
+/// 'linespace' included. `time_last_edit` is the surface's
+/// SyncCache.last_edit; it reaches the shader only when the shader samples
+/// edit inputs, so a shader without them never sees an edit time.
+pub fn fillEditUniforms(
+    u: *zonvie_shader_uniforms,
+    cell_w_px: f32,
+    row_h_px: f32,
+    grid_origin_px: [2]f32,
+    time_last_edit: f32,
+    cursor_visible: bool,
+    wants_edit_inputs: bool,
+) void {
+    u.iCellSize = .{ cell_w_px, row_h_px };
+    u.iGridOrigin = grid_origin_px;
+    u.iTimeLastEdit = if (wants_edit_inputs) time_last_edit else 0;
+    u.iCursorVisible = @intFromBool(cursor_visible);
+    u.iCurrentCursorStyle = cursorStyleForRect(u.iCurrentCursor, cell_w_px, row_h_px);
+    u.iPreviousCursorStyle = cursorStyleForRect(u.iPreviousCursor, cell_w_px, row_h_px);
+}
+
+pub export fn zonvie_shader_fill_edit_uniforms(
+    u: *zonvie_shader_uniforms,
+    cell_w_px: f32,
+    row_h_px: f32,
+    grid_origin_x_px: f32,
+    grid_origin_y_px: f32,
+    time_last_edit: f32,
+    cursor_visible: bool,
+    wants_edit_inputs: bool,
+) callconv(.c) void {
+    fillEditUniforms(u, cell_w_px, row_h_px, .{ grid_origin_x_px, grid_origin_y_px }, time_last_edit, cursor_visible, wants_edit_inputs);
+}
+
+test "fillEditUniforms: row height sizes the cell, styles follow the rects, last edit is gated" {
+    var u: zonvie_shader_uniforms = .{};
+    u.iCurrentCursor = .{ 0, 0, 2, 20 }; // bar on a 9 x 20 cell
+    u.iPreviousCursor = .{ 0, 0, 9, 4 }; // underline
+    fillEditUniforms(&u, 9, 20, .{ 4, 30 }, 6, false, true);
+    try std.testing.expectEqual([2]f32{ 9, 20 }, u.iCellSize);
+    try std.testing.expectEqual([2]f32{ 4, 30 }, u.iGridOrigin);
+    try std.testing.expectEqual(@as(f32, 6), u.iTimeLastEdit);
+    try std.testing.expectEqual(@as(i32, 0), u.iCursorVisible);
+    try std.testing.expectEqual(@as(i32, 2), u.iCurrentCursorStyle);
+    try std.testing.expectEqual(@as(i32, 3), u.iPreviousCursorStyle);
+    // A 9 px tall cursor is a block on a 17 px cell but an underline once
+    // 'linespace' makes the row 20 px; the rule must see the row height.
+    u.iCurrentCursor = .{ 0, 0, 9, 9 };
+    fillEditUniforms(&u, 9, 17, .{ 0, 0 }, 6, true, false);
+    try std.testing.expectEqual(@as(i32, 0), u.iCurrentCursorStyle);
+    try std.testing.expectEqual(@as(f32, 0), u.iTimeLastEdit);
+    try std.testing.expectEqual(@as(i32, 1), u.iCursorVisible);
+    fillEditUniforms(&u, 9, 20, .{ 0, 0 }, 6, true, false);
+    try std.testing.expectEqual(@as(i32, 3), u.iCurrentCursorStyle);
 }
 
 /// Result of a shader compile. Owns an internal allocation; the caller must

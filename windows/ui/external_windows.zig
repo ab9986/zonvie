@@ -1657,7 +1657,7 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     // Show window without activating (SW_SHOWNA = 8)
     _ = c.ShowWindow(hwnd, 8);
 
-    const renderer = newExternalRenderer(app, hwnd) orelse {
+    const renderer = newExternalRenderer(app, hwnd, req.grid_id) orelse {
         _ = c.DestroyWindow(hwnd);
         return .retry;
     };
@@ -2046,6 +2046,8 @@ pub fn closeExternalWindowOnUIThread(app: *App, grid_id: i64) void {
 
     // Remove from external_windows HashMap and get the entry
     const entry = app.external_windows.fetchRemove(grid_id);
+    // A later window reusing this grid id must start unedited.
+    app.cell_age.drop(grid_id);
     // Evict the scrollbar viewport cache entry for this grid; nothing else
     // removes it once the grid is gone (a dead grid_id is never re-queried),
     // so long sessions would otherwise accumulate one stale entry per
@@ -2959,7 +2961,7 @@ pub fn serviceDeferredSizeReplays(app: *App) void {
 /// shares the App device, so until that is published there is none, and
 /// it loads the main window's custom post-process shaders so overlays get the
 /// same effect through their own back_tex.
-pub fn newExternalRenderer(app: *App, hwnd: c.HWND) ?d3d11.Renderer {
+pub fn newExternalRenderer(app: *App, hwnd: c.HWND, grid_id: i64) ?d3d11.Renderer {
     const device = app.d3d_device orelse return null;
     const device_ctx = app.d3d_ctx orelse return null;
     var renderer = d3d11.Renderer.initWithDevice(
@@ -2975,6 +2977,9 @@ pub fn newExternalRenderer(app: *App, hwnd: c.HWND) ?d3d11.Renderer {
         return null;
     };
     renderer.loadCustomShaderPipelines(&app.config);
+    // The core stamps an external window under its own grid id.
+    renderer.cell_age = &app.cell_age;
+    renderer.cell_age_grid = grid_id;
     if (app.corep) |corep| {
         if (core.zonvie_core_get_glow_enabled(corep)) _ = renderer.prepareBloomShaders();
     }
@@ -3147,8 +3152,6 @@ pub fn syncExternalShaderFrame(app: *App, hwnd: c.HWND, g_sh: *d3d11.Renderer, c
             g_sh.shader_cursor_current_color = main_r3.shader_cursor_current_color;
             g_sh.shader_cursor_previous_color = main_r3.shader_cursor_previous_color;
             g_sh.shader_cursor_change_time = main_r3.shader_cursor_change_time;
-            g_sh.shader_cursor_style = main_r3.shader_cursor_style;
-            g_sh.shader_prev_cursor_style = main_r3.shader_prev_cursor_style;
         }
         // iCellSize, which also sizes this window's cell-age grid; the core
         // stamps it under this window's grid id.

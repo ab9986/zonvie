@@ -2190,14 +2190,7 @@ pub fn onCellAgeStamps(
     const now = r.shaderTimeNow();
     const slice: []const core.zonvie_cell_stamp =
         if (stamps != null and n > 0) stamps.?[0..n] else &.{};
-    r.applyCellAgeStamps(1, slice, clear != 0, now);
-    // Each external window keeps its own texture, indexed by its own grid.
-    var it = app.external_windows.iterator();
-    while (it.next()) |entry| {
-        const ext = entry.value_ptr.*;
-        if (ext.is_pending_close) continue;
-        ext.renderer.applyCellAgeStamps(entry.key_ptr.*, slice, clear != 0, now);
-    }
+    app.cell_age.apply(slice, clear != 0, now);
 }
 
 pub fn onLineSpace(ctx: ?*anyopaque, linespace_px: i32) callconv(.c) void {

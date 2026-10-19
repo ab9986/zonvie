@@ -5910,6 +5910,10 @@ pub const App = struct {
     cursor_blink: core.frontend_rules.Blink = .{}, // .visible: the cursor is drawn
     cursor_blink_timer: c.UINT_PTR = 0, // Timer ID for blink
 
+    /// iCellAge mirrors for the main and every external window, written by
+    /// on_cell_age_stamps and read by each renderer's shaded draw.
+    cell_age: core.cell_age_store.Stores,
+
     cursor_is_hand: bool = false, // URL hover: hand cursor
     url_cache_grid: i64 = 0,
     url_cache_row: i32 = 0,
@@ -6365,6 +6369,8 @@ pub const App = struct {
 
         if (self.renderer) |*r| r.deinit();
         self.renderer = null;
+        // After every renderer that pointed at it.
+        self.cell_age.deinit();
 
         // Release App's own reference on the shared D3D11 device/context (the
         // renderer, as of this fix, takes and releases its OWN reference via

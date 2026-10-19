@@ -444,16 +444,11 @@ final class SharedRenderResources {
         uniforms.iCurrentCursorColor = cursor.currentColor
         uniforms.iPreviousCursorColor = cursor.previousColor
         uniforms.iTimeCursorChange = cursor.changeTimeSec
-        // Zonvie edit-effect uniforms.
-        let cellW = cellWidthPx, cellH = cellHeightPx
-        uniforms.iCellSize.0 = cellW
-        uniforms.iCellSize.1 = cellH
-        uniforms.iGridOrigin.0 = Float(gridOrigin.x)
-        uniforms.iGridOrigin.1 = Float(gridOrigin.y)
-        uniforms.iTimeLastEdit = shaderWantsEditInputs ? cellAge.lastEdit(grid: cellAgeGrid) : 0
-        uniforms.iCursorVisible = cursorVisible ? 1 : 0
-        uniforms.iCurrentCursorStyle = Self.cursorStyleForRect(cursorCur, cellW: cellW, cellH: cellH)
-        uniforms.iPreviousCursorStyle = Self.cursorStyleForRect(cursor.previous, cellW: cellW, cellH: cellH)
+        // Zonvie edit-effect uniforms; cellHeightPx is the row height,
+        // 'linespace' included.
+        zonvie_shader_fill_edit_uniforms(
+            &uniforms, cellWidthPx, cellHeightPx, Float(gridOrigin.x), Float(gridOrigin.y),
+            cellAge.lastEdit(grid: cellAgeGrid), cursorVisible, shaderWantsEditInputs)
         // Shadertoy iDate: (year, month [1..12], day, seconds-in-day).
         // Shadertoy's howto lists the fields as "Year, month, day,
         // time in seconds" without specifying month indexing. Forward
@@ -486,18 +481,6 @@ final class SharedRenderResources {
 
         state.frameIndex &+= 1
         return uniforms
-    }
-
-    /// Classify a cursor rect into Ghostty's cursor style enum, from what is
-    /// on screen rather than from the mode name: a rect narrower than half a
-    /// cell is a bar, one shorter than half a cell an underline, anything
-    /// else a block. Degenerate cell metrics (before the first font load)
-    /// fall back to block.
-    static func cursorStyleForRect(_ rect: SurfaceShaderCursor.Rect, cellW: Float, cellH: Float) -> Int32 {
-        guard cellW > 0, cellH > 0 else { return 0 }
-        if rect.2 < cellW * 0.5 { return 2 }      // bar
-        if rect.3 < cellH * 0.5 { return 3 }      // underline
-        return 0                                  // block
     }
 
     /// Close the transaction: publish this flush's staged CPU pixels, then swap
@@ -818,172 +801,115 @@ final class SurfaceShaderCursor {
     }
 }
 
-/// The iCellAge state of every surface: one store per texture, keyed the way
-/// the core stamps (`zonvie_cell_stamp.grid`) — 1 for the main window's
-/// screen-space cells, otherwise the grid id of an external window, indexed by
-/// that window's own grid.
+/// The iCellAge textures of every surface, over the core's shared store set
+/// (zonvie_cell_age_*), which owns the CPU mirrors, their stamp rules and
+/// their lock. Keyed the way the core stamps (`zonvie_cell_stamp.grid`): 1
+/// for the main window's screen-space cells, otherwise the grid id of an
+/// external window, indexed by that window's own grid.
 ///
-/// The core thread writes the CPU mirror from on_cell_age_stamps (grid_mu
-/// held); each surface's draw sizes its store and uploads it. `lock` is a
-/// **leaf**: nothing under it calls out, and the GPU upload runs outside it.
+/// The core thread applies stamps; each surface's draw syncs its store and
+/// uploads it. Textures and upload scratch are touched only by the drawing
+/// thread of the surface that owns the grid.
 final class SurfaceCellAgeStores {
-    final class Store {
-        var cols = 0                    // Protected by lock
-        var rows = 0                    // Protected by lock
-        var values: [Float] = []        // Protected by lock
-        var dirty = false               // Protected by lock
-        var lastEdit: Float = 0         // Protected by lock
-        var texture: MTLTexture?        // Drawing thread only
-        var uploadScratch: [Float] = [] // Drawing thread only
+    private final class Texture {
+        var texture: MTLTexture?
+        var uploadScratch: [Float] = []
+        var cache = zonvie_cell_age_cache()
     }
 
-    private let lock = NSLock()
-    private var stores: [Int64: Store] = [:]
-    /// Stamps for a texture whose store is not sized yet — the first keystroke
-    /// after a window opens arrives before that window's first shaded draw.
-    /// Applied by `ensure`, capped so a window that never draws cannot grow it.
-    private var pending: [Int64: [(row: Int, col: Int, count: Int, time: Float)]] = [:]
-    private static let pendingCap = 16
+    private let stores: OpaquePointer
+    private let textureLock = NSLock()
+    private var textures: [Int64: Texture] = [:]  // Protected by textureLock
+
+    init() {
+        stores = zonvie_cell_age_create()!
+    }
+
+    deinit {
+        zonvie_cell_age_destroy(stores)
+    }
 
     /// Apply one flush's stamps, in the order the ABI documents. Core thread.
     func apply(_ stamps: UnsafeBufferPointer<zonvie_cell_stamp>, clear: Bool, now: Float) {
-        lock.lock()
-        defer { lock.unlock() }
-        if clear {
-            // Every texture: a bulk repaint invalidates whatever any window
-            // still shows.
-            for st in stores.values { Self.zero(st) }
-            pending.removeAll()
-            return
-        }
-        guard now > 0 else { return }
-        for s in stamps {
-            let grid = Int64(s.grid)
-            if s.count == 0 {
-                // Clear marker: zero just this texture.
-                if let st = stores[grid] { Self.zero(st) }
-                pending.removeValue(forKey: grid)
-                continue
-            }
-            guard let st = stores[grid], st.cols > 0, st.rows > 0 else {
-                var list = pending[grid] ?? []
-                if list.count < Self.pendingCap {
-                    list.append((row: Int(s.row), col: Int(s.col), count: Int(s.count), time: now))
-                }
-                pending[grid] = list
-                continue
-            }
-            Self.stamp(st, row: Int(s.row), col: Int(s.col), count: Int(s.count), time: now)
-        }
-    }
-
-    /// Size `grid`'s store to cols x rows, creating it if needed. A resize
-    /// invalidates every stamp position, so it starts clean rather than
-    /// remapping ages onto cells that now hold different text.
-    func ensure(grid: Int64, cols: Int, rows: Int) {
-        guard cols > 0, rows > 0 else { return }
-        lock.lock()
-        defer { lock.unlock() }
-        let st = stores[grid] ?? {
-            let st = Store()
-            stores[grid] = st
-            return st
-        }()
-        guard st.cols != cols || st.rows != rows else { return }
-        st.cols = cols
-        st.rows = rows
-        st.values = [Float](repeating: 0, count: cols * rows)
-        st.dirty = true
-        for p in pending.removeValue(forKey: grid) ?? [] {
-            Self.stamp(st, row: p.row, col: p.col, count: p.count, time: p.time)
-        }
+        zonvie_cell_age_apply(stores, stamps.baseAddress, stamps.count, clear, now)
     }
 
     /// Size `grid`'s store and return its texture with the mirror uploaded.
     /// Drawing thread. The texture is made only when the size changes.
     func texture(grid: Int64, cols: Int, rows: Int, device: MTLDevice) -> MTLTexture? {
-        ensure(grid: grid, cols: cols, rows: rows)
-        lock.lock()
-        guard let st = stores[grid], st.cols == cols, st.rows == rows else {
-            lock.unlock()
-            return nil
-        }
-        lock.unlock()
+        guard cols > 0, rows > 0 else { return nil }
+        textureLock.lock()
+        let t = textures[grid] ?? {
+            let t = Texture()
+            textures[grid] = t
+            return t
+        }()
+        textureLock.unlock()
 
-        if st.texture == nil || st.texture?.width != cols || st.texture?.height != rows {
+        var created = false
+        if t.texture == nil || t.texture?.width != cols || t.texture?.height != rows {
             let desc = MTLTextureDescriptor.texture2DDescriptor(
                 pixelFormat: .r32Float, width: cols, height: rows, mipmapped: false)
             desc.usage = [.shaderRead]
             desc.storageMode = .shared
             guard let tex = device.makeTexture(descriptor: desc) else { return nil }
-            st.texture = tex
-            // A fresh texture holds garbage; force the upload below.
-            lock.lock(); st.dirty = true; lock.unlock()
+            t.texture = tex
+            created = true
         }
-        // Copy out under the lock, upload outside it: replace() on a shared
-        // texture is a memcpy, but holding the core thread's peer lock across
-        // it would put that thread behind a GPU-facing call for no reason.
-        if st.uploadScratch.count != cols * rows {
-            st.uploadScratch = [Float](repeating: 0, count: cols * rows)
+        let n = cols * rows
+        if t.uploadScratch.count != n {
+            t.uploadScratch = [Float](repeating: 0, count: n)
         }
-        do {
-            lock.lock()
-            defer { lock.unlock() }
-            guard st.dirty, st.values.count == cols * rows else { return st.texture }
-            st.uploadScratch.withUnsafeMutableBufferPointer { dst in
-                _ = st.values.withUnsafeBufferPointer { src in
-                    memcpy(dst.baseAddress!, src.baseAddress!, cols * rows * MemoryLayout<Float>.size)
-                }
+        // Copy out under the store's lock, upload outside it: replace() on a
+        // shared texture is a memcpy, but holding the core thread's peer lock
+        // across it would put that thread behind a GPU-facing call. A fresh
+        // texture holds garbage, so it forces the upload.
+        var values: UnsafePointer<Float>?
+        switch zonvie_cell_age_sync(stores, grid, UInt32(cols), UInt32(rows), created, &t.cache, &values) {
+        case 0:
+            return nil
+        case 2:
+            t.uploadScratch.withUnsafeMutableBufferPointer { dst in
+                _ = memcpy(dst.baseAddress!, values!, n * MemoryLayout<Float>.size)
             }
-            st.dirty = false
+            zonvie_cell_age_end_upload(stores)
+        default:
+            return t.texture
         }
-        st.uploadScratch.withUnsafeBytes { raw in
-            st.texture?.replace(
+        t.uploadScratch.withUnsafeBytes { raw in
+            t.texture?.replace(
                 region: MTLRegionMake2D(0, 0, cols, rows),
                 mipmapLevel: 0,
                 withBytes: raw.baseAddress!,
                 bytesPerRow: cols * MemoryLayout<Float>.size
             )
         }
-        return st.texture
+        return t.texture
     }
 
-    /// iTimeLastEdit for one texture: the time of its last stamp, so each
-    /// surface gates its effect on its own edits.
+    /// iTimeLastEdit for one texture as of its last sync, so each surface
+    /// gates its effect on its own edits.
     func lastEdit(grid: Int64) -> Float {
-        lock.lock()
-        defer { lock.unlock() }
-        return stores[grid]?.lastEdit ?? 0
+        textureLock.lock()
+        defer { textureLock.unlock() }
+        return textures[grid]?.cache.last_edit ?? 0
     }
 
-    /// Forget an external window's store when that window goes away.
+    /// Forget an external window's store when that window goes away. Main
+    /// thread, which is also where external windows draw, so no draw of
+    /// `grid` can sit between its lookup and its sync and re-create the store.
     func drop(grid: Int64) {
-        lock.lock()
-        defer { lock.unlock() }
-        stores.removeValue(forKey: grid)
-        pending.removeValue(forKey: grid)
+        zonvie_cell_age_drop(stores, grid)
+        textureLock.lock()
+        textures.removeValue(forKey: grid)
+        textureLock.unlock()
     }
 
     func removeAll() {
-        lock.lock()
-        defer { lock.unlock() }
-        stores.removeAll()
-        pending.removeAll()
-    }
-
-    private static func zero(_ st: Store) {
-        for i in st.values.indices { st.values[i] = 0 }
-        st.dirty = true
-    }
-
-    private static func stamp(_ st: Store, row: Int, col: Int, count: Int, time: Float) {
-        guard row >= 0, row < st.rows, col >= 0 else { return }
-        let colEnd = min(st.cols, col + count)
-        guard col < colEnd else { return }
-        let base = row * st.cols
-        for c in col..<colEnd { st.values[base + c] = time }
-        st.lastEdit = max(st.lastEdit, time)
-        st.dirty = true
+        zonvie_cell_age_remove_all(stores)
+        textureLock.lock()
+        textures.removeAll()
+        textureLock.unlock()
     }
 }
 

@@ -4688,13 +4688,12 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         let editInputs: SurfaceEditInputs? = !runsChain ? nil : SurfaceEditInputs.make(
             shared: shared, feedback: customShaderFeedback
         ) {
-            let cw = cellWidthPx, ch = cellHeightPx
-            guard cw > 0, ch > 0 else { return nil }
+            var cols: UInt32 = 0, rows: UInt32 = 0
+            zonvie_cell_age_surface_grid(
+                Float(view.drawableSize.width), Float(view.drawableSize.height),
+                cellWidthPx, cellHeightPx, &cols, &rows)
             return shared.cellAge.texture(
-                grid: 1,
-                cols: max(1, Int((Float(view.drawableSize.width) / cw).rounded(.up))),
-                rows: max(1, Int((Float(view.drawableSize.height) / ch).rounded(.up))),
-                device: shared.device)
+                grid: 1, cols: Int(cols), rows: Int(rows), device: shared.device)
         }
         let cursorVisible = f.cursorBlink && f.cursorCount > 0
         return encodeSurfaceBackBufferToDrawable(

@@ -2300,6 +2300,7 @@ fn drawMainFrame(hwnd: c.HWND, app: *App, g: *d3d11.Renderer, in: MainFrameInput
     // Edit-effect shader inputs, on the UI thread that draws with them.
     // The chain renders over the full backbuffer, so iGridOrigin is where
     // the grid sits inside it: past the in-client tab bar or sidebar.
+    g.cell_age = &app.cell_age;
     g.cell_w_px = app.cell_w_px;
     g.cell_h_px = app.rowHeightPx();
     g.cursor_blink_on = app.cursor_blink.visible;
@@ -5244,7 +5245,7 @@ pub export fn WndProc(
                     // deinit leaves the struct undefined, so replacing it
                     // only on success is what prevents a later double-deinit
                     // on garbage COM pointers.
-                    var new_renderer = external_windows.newExternalRenderer(app, ext_win.hwnd) orelse {
+                    var new_renderer = external_windows.newExternalRenderer(app, ext_win.hwnd, grid_id) orelse {
                         if (applog.isEnabled()) applog.appLog("[win] device-lost recovery: external renderer re-init failed (window stays lost)\n", .{});
                         any_ext_failed = true;
                         external_windows.finishExternalWindowPaint(app, grid_id);

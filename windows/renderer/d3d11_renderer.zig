@@ -414,11 +414,6 @@ pub const Renderer = struct {
     shader_cursor_current_color: [4]f32 = .{ 0, 0, 0, 0 },
     shader_cursor_previous_color: [4]f32 = .{ 0, 0, 0, 0 },
     shader_cursor_change_time: f32 = 0,
-    /// Ghostty-compatible cursor style for the shader uniforms: 0 block,
-    /// 2 bar, 3 underline. Derived from the committed cursor rect, because
-    /// the rect is what is actually on screen.
-    shader_cursor_style: i32 = 0,
-    shader_prev_cursor_style: i32 = 0,
 
     // --- Zonvie edit-effect shader inputs (iPrevFrame / iCellAge) ---
     //
@@ -446,22 +441,16 @@ pub const Renderer = struct {
     feedback_h: u32 = 0,
     feedback_index: usize = 0,
     feedback_primed: bool = false,
-    /// Cell-age grid, screen-space cells indexed with the same formula the
-    /// shader uses. CPU mirror written from the core callback, uploaded once
-    /// per frame when dirty.
+    /// The app's shared cell-age stores and the stamp grid this renderer's
+    /// texture holds: 1 for the main window, otherwise the external
+    /// window's grid id. The store's lock is taken INSIDE ctx_mu.
+    cell_age: ?*core.cell_age_store.Stores = null,
+    cell_age_grid: i64 = 1,
+    cell_age_cache: core.cell_age_store.SyncCache = .{},
     cell_age_tex: ?*c.ID3D11Texture2D = null,
     cell_age_srv: ?*c.ID3D11ShaderResourceView = null,
-    /// Guards the CPU mirror below. The core thread writes it from
-    /// on_cell_age_stamps while the UI thread resizes, frees and uploads it
-    /// from the draw path — without this a window resize frees the slice out
-    /// from under a keystroke's stamp. Always taken INSIDE ctx_mu when both
-    /// are held (the draw path is the only place that holds both).
-    cell_age_mu: std.Io.Mutex = .init,
-    cell_age_values: []f32 = &.{},
-    cell_age_cols: u32 = 0,
-    cell_age_rows: u32 = 0,
-    cell_age_dirty: bool = false,
-    cell_age_last_edit: f32 = 0,
+    cell_age_tex_cols: u32 = 0,
+    cell_age_tex_rows: u32 = 0,
     /// True when any loaded custom shader references a time-varying
     /// Shadertoy uniform. The main loop reads this to decide whether to
     /// arm a ~60Hz WM_TIMER for continuous redraw; without it shaders
@@ -768,16 +757,6 @@ pub const Renderer = struct {
         self.releaseFeedbackTextures();
         safeRelease(&self.cell_age_srv);
         safeRelease(&self.cell_age_tex);
-        {
-            // The core thread writes the mirror under cell_age_mu; callers
-            // detach the renderer from `app.renderer` under app.mu first.
-            self.cell_age_mu.lockUncancelable(core.clock.io());
-            defer self.cell_age_mu.unlock(core.clock.io());
-            if (self.cell_age_values.len != 0) self.alloc.free(self.cell_age_values);
-            self.cell_age_values = &.{};
-            self.cell_age_cols = 0;
-            self.cell_age_rows = 0;
-        }
 
         safeRelease(&self.vb);
         safeRelease(&self.rs);
@@ -2665,74 +2644,21 @@ pub const Renderer = struct {
         self.feedback_primed = false;
     }
 
-    /// Resize the CPU mirror to cover the window. A resize invalidates every
-    /// stamp position, so start clean rather than remapping ages onto cells
-    /// that now hold different text.
-    fn ensureCellAgeGrid(self: *Renderer, cols: u32, rows: u32) void {
-        if (cols == 0 or rows == 0) return;
-        if (self.cell_age_cols == cols and self.cell_age_rows == rows and
-            self.cell_age_values.len == cols * rows) return;
-        const n: usize = @as(usize, cols) * @as(usize, rows);
-        const buf = self.alloc.alloc(f32, n) catch return;
-        @memset(buf, 0);
-        self.cell_age_mu.lockUncancelable(core.clock.io());
-        defer self.cell_age_mu.unlock(core.clock.io());
-        if (self.cell_age_values.len != 0) self.alloc.free(self.cell_age_values);
-        self.cell_age_values = buf;
-        self.cell_age_cols = cols;
-        self.cell_age_rows = rows;
-        self.cell_age_dirty = true;
-        // The texture must follow the grid.
-        safeRelease(&self.cell_age_srv);
-        safeRelease(&self.cell_age_tex);
-    }
-
-    /// Apply one flush's stamps. Called from the core thread via
-    /// on_cell_age_stamps; touches only the CPU mirror. `grid` is the stamp
-    /// grid this renderer's texture holds: 1 for the main window, otherwise
-    /// the external window's grid id. Stamps for other grids are skipped.
-    pub fn applyCellAgeStamps(self: *Renderer, grid: i64, stamps: []const core.zonvie_cell_stamp, clear: bool, now: f32) void {
-        self.cell_age_mu.lockUncancelable(core.clock.io());
-        defer self.cell_age_mu.unlock(core.clock.io());
-        if (self.cell_age_cols == 0 or self.cell_age_rows == 0) return;
-        if (clear) {
-            @memset(self.cell_age_values, 0);
-            self.cell_age_dirty = true;
-            return;
-        }
-        if (now <= 0) return;
-        for (stamps) |st| {
-            if (st.grid != grid) continue;
-            if (st.count == 0) {
-                // Clear marker for this texture.
-                @memset(self.cell_age_values, 0);
-                self.cell_age_dirty = true;
-                continue;
-            }
-            const row: u32 = st.row;
-            if (row >= self.cell_age_rows) continue;
-            const base: usize = @as(usize, row) * @as(usize, self.cell_age_cols);
-            const col_start: u32 = st.col;
-            const col_end: u32 = @min(self.cell_age_cols, col_start + @as(u32, st.count));
-            if (col_start >= col_end) continue;
-            var col = col_start;
-            while (col < col_end) : (col += 1) self.cell_age_values[base + col] = now;
-            // Per stamp, not per call: a list carrying only other grids'
-            // stamps must not advance this window's iTimeLastEdit, and a
-            // call that stamped nothing must not force a full texture upload.
-            self.cell_age_last_edit = now;
-            self.cell_age_dirty = true;
-        }
-    }
-
-    /// Create/refresh the cell-age texture and upload the mirror when dirty.
-    fn ensureCellAgeTexture(self: *Renderer, ctx: *c.ID3D11DeviceContext, ctx_vtbl: anytype) ?*c.ID3D11ShaderResourceView {
-        if (self.cell_age_cols == 0 or self.cell_age_rows == 0) return null;
+    /// Size this grid's store to cols x rows, (re)create the texture to
+    /// match, and upload the mirror when it changed. The store's lock is held
+    /// only across the UpdateSubresource copy.
+    fn ensureCellAgeTexture(self: *Renderer, ctx: *c.ID3D11DeviceContext, ctx_vtbl: anytype, cols: u32, rows: u32) ?*c.ID3D11ShaderResourceView {
+        const stores = self.cell_age orelse return null;
         const dev = self.device orelse return null;
-        if (self.cell_age_tex == null) {
+        var created = false;
+        if (self.cell_age_tex == null or self.cell_age_tex_cols != cols or self.cell_age_tex_rows != rows) {
+            safeRelease(&self.cell_age_srv);
+            safeRelease(&self.cell_age_tex);
+            self.cell_age_tex_cols = 0;
+            self.cell_age_tex_rows = 0;
             var td: c.D3D11_TEXTURE2D_DESC = std.mem.zeroes(c.D3D11_TEXTURE2D_DESC);
-            td.Width = self.cell_age_cols;
-            td.Height = self.cell_age_rows;
+            td.Width = cols;
+            td.Height = rows;
             td.MipLevels = 1;
             td.ArraySize = 1;
             td.Format = c.DXGI_FORMAT_R32_FLOAT;
@@ -2751,35 +2677,23 @@ pub const Renderer = struct {
             }
             self.cell_age_tex = tex;
             self.cell_age_srv = srv;
-            // A fresh texture holds garbage until the first upload.
-            self.cell_age_dirty = true;
+            self.cell_age_tex_cols = cols;
+            self.cell_age_tex_rows = rows;
+            created = true;
         }
-        // The core thread writes the mirror; hold it still for the copy.
-        self.cell_age_mu.lockUncancelable(core.clock.io());
-        defer self.cell_age_mu.unlock(core.clock.io());
-        if (self.cell_age_dirty) {
-            if (ctx_vtbl.*.UpdateSubresource) |update| {
-                update(
-                    ctx,
-                    @ptrCast(self.cell_age_tex.?),
-                    0,
-                    null,
-                    @ptrCast(self.cell_age_values.ptr),
-                    self.cell_age_cols * @sizeOf(f32),
-                    0,
-                );
-                self.cell_age_dirty = false;
-            }
+        var values: []const f32 = &.{};
+        // A fresh texture holds garbage until the first upload.
+        switch (stores.sync(self.cell_age_grid, cols, rows, created, &self.cell_age_cache, &values)) {
+            .unavailable => return null,
+            .clean => {},
+            .dirty => {
+                defer stores.endUpload();
+                if (ctx_vtbl.*.UpdateSubresource) |update| {
+                    update(ctx, @ptrCast(self.cell_age_tex.?), 0, null, @ptrCast(values.ptr), cols * @sizeOf(f32), 0);
+                }
+            },
         }
         return self.cell_age_srv;
-    }
-
-    /// Classify a cursor rect into Ghostty's cursor style enum.
-    pub fn cursorStyleForRect(rect: [4]f32, cell_w: f32, cell_h: f32) i32 {
-        if (cell_w <= 0 or cell_h <= 0) return 0;
-        if (rect[2] < cell_w * 0.5) return 2; // bar
-        if (rect[3] < cell_h * 0.5) return 3; // underline
-        return 0; // block
     }
 
     fn bloomShadersReady(self: *const Renderer) bool {
@@ -3214,12 +3128,6 @@ pub const Renderer = struct {
         self.shader_cursor_previous_color = self.shader_cursor_current_color;
         self.shader_cursor_current = rect;
         self.shader_cursor_current_color = color;
-        self.shader_prev_cursor_style = self.shader_cursor_style;
-        self.shader_cursor_style = cursorStyleForRect(
-            rect,
-            @floatFromInt(self.cell_w_px),
-            @floatFromInt(self.cell_h_px),
-        );
 
         // iTimeCursorChange is in the same "seconds since shader start"
         // space as iTime, so recompute from QPC here.
@@ -3323,15 +3231,15 @@ pub const Renderer = struct {
         u.iCurrentCursorColor = self.shader_cursor_current_color;
         u.iPreviousCursorColor = self.shader_cursor_previous_color;
         u.iTimeCursorChange = self.shader_cursor_change_time;
-        // Zonvie edit-effect uniforms. The cell-age grid is indexed in grid
-        // cells, so the shader maps fragCoord through iGridOrigin.
-        u.iCellSize[0] = @floatFromInt(self.cell_w_px);
-        u.iCellSize[1] = @floatFromInt(self.cell_h_px);
-        u.iGridOrigin = self.shader_grid_origin;
-        u.iTimeLastEdit = self.cell_age_last_edit;
-        u.iCursorVisible = if (self.cursor_blink_on) 1 else 0;
-        u.iCurrentCursorStyle = self.shader_cursor_style;
-        u.iPreviousCursorStyle = self.shader_prev_cursor_style;
+        core.fillEditUniforms(
+            &u,
+            @floatFromInt(self.cell_w_px),
+            @floatFromInt(self.cell_h_px),
+            self.shader_grid_origin,
+            self.cell_age_cache.last_edit,
+            self.cursor_blink_on,
+            self.shader_wants_edit_inputs,
+        );
         // Shadertoy iDate: (year, month [1..12], day, seconds-in-day).
         // Shadertoy's howto just lists the fields as "Year, month, day,
         // time in seconds" without spelling out indexing. Forward
@@ -3416,11 +3324,14 @@ pub const Renderer = struct {
         var cell_age_srv_bind: ?*c.ID3D11ShaderResourceView = null;
         var feedback_rtv_target: ?*c.ID3D11RenderTargetView = null;
         var feedback_src_tex: ?*c.ID3D11Texture2D = null;
-        if (self.shader_wants_edit_inputs and self.cell_w_px > 0 and self.cell_h_px > 0) {
-            const cols = (self.width + self.cell_w_px - 1) / self.cell_w_px;
-            const rows = (self.height + self.cell_h_px - 1) / self.cell_h_px;
-            self.ensureCellAgeGrid(@max(1, cols), @max(1, rows));
-            cell_age_srv_bind = self.ensureCellAgeTexture(ctx, ctx_vtbl);
+        if (self.shader_wants_edit_inputs) {
+            const g = core.cell_age_store.surfaceGrid(
+                @floatFromInt(self.width),
+                @floatFromInt(self.height),
+                @floatFromInt(self.cell_w_px),
+                @floatFromInt(self.cell_h_px),
+            );
+            if (g.cols > 0) cell_age_srv_bind = self.ensureCellAgeTexture(ctx, ctx_vtbl, g.cols, g.rows);
         }
         if (self.shader_wants_prev_frame) {
             self.ensureFeedbackTextures();
