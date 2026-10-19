@@ -98,7 +98,7 @@ const IDCompositionTarget = extern struct {
 };
 
 // IDCompositionDevice
-const IDCompositionDevice = extern struct {
+pub const IDCompositionDevice = extern struct {
     lpVtbl: *const Vtbl,
     const Vtbl = extern struct {
         // IUnknown
@@ -575,7 +575,9 @@ pub const Renderer = struct {
     /// Initialize with a pre-created D3D11 device (from createDeviceOnly).
     /// `create_atlas`: only the main renderer owns a glyph atlas texture; an
     /// external one borrows it (borrowAtlas) on every paint.
-    pub fn initWithDevice(alloc: std.mem.Allocator, hwnd: c.HWND, opacity: f32, blur: bool, device: *c.ID3D11Device, device_ctx: *c.ID3D11DeviceContext, create_atlas: bool) !Renderer {
+    /// `dcomp_device`: another renderer's composition device on `device`, to
+    /// build this window's target on instead of creating one; null creates.
+    pub fn initWithDevice(alloc: std.mem.Allocator, hwnd: c.HWND, opacity: f32, blur: bool, device: *c.ID3D11Device, device_ctx: *c.ID3D11DeviceContext, create_atlas: bool, dcomp_device: ?*IDCompositionDevice) !Renderer {
         // Take our own COM reference on the App-owned device/context so this
         // renderer's deinit() can Release() without over-releasing the App's
         // reference. App creates this device via createDeviceOnly() and
@@ -583,6 +585,7 @@ pub const Renderer = struct {
         // windows/app.zig.
         addRef(device);
         addRef(device_ctx);
+        if (dcomp_device) |d| addRef(d);
         var self: Renderer = .{
             .alloc = alloc,
             .hwnd = hwnd,
@@ -590,6 +593,7 @@ pub const Renderer = struct {
             .blur_enabled = blur,
             .device = device,
             .ctx = device_ctx,
+            .dcomp_device = dcomp_device,
         };
         // Five `try` fail points follow (createSwapchainOnly/createBackTargets/
         // createPipeline/ensureVertexBuffer/createAtlasTexture). self.deinit()
@@ -1841,10 +1845,16 @@ pub const Renderer = struct {
     /// composition swapchain without a committed visual would create a
     /// permanently blank renderer that otherwise looks initialized.
     fn createDirectComposition(self: *Renderer, sc1: *c.IDXGISwapChain1, dxgi_dev: *c.IDXGIDevice) !void {
-        var dcomp_dev: ?*IDCompositionDevice = null;
+        // A device handed in by initWithDevice (another renderer's, same D3D
+        // device) serves this HWND's target too; only target and visual are
+        // per window.
+        var dcomp_dev: ?*IDCompositionDevice = self.dcomp_device;
+        self.dcomp_device = null;
         errdefer safeRelease(&dcomp_dev);
-        const dcomp_hr = DCompositionCreateDevice(dxgi_dev, &IID_IDCompositionDevice, &dcomp_dev);
-        if (c.FAILED(dcomp_hr) or dcomp_dev == null) return error.DCompositionCreateDeviceFailed;
+        if (dcomp_dev == null) {
+            const dcomp_hr = DCompositionCreateDevice(dxgi_dev, &IID_IDCompositionDevice, &dcomp_dev);
+            if (c.FAILED(dcomp_hr) or dcomp_dev == null) return error.DCompositionCreateDeviceFailed;
+        }
 
         const vtbl = dcomp_dev.?.lpVtbl;
         var dcomp_target: ?*IDCompositionTarget = null;
@@ -2738,40 +2748,47 @@ pub const Renderer = struct {
         const BloomEntry = struct {
             entry: [*:0]const u8,
             target: [*:0]const u8,
+            /// compiled_shaders.zig declaration carrying it precompiled.
+            decl: []const u8,
         };
         const bloom_entries = [_]BloomEntry{
-            .{ .entry = "VSFullscreen", .target = "vs_5_0" },
-            .{ .entry = "PSGlowExtract", .target = "ps_5_0" },
-            .{ .entry = "PSGlowOcclude", .target = "ps_5_0" },
-            .{ .entry = "PSKawaseDown", .target = "ps_5_0" },
-            .{ .entry = "PSKawaseUp", .target = "ps_5_0" },
-            .{ .entry = "PSGlowComposite", .target = "ps_5_0" },
+            .{ .entry = "VSFullscreen", .target = "vs_5_0", .decl = "vs_fullscreen_bytecode" },
+            .{ .entry = "PSGlowExtract", .target = "ps_5_0", .decl = "ps_glow_extract_bytecode" },
+            .{ .entry = "PSGlowOcclude", .target = "ps_5_0", .decl = "ps_glow_occlude_bytecode" },
+            .{ .entry = "PSKawaseDown", .target = "ps_5_0", .decl = "ps_kawase_down_bytecode" },
+            .{ .entry = "PSKawaseUp", .target = "ps_5_0", .decl = "ps_kawase_up_bytecode" },
+            .{ .entry = "PSGlowComposite", .target = "ps_5_0", .decl = "ps_glow_composite_bytecode" },
         };
 
         var bloom_blobs: [bloom_entries.len]?*ID3DBlob = .{null} ** bloom_entries.len;
         defer for (&bloom_blobs) |*b| blobRelease(b.*);
+        var bloom_code: [bloom_entries.len][]const u8 = undefined;
 
-        for (bloom_entries, 0..) |be, idx| {
-            var blob: ?*ID3DBlob = null;
-            var err_b: ?*ID3DBlob = null;
-            defer blobRelease(err_b);
-            const hr_b = D3DCompile(hlsl.ptr, hlsl.len, null, null, null, be.entry, be.target, 0, 0, &blob, &err_b);
-            if (hr_b != 0 or blob == null) {
-                dumpBlobAsText("[D3DCompile bloom] ", err_b);
-                bloomUnavailable("'{s}' compile failed hr=0x{x}", .{ be.entry, @as(u32, @bitCast(hr_b)) });
-                return false;
+        inline for (bloom_entries, 0..) |be, idx| {
+            if (precompiledMainHlsl(be.decl)) |bytes| {
+                bloom_code[idx] = bytes;
+            } else {
+                var blob: ?*ID3DBlob = null;
+                var err_b: ?*ID3DBlob = null;
+                defer blobRelease(err_b);
+                const hr_b = D3DCompile(hlsl.ptr, hlsl.len, null, null, null, be.entry, be.target, 0, 0, &blob, &err_b);
+                if (hr_b != 0 or blob == null) {
+                    dumpBlobAsText("[D3DCompile bloom] ", err_b);
+                    bloomUnavailable("'{s}' compile failed hr=0x{x}", .{ be.entry, @as(u32, @bitCast(hr_b)) });
+                    return false;
+                }
+                bloom_blobs[idx] = blob;
+                const bp = blobPtr(blob) orelse {
+                    bloomUnavailable("'{s}' produced no bytecode", .{be.entry});
+                    return false;
+                };
+                bloom_code[idx] = @as([*]const u8, @ptrCast(bp))[0..blobSize(blob)];
             }
-            bloom_blobs[idx] = blob;
         }
 
         if (self.vs_fullscreen == null) {
-            const bp0 = blobPtr(bloom_blobs[0]) orelse {
-                bloomUnavailable("'{s}' produced no bytecode", .{bloom_entries[0].entry});
-                return false;
-            };
-            const bs0 = blobSize(bloom_blobs[0]);
             var vs_fs: ?*c.ID3D11VertexShader = null;
-            if (c.FAILED(create_vs_fn(dev, bp0, bs0, null, &vs_fs)) or vs_fs == null) {
+            if (c.FAILED(create_vs_fn(dev, bloom_code[0].ptr, bloom_code[0].len, null, &vs_fs)) or vs_fs == null) {
                 bloomUnavailable("CreateVertexShader rejected '{s}'", .{bloom_entries[0].entry});
                 return false;
             }
@@ -2780,11 +2797,8 @@ pub const Renderer = struct {
 
         inline for (.{ 1, 2, 3, 4, 5 }, .{ &self.ps_glow_extract, &self.ps_glow_occlude, &self.ps_kawase_down, &self.ps_kawase_up, &self.ps_glow_composite }) |idx, field| {
             if (field.* == null) {
-                const bp = blobPtr(bloom_blobs[idx]) orelse {
-                    bloomUnavailable("'{s}' produced no bytecode", .{bloom_entries[idx].entry});
-                    return false;
-                };
-                const bs = blobSize(bloom_blobs[idx]);
+                const bp = bloom_code[idx].ptr;
+                const bs = bloom_code[idx].len;
                 var ps_out: ?*c.ID3D11PixelShader = null;
                 if (c.FAILED(create_ps_fn(dev, bp, bs, null, &ps_out)) or ps_out == null) {
                     bloomUnavailable("CreatePixelShader rejected '{s}'", .{bloom_entries[idx].entry});
@@ -2818,14 +2832,17 @@ pub const Renderer = struct {
         var vcp_err: ?*ID3DBlob = null;
         defer blobRelease(vcp_blob);
         defer blobRelease(vcp_err);
-        const hr_vcp = D3DCompile(hlsl.ptr, hlsl.len, null, null, null, "VSCustomPost", "vs_5_0", 0, 0, &vcp_blob, &vcp_err);
-        if (hr_vcp != 0 or vcp_blob == null) {
-            applog.appLog("[d3d] VSCustomPost D3DCompile FAILED hr=0x{x}\n", .{@as(u32, @bitCast(hr_vcp))});
-            dumpBlobAsText("[D3DCompile VSCustomPost] ", vcp_err);
-            return;
-        }
-        const vcp_p = blobPtr(vcp_blob).?;
-        const vcp_s = blobSize(vcp_blob);
+        const vcp_code: []const u8 = precompiledMainHlsl("vs_custom_post_bytecode") orelse code: {
+            const hr_vcp = D3DCompile(hlsl.ptr, hlsl.len, null, null, null, "VSCustomPost", "vs_5_0", 0, 0, &vcp_blob, &vcp_err);
+            if (hr_vcp != 0 or vcp_blob == null) {
+                applog.appLog("[d3d] VSCustomPost D3DCompile FAILED hr=0x{x}\n", .{@as(u32, @bitCast(hr_vcp))});
+                dumpBlobAsText("[D3DCompile VSCustomPost] ", vcp_err);
+                return;
+            }
+            break :code @as([*]const u8, @ptrCast(blobPtr(vcp_blob).?))[0..blobSize(vcp_blob)];
+        };
+        const vcp_p = vcp_code.ptr;
+        const vcp_s = vcp_code.len;
         var vs_cp: ?*c.ID3D11VertexShader = null;
         if (c.FAILED(create_vs_fn(dev, vcp_p, vcp_s, null, &vs_cp)) or vs_cp == null) {
             applog.appLog("[d3d] VSCustomPost create shader FAILED\n", .{});
@@ -2875,6 +2892,48 @@ pub const Renderer = struct {
             "[CustomShader] loaded {d}/{d} custom shaders, anyNeedsAnimation={}\n",
             .{ self.custom_shader_pipelines.items.len, cfg.shaders.paths.len, self.any_custom_shader_needs_animation },
         );
+    }
+
+    /// Take `src`'s compiled custom and bloom shaders instead of compiling
+    /// them again; each renderer holds its own COM reference. Shader objects
+    /// belong to the device, so this refuses (returns false) unless both
+    /// renderers are on the same one.
+    pub fn adoptShadersFrom(self: *Renderer, src: *const Renderer) bool {
+        const dev = self.device orelse return false;
+        if (src.device != dev) return false;
+
+        for (self.custom_shader_pipelines.items) |*p| p.deinit();
+        self.custom_shader_pipelines.clearRetainingCapacity();
+        self.any_custom_shader_needs_animation = src.any_custom_shader_needs_animation;
+        self.shader_wants_edit_inputs = src.shader_wants_edit_inputs;
+        self.shader_wants_prev_frame = src.shader_wants_prev_frame;
+        self.shader_owns_cursor = src.shader_owns_cursor;
+        for (src.custom_shader_pipelines.items) |sp| {
+            const path = self.alloc.dupe(u8, sp.source_path) catch return false;
+            self.custom_shader_pipelines.append(self.alloc, .{
+                .alloc = self.alloc,
+                .source_path = path,
+                .pixel_shader = sp.pixel_shader,
+                .needs_animation = sp.needs_animation,
+                .uses_edit_inputs = sp.uses_edit_inputs,
+                .uses_prev_frame = sp.uses_prev_frame,
+                .owns_cursor = sp.owns_cursor,
+            }) catch {
+                self.alloc.free(path);
+                return false;
+            };
+            if (sp.pixel_shader) |ps| addRef(ps);
+        }
+
+        inline for (.{ "vs_custom_post", "vs_fullscreen", "ps_glow_extract", "ps_glow_occlude", "ps_kawase_down", "ps_kawase_up", "ps_glow_composite" }) |name| {
+            if (@field(self, name) == null) {
+                if (@field(src, name)) |s| {
+                    addRef(s);
+                    @field(self, name) = s;
+                }
+            }
+        }
+        return true;
     }
 
     /// True when a `@zonvie-owns-cursor` shader can draw the cursor now, so
@@ -3931,31 +3990,8 @@ pub const Renderer = struct {
         // Decide at comptime whether pre-compiled bytecode is usable.
         // If the HLSL source has changed since bytecodes were generated (hash mismatch),
         // fall back to runtime compilation to guarantee correctness.
-        const use_precompiled = comptime blk: {
-            @setEvalBranchQuota(1_000_000);
-            if (compiled_shaders.vs_bytecode.len == 0 or compiled_shaders.ps_bytecode.len == 0)
-                break :blk false;
-            if (compiled_shaders.hlsl_sha256.len == 0)
-                break :blk true; // no hash recorded — trust the bytecode
-            // LF-normalize embedded HLSL and compute SHA256
-            var normalized: [hlsl.len]u8 = undefined;
-            var out_len: usize = 0;
-            for (hlsl) |byte| {
-                if (byte == '\r') continue;
-                normalized[out_len] = byte;
-                out_len += 1;
-            }
-            var h = std.crypto.hash.sha2.Sha256.init(.{});
-            h.update(normalized[0..out_len]);
-            const digest = h.finalResult();
-            const hex_chars = "0123456789abcdef";
-            var hex: [64]u8 = undefined;
-            for (digest, 0..) |b, j| {
-                hex[j * 2] = hex_chars[b >> 4];
-                hex[j * 2 + 1] = hex_chars[b & 0x0f];
-            }
-            break :blk std.mem.eql(u8, &hex, compiled_shaders.hlsl_sha256);
-        };
+        const use_precompiled = compiled_shaders.vs_bytecode.len != 0 and
+            compiled_shaders.ps_bytecode.len != 0 and main_hlsl_bytecode_current;
 
         if (use_precompiled) {
             dbgLog("[d3d] Using pre-compiled shader bytecode\n", .{});
@@ -4261,6 +4297,40 @@ pub const Renderer = struct {
 /// crash/update/TDR). Present/ResizeBuffers/Present1 can all return these.
 fn isDeviceLost(hr: c.HRESULT) bool {
     return hr == c.DXGI_ERROR_DEVICE_REMOVED or hr == c.DXGI_ERROR_DEVICE_RESET or hr == c.DXGI_ERROR_DEVICE_HUNG;
+}
+
+/// Whether compiled_shaders.zig was generated from the main.hlsl embedded in
+/// this build (LF-normalized SHA-256). Stale bytecode is never used; every
+/// entry point then compiles at runtime instead.
+const main_hlsl_bytecode_current = blk: {
+    @setEvalBranchQuota(1_000_000);
+    if (compiled_shaders.hlsl_sha256.len == 0) break :blk true; // no hash recorded — trust the bytecode
+    const hlsl = @embedFile("../shaders/main.hlsl");
+    var normalized: [hlsl.len]u8 = undefined;
+    var out_len: usize = 0;
+    for (hlsl) |byte| {
+        if (byte == '\r') continue;
+        normalized[out_len] = byte;
+        out_len += 1;
+    }
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update(normalized[0..out_len]);
+    const digest = h.finalResult();
+    const hex_chars = "0123456789abcdef";
+    var hex: [64]u8 = undefined;
+    for (digest, 0..) |b, j| {
+        hex[j * 2] = hex_chars[b >> 4];
+        hex[j * 2 + 1] = hex_chars[b & 0x0f];
+    }
+    break :blk std.mem.eql(u8, &hex, compiled_shaders.hlsl_sha256);
+};
+
+/// The precompiled bytecode for one main.hlsl entry point, or null when
+/// compiled_shaders.zig does not carry it yet or is stale.
+fn precompiledMainHlsl(comptime decl: []const u8) ?[]const u8 {
+    if (!main_hlsl_bytecode_current or !@hasDecl(compiled_shaders, decl)) return null;
+    const bytes = &@field(compiled_shaders, decl);
+    return if (bytes.len == 0) null else bytes;
 }
 
 fn addRef(p: anytype) void {

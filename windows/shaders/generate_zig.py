@@ -34,6 +34,18 @@ def format_bytes(data, name):
     lines.append("};")
     return "\n".join(lines)
 
+# Entry points the renderer would otherwise D3DCompile at runtime
+# (VSCustomPost and the bloom chain): (.cso file, Zig declaration).
+EXTRA_SHADERS = [
+    ("vs_custom_post.cso", "vs_custom_post_bytecode"),
+    ("vs_fullscreen.cso", "vs_fullscreen_bytecode"),
+    ("ps_glow_extract.cso", "ps_glow_extract_bytecode"),
+    ("ps_glow_occlude.cso", "ps_glow_occlude_bytecode"),
+    ("ps_kawase_down.cso", "ps_kawase_down_bytecode"),
+    ("ps_kawase_up.cso", "ps_kawase_up_bytecode"),
+    ("ps_glow_composite.cso", "ps_glow_composite_bytecode"),
+]
+
 def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     vs_path = os.path.join(script_dir, "vs_main.cso")
@@ -50,6 +62,14 @@ def main():
     if not os.path.exists(hlsl_path):
         print(f"Error: {hlsl_path} not found.")
         sys.exit(1)
+
+    extra_blocks = []
+    for cso, decl in EXTRA_SHADERS:
+        path = os.path.join(script_dir, cso)
+        if not os.path.exists(path):
+            print(f"Error: {path} not found. Run compile.bat first.")
+            sys.exit(1)
+        extra_blocks.append(format_bytes(read_cso(path), decl))
 
     vs_data = read_cso(vs_path)
     ps_data = read_cso(ps_path)
@@ -70,7 +90,7 @@ pub const hlsl_sha256 = "{sha}";
 {format_bytes(vs_data, "vs_bytecode")}
 
 {format_bytes(ps_data, "ps_bytecode")}
-"""
+""" + "".join(f"\n{block}\n" for block in extra_blocks)
 
     # newline='\n' so the file is byte-identical whether it was generated on
     # Windows (CI) or anywhere else; the default would translate to CRLF and

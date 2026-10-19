@@ -3543,6 +3543,30 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         )
     }
 
+    /// Main thread. A reused window's layer still holds the last frame it
+    /// presented before it was hidden; keep the window invisible until this
+    /// view presents a new one, or for at most `revealTimeout` so a showing
+    /// whose content never arrives still shows its shell.
+    func hideWindowUntilFirstPresent() {
+        window?.alphaValue = 0
+        revealToken &+= 1
+        let token = revealToken
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.revealTimeout) { [weak self] in
+            self?.revealWindow(token: token)
+        }
+    }
+
+    private static let revealTimeout: TimeInterval = 0.25
+    /// Main thread. Bumped per hide; a reveal for an older one is ignored.
+    private var revealToken: UInt64 = 0
+    private var revealedToken: UInt64 = 0
+
+    private func revealWindow(token: UInt64) {
+        guard token == revealToken, revealedToken != token else { return }
+        revealedToken = token
+        window?.alphaValue = 1
+    }
+
     /// Present the drawable and commit, with the completion handler that
     /// releases the frame's row set, cursor slot, in-flight slot and atlas
     /// read.
@@ -3553,6 +3577,12 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         cursorSlot cci: Int,
         atlasReader: SharedRenderResources
     ) {
+        if revealedToken != revealToken {
+            let token = revealToken
+            drawable.addPresentedHandler { [weak self] _ in
+                DispatchQueue.main.async { self?.revealWindow(token: token) }
+            }
+        }
         FrameTracer.tracePresented(drawable, seq: UInt32(truncatingIfNeeded: gridId))
         FrameTracer.trace(.presentCall, seq: UInt32(truncatingIfNeeded: gridId))
         cmd.present(drawable)

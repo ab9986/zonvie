@@ -2153,6 +2153,16 @@ pub const Grid = struct {
         while (sg_it.next()) |sg| sg.markAllDirty();
     }
 
+    /// Mark the grids surface `root` composites dirty: the root and every
+    /// grid whose anchor chain resolves to it. Other surfaces keep their state.
+    pub fn markSurfaceDirty(self: *Grid, root: i64) void {
+        if (root == 1) self.main_buf.markAllDirty();
+        var sg_it = self.sub_grids.iterator();
+        while (sg_it.next()) |e| {
+            if (self.surfaceForGrid(e.key_ptr.*) == root) e.value_ptr.markAllDirty();
+        }
+    }
+
     pub fn clearDirty(self: *Grid) void {
         self.main_buf.clearDirtyContent();
     }
@@ -5322,6 +5332,37 @@ test "a float in an external window turned split owes no root rows anywhere" {
     try std.testing.expect(!ext.isRowDirty(4));
     // Grid 1's rows 2..4 never held it.
     try std.testing.expect(!grid.main_buf.isRowDirty(2));
+}
+
+test "markSurfaceDirty dirties one surface's grids and leaves the others" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resize(20, 40);
+    // External window 3 hosting float 4; split 2 on the main surface.
+    try grid.resizeGrid(3, 10, 40);
+    try std.testing.expect(try grid.setWinExternalPos(3, 43));
+    try grid.resizeGrid(4, 3, 10);
+    try grid.setWinFloatPos(4, 44, 2, 1, 50, 0, 3, true);
+    try grid.resizeGrid(2, 10, 40);
+    try grid.setWinPos(2, 102, 0, 0);
+
+    grid.main_buf.dirty_all = false;
+    grid.main_buf.dirty_rows.unsetAll();
+    var it = grid.sub_grids.valueIterator();
+    while (it.next()) |sg| {
+        sg.dirty_all = false;
+        sg.dirty_rows.unsetAll();
+    }
+
+    grid.markSurfaceDirty(3);
+    try std.testing.expect(grid.sub_grids.get(3).?.dirty_all);
+    try std.testing.expect(grid.sub_grids.get(4).?.dirty_all);
+    try std.testing.expect(!grid.sub_grids.get(2).?.dirty_all);
+    try std.testing.expect(!grid.main_buf.dirty_all);
+
+    grid.markSurfaceDirty(1);
+    try std.testing.expect(grid.main_buf.dirty_all);
+    try std.testing.expect(grid.sub_grids.get(2).?.dirty_all);
 }
 
 test "typing in a main-surface split leaves the root rows alone" {

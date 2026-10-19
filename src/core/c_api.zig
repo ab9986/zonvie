@@ -3399,6 +3399,24 @@ pub fn forceResendAll(cp: *core.Core) void {
     cp.cursor_owner.force_recheck = true;
 }
 
+// forceResendAll for one surface: a frontend that just registered the window
+// for `surface_id` lost only the rows routed to it. The cursor is re-checked
+// everywhere since it may have moved onto or off that surface meanwhile.
+pub fn forceResendSurface(cp: *core.Core, surface_id: i64) void {
+    if (cp.last_surface_layout.getPtr(surface_id)) |layout| layout.invalidate();
+    cp.grid.markSurfaceDirty(surface_id);
+    cp.grid.cursor_rev +%= 1;
+    cp.cursor_owner.force_recheck = true;
+}
+
+pub export fn zonvie_core_force_resend_surface(p: ?*zonvie_core, surface_id: i64) callconv(.c) void {
+    if (p == null) return;
+    const cp = &asBox(p.?).core;
+    cp.grid_mu.lockUncancelable(clock.io());
+    defer cp.grid_mu.unlock(clock.io());
+    forceResendSurface(cp, surface_id);
+}
+
 // Force every grid to be treated as dirty on the next flush attempt.
 // This is for failures discovered outside the on_flush_begin/on_flush_end
 // transaction, after onFlush returned and can no longer observe

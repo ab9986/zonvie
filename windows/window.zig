@@ -1239,6 +1239,10 @@ fn prepareGlowShadersOnUiThread(hwnd: c.HWND, app: *App) void {
     }
 
     for (external_renderers.items, 0..) |renderer, i| {
+        // The main renderer has just compiled these on the same device; take
+        // them rather than compile them again per window. Falls back to a
+        // compile when it could not.
+        if (app.renderer) |*main_r| _ = renderer.adoptShadersFrom(main_r);
         _ = renderer.prepareBloomShaders();
         prepared_any = true;
         _ = c.InvalidateRect(renderer.hwnd, null, c.FALSE);
@@ -5084,7 +5088,7 @@ pub export fn WndProc(
                 // renderer are known-good (or not at all, on failure).
                 var recovered_gpu: ?d3d11.Renderer = blk: {
                     if (new_d3d_device != null and new_d3d_ctx != null) {
-                        break :blk d3d11.Renderer.initWithDevice(app.alloc, hwnd, app.config.window.opacity, app.config.window.blur, new_d3d_device.?, new_d3d_ctx.?, true) catch null;
+                        break :blk d3d11.Renderer.initWithDevice(app.alloc, hwnd, app.config.window.opacity, app.config.window.blur, new_d3d_device.?, new_d3d_ctx.?, true, null) catch null;
                     }
                     break :blk d3d11.Renderer.init(app.alloc, hwnd, app.config.window.opacity, app.config.window.blur) catch null;
                 };
@@ -5599,7 +5603,7 @@ pub export fn WndProc(
                 if (deferred_log_enabled) _ = c.QueryPerformanceCounter(&t1);
                 const gpu = blk: {
                     if (app.d3d_device != null and app.d3d_ctx != null) {
-                        break :blk d3d11.Renderer.initWithDevice(app.alloc, hwnd, app.config.window.opacity, app.config.window.blur, app.d3d_device.?, app.d3d_ctx.?, true) catch |e| {
+                        break :blk d3d11.Renderer.initWithDevice(app.alloc, hwnd, app.config.window.opacity, app.config.window.blur, app.d3d_device.?, app.d3d_ctx.?, true, null) catch |e| {
                             if (deferred_log_enabled) applog.appLog("d3d11.Renderer.initWithDevice failed: {any}\n", .{e});
                             return 0;
                         };

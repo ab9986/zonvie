@@ -359,7 +359,9 @@ typedef void (*zonvie_on_external_window_fn)(
 );
 
 /* Called when an external grid is closed (win_hide/win_close for external grid).
-   Frontend should destroy the corresponding window. */
+   Frontend should destroy or hide the corresponding window. The next
+   on_external_window for the same id is a new surface either way: nothing is
+   routed to it until then, and the core resends it in full. */
 typedef void (*zonvie_on_external_window_close_fn)(
     void* ctx,
     int64_t grid_id
@@ -2051,6 +2053,13 @@ ZONVIE_API void zonvie_core_force_resend(zonvie_core *core);
    grid_mu: on_flush_begin/on_flush_end, on_grid_row_scroll, and the other
    callbacks the core runs inside a flush. */
 ZONVIE_API void zonvie_core_force_resend_locked(zonvie_core *core);
+
+/* zonvie_core_force_resend for one surface (1 = the main window, otherwise
+   an external grid id): for a frontend that just created the window for
+   `surface_id` after the on_external_window flush, whose rows and layout it
+   could not place. Other surfaces keep their dirty state. Takes grid_mu, with
+   the same calling restrictions as zonvie_core_force_resend. */
+ZONVIE_API void zonvie_core_force_resend_surface(zonvie_core *core, int64_t surface_id);
 
 #ifdef __cplusplus
 }
