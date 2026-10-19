@@ -215,12 +215,24 @@ fn measureCmdline(alloc: std.mem.Allocator, config_dir: []const u8, tag: []const
         .{ grid_cols, grid_lines },
     );
     defer alloc.free(size);
+    // Until the startup font settles the app resizes the grid to its window:
+    // the deferred guifont relayout, then the window snap 300 ms after it.
+    // Either can land after `set columns` and put the old size back, so the
+    // size has to HOLD for longer than that before it counts; re-apply it
+    // when the app wins.
     try g.exec(size);
     var size_timer = gui_io.Timer.start();
-    while (try g.evalInt("&columns") != grid_cols and size_timer.read() / std.time.ns_per_ms < 5000) {
+    var held_timer = gui_io.Timer.start();
+    while (true) {
+        const applied = try g.evalInt("&columns") == grid_cols and
+            try g.evalInt("&lines") == grid_lines;
+        if (!applied) {
+            if (size_timer.read() / std.time.ns_per_ms >= 5000) return error.GridSizeNotApplied;
+            try g.exec(size);
+            held_timer = gui_io.Timer.start();
+        } else if (held_timer.read() / std.time.ns_per_ms >= 600) break;
         gui_io.sleepNs(50 * std.time.ns_per_ms);
     }
-    if (try g.evalInt("&columns") != grid_cols) return error.GridSizeNotApplied;
 
     const hl = try std.fmt.allocPrint(
         alloc,
