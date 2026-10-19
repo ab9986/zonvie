@@ -3162,7 +3162,10 @@ pub fn syncExternalShaderFrame(app: *App, hwnd: c.HWND, g_sh: *d3d11.Renderer, c
     g_sh.shader_screen_h = screen_h;
     g_sh.shader_window_offset_x = off_x;
     g_sh.shader_window_offset_y = off_y;
-    g_sh.shader_grid_origin = .{ off_x, off_y };
+    // iCellAge cell (0,0) is where the grid's cells start, past a decorated
+    // surface's icon strip and padding.
+    const content = decoratedContentOriginPx(app, classifyExternalSurface(g_sh.cell_age_grid));
+    g_sh.shader_grid_origin = .{ off_x + content.x, off_y + content.y };
     g_sh.cursor_blink_on = app.cursor_blink.visible;
 }
 
