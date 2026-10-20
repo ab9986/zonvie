@@ -23,6 +23,13 @@ pub const CustomShaderPipeline = struct {
     /// source so the renderer knows to run a ~60Hz WM_TIMER loop instead of
     /// relying purely on flush-driven WM_PAINT.
     needs_animation: bool = false,
+    /// True when the source reads the cell-age inputs. Gates the core opt-in
+    /// and the cell-age texture.
+    uses_edit_inputs: bool = false,
+    /// True when the source reads iPrevFrame. Gates the feedback pair.
+    uses_prev_frame: bool = false,
+    /// True when the source declared `@zonvie-owns-cursor`.
+    owns_cursor: bool = false,
 
     pub fn deinit(self: *CustomShaderPipeline) void {
         if (self.pixel_shader) |ps| {

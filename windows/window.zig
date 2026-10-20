@@ -896,6 +896,18 @@ pub fn scheduleReliableWindowMessage(
     return true;
 }
 
+/// Tell the core whether any loaded custom shader wants the edit inputs
+/// (iCellAge / iTimeLastEdit). The core records no cell-age stamps and never
+/// fires on_cell_age_stamps until this is on, so a shader that declares the
+/// inputs would silently get an all-zero iCellAge without this call. Must run
+/// after every loadCustomShaderPipelines on the MAIN renderer (external
+/// windows compile the same config, so the flag they derive is identical).
+fn syncShaderInputsEnabled(app: *App) void {
+    const corep = app.corep orelse return;
+    const want = if (app.renderer) |*r| r.shader_wants_edit_inputs else false;
+    core.zonvie_core_set_shader_inputs_enabled(corep, if (want) 1 else 0);
+}
+
 pub fn scheduleDeviceLostRetry(hwnd: c.HWND, app: *App) void {
     if (app.device_lost_recovery_cancelled) return;
     const delay_ms = render_helpers.deviceLostRetryDelayMs(app.device_lost_recover_attempts);
@@ -1227,6 +1239,10 @@ fn prepareGlowShadersOnUiThread(hwnd: c.HWND, app: *App) void {
     }
 
     for (external_renderers.items, 0..) |renderer, i| {
+        // The main renderer has just compiled these on the same device; take
+        // them rather than compile them again per window. Falls back to a
+        // compile when it could not.
+        if (app.renderer) |*main_r| _ = renderer.adoptShadersFrom(main_r);
         _ = renderer.prepareBloomShaders();
         prepared_any = true;
         _ = c.InvalidateRect(renderer.hwnd, null, c.FALSE);
@@ -1469,6 +1485,7 @@ fn makeCoreCbs() core.Callbacks {
         .on_flush_begin = callbacks.onFlushBegin,
         .on_flush_end = callbacks.onFlushEnd,
         .on_main_grid_size = callbacks.onMainGridSize,
+        .on_cell_age_stamps = callbacks.onCellAgeStamps,
         .on_grid_row_scroll = callbacks.onGridRowScroll,
         .on_surface_layout = callbacks.onSurfaceLayout,
         .on_grid_destroy = callbacks.onGridDestroy,
@@ -2284,6 +2301,18 @@ fn drawMainFrame(hwnd: c.HWND, app: *App, g: *d3d11.Renderer, in: MainFrameInput
     const geom = mainContentGeom(hwnd, app, in.snap.row_h_px);
     renderMainChromeTextures(app, geom.client);
 
+    // Edit-effect shader inputs, on the UI thread that draws with them.
+    // The chain renders over the full backbuffer, so iGridOrigin is where
+    // the grid sits inside it: past the in-client tab bar or sidebar.
+    g.cell_age = &app.cell_age;
+    g.cell_w_px = app.cell_w_px;
+    g.cell_h_px = app.rowHeightPx();
+    g.cursor_blink_on = app.cursor_blink.visible;
+    g.shader_grid_origin = .{
+        @floatFromInt(geom.content_x_offset orelse 0),
+        @floatFromInt(geom.content_y_offset orelse 0),
+    };
+
     if (!in.snap.row_mode) return drawMainFlatFrame(hwnd, app, g, in, geom);
     return drawMainRowFrame(hwnd, app, g, in, geom, resized_before_draw);
 }
@@ -2887,12 +2916,12 @@ fn drawMainRowFrame(
             .cursor_grid = cursor.grid,
             .cursor_erase_rows = cursor.erase_rows,
             .cursor_layer_origin = cursor.layer_origin,
-            .blink_visible = app.cursor_blink.visible,
+            .blink_visible = app.cursor_blink.visible and !g.shaderDrawsCursorNow(),
             .force_full_rows = force_full_rows,
             .glow = if (in.glow.enabled) app_mod.RowFrameGlow{
                 .intensity = in.glow.intensity,
                 .radius_scale = in.glow.radius_scale,
-                .cursor_visible = app.cursor_blink.visible,
+                .cursor_visible = app.cursor_blink.visible and !g.shaderDrawsCursorNow(),
             } else null,
             .draw_params = row_draw_params,
             .log_enabled = log_enabled,
@@ -4636,7 +4665,11 @@ pub export fn WndProc(
                         // WM_PAINT returns early for an iconic window too. The
                         // visible external windows above keep animating.
                         if (c.IsIconic(hwnd) == 0) {
-                            if (app.renderer) |*r| r.presentShaderAnimationFrame();
+                            if (app.renderer) |*r| {
+                                // A blink toggle repaints without a flush.
+                                r.cursor_blink_on = app.cursor_blink.visible;
+                                r.presentShaderAnimationFrame();
+                            }
                         }
                         if (app.renderer) |*r| anim_dev_lost = anim_dev_lost or r.device_lost;
 
@@ -5055,7 +5088,7 @@ pub export fn WndProc(
                 // renderer are known-good (or not at all, on failure).
                 var recovered_gpu: ?d3d11.Renderer = blk: {
                     if (new_d3d_device != null and new_d3d_ctx != null) {
-                        break :blk d3d11.Renderer.initWithDevice(app.alloc, hwnd, app.config.window.opacity, app.config.window.blur, new_d3d_device.?, new_d3d_ctx.?, true) catch null;
+                        break :blk d3d11.Renderer.initWithDevice(app.alloc, hwnd, app.config.window.opacity, app.config.window.blur, new_d3d_device.?, new_d3d_ctx.?, true, null) catch null;
                     }
                     break :blk d3d11.Renderer.init(app.alloc, hwnd, app.config.window.opacity, app.config.window.blur) catch null;
                 };
@@ -5148,6 +5181,7 @@ pub export fn WndProc(
                 app.renderer = recovered_gpu.?;
                 app.device_lost_shader_carry = null;
                 app.mu.unlock(core.clock.io());
+                syncShaderInputsEnabled(app);
 
                 // 4. Full reseed: GPU atlas + all rows + tabline texture.
                 app.atlas_upload.forceFull();
@@ -5215,7 +5249,7 @@ pub export fn WndProc(
                     // deinit leaves the struct undefined, so replacing it
                     // only on success is what prevents a later double-deinit
                     // on garbage COM pointers.
-                    var new_renderer = external_windows.newExternalRenderer(app, ext_win.hwnd) orelse {
+                    var new_renderer = external_windows.newExternalRenderer(app, ext_win.hwnd, grid_id) orelse {
                         if (applog.isEnabled()) applog.appLog("[win] device-lost recovery: external renderer re-init failed (window stays lost)\n", .{});
                         any_ext_failed = true;
                         external_windows.finishExternalWindowPaint(app, grid_id);
@@ -5569,7 +5603,7 @@ pub export fn WndProc(
                 if (deferred_log_enabled) _ = c.QueryPerformanceCounter(&t1);
                 const gpu = blk: {
                     if (app.d3d_device != null and app.d3d_ctx != null) {
-                        break :blk d3d11.Renderer.initWithDevice(app.alloc, hwnd, app.config.window.opacity, app.config.window.blur, app.d3d_device.?, app.d3d_ctx.?, true) catch |e| {
+                        break :blk d3d11.Renderer.initWithDevice(app.alloc, hwnd, app.config.window.opacity, app.config.window.blur, app.d3d_device.?, app.d3d_ctx.?, true, null) catch |e| {
                             if (deferred_log_enabled) applog.appLog("d3d11.Renderer.initWithDevice failed: {any}\n", .{e});
                             return 0;
                         };
@@ -5611,6 +5645,7 @@ pub export fn WndProc(
                 // live D3D11 device.
                 if (app.renderer) |*r| {
                     r.loadCustomShaderPipelines(&app.config);
+                    syncShaderInputsEnabled(app);
                     if (r.any_custom_shader_needs_animation) {
                         // Kick continuous-redraw ticker. Runs ~60Hz until
                         // the renderer (or a future config reload) tells

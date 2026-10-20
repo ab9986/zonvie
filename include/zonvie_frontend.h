@@ -771,6 +771,29 @@ ZONVIE_API size_t zonvie_core_escape_path_for_cmdline(
    Pure — no core pointer, no lock. */
 ZONVIE_API bool zonvie_core_shader_needs_animation(const char *source, size_t len);
 
+/* Whether a custom shader's source reads the cell-age inputs (iCellAge, the
+   zonvieCellAge wrapper, iCellSize, iGridOrigin, iTimeLastEdit). Frontends
+   allocate the cell-age texture, and opt in with
+   zonvie_core_set_shader_inputs_enabled, only when a loaded shader does.
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API bool zonvie_core_shader_uses_edit_inputs(const char *source, size_t len);
+
+/* Whether a custom shader's source reads iPrevFrame. Frontends allocate the
+   feedback pair, and render the last pass into it plus a copy to the
+   drawable, only when a loaded shader does.
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API bool zonvie_core_shader_uses_prev_frame(const char *source, size_t len);
+
+/* Whether a custom shader's source carries the `@zonvie-owns-cursor` token:
+   once iCurrentCursor holds a non-empty rect, the frontend skips its native
+   cursor pass and cursor glow for every shape, block included, and leaves
+   the cursor to the shader.
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API bool zonvie_core_shader_owns_cursor(const char *source, size_t len);
+
 /* The insertion index a tab drag at `pos` drops on: the first of `count`
    equal tabs (tab i starts at origin + i*stride and is `size` long) whose
    centre is past `pos`, else `count`. One axis: x on a tab bar, y down a
@@ -962,7 +985,85 @@ typedef struct zonvie_shader_uniforms {
     float    iPreviousCursorColor[4]; /* 128..143 */
     float    iTimeCursorChange;       /* 144..147 */
     float    _pad_cursor[3];          /* 148..159 — UBO size must be 16-aligned */
+    /* Zonvie edit-effect extensions. Appended after the Ghostty-compatible
+       block so shaders compiled against the 160-byte layout keep reading the
+       same offsets.
+       iCellSize/iGridOrigin let a shader map fragCoord to a grid cell, which
+       is what the iCellAge sampler is indexed by:
+       cell = floor((fragCoord - iGridOrigin) / iCellSize). iGridOrigin is
+       the surface's grid top-left in the same drawable space as fragCoord
+       and iCurrentCursor, so cursor maths needs no iGridOrigin term.
+       iTimeLastEdit is the iTime of the most recent cell stamp, so a shader
+       can skip all per-cell work outside its effect window.
+       iCursorVisible/iCurrentCursorStyle/iPreviousCursorStyle mirror
+       Ghostty's uniforms of the same name and type. Style values match
+       Ghostty's renderer cursor style enum: 0 block, 1 block_hollow, 2 bar,
+       3 underline, 4 lock. Zonvie emits only 0/2/3. */
+    float    iCellSize[2];            /* 160..167  cell (w, h) in drawable px */
+    float    iGridOrigin[2];          /* 168..175  surface grid top-left, drawable px */
+    float    iTimeLastEdit;           /* 176..179 */
+    int32_t  iCursorVisible;          /* 180..183  0 while blink-off */
+    int32_t  iCurrentCursorStyle;     /* 184..187 */
+    int32_t  iPreviousCursorStyle;    /* 188..191 */
 } zonvie_shader_uniforms;
+
+/* ---------------------------------------------------------------------------
+   iCellAge stores.
+
+   The CPU side of every surface's iCellAge texture: one r32float mirror per
+   zonvie_cell_stamp.grid value (1 for the main window, otherwise an external
+   window's grid id). A frontend creates one store set, feeds it every
+   on_cell_age_stamps list with zonvie_cell_age_apply (core thread), and each
+   shaded draw calls zonvie_cell_age_sync for its own grid:
+     0  nothing to bind (zero size or out of memory);
+     1  the texture already holds the mirror;
+     2  *out_values is the cols x rows mirror to upload, and the store's
+        lock stays held until zonvie_cell_age_end_upload.
+   `cache` is the caller's, one per texture, zero-initialised and otherwise
+   opaque: while that grid's store is unchanged since its last sync, the
+   call returns 1 without taking the lock (for the first 16 live stores).
+   Its last_edit is that texture's iTimeLastEdit as of the sync.
+   `force` marks the mirror dirty first, for a texture just (re)created. A
+   size change starts the store clean. Stamps for a grid not yet sized are
+   held (16 per grid) and applied by its first sync. Drop a grid's store
+   when its window closes. The lock is a leaf: call nothing between sync and
+   end_upload but the upload itself. */
+typedef struct zonvie_cell_age_stores zonvie_cell_age_stores;
+typedef struct {
+    uint64_t version;
+    uint32_t slot;
+    uint32_t cols;
+    uint32_t rows;
+    float    last_edit;
+} zonvie_cell_age_cache;
+ZONVIE_API zonvie_cell_age_stores *zonvie_cell_age_create(void);
+ZONVIE_API void zonvie_cell_age_destroy(zonvie_cell_age_stores *stores);
+ZONVIE_API void zonvie_cell_age_apply(zonvie_cell_age_stores *stores,
+    const zonvie_cell_stamp *stamps, size_t n, bool clear, float now);
+ZONVIE_API int32_t zonvie_cell_age_sync(zonvie_cell_age_stores *stores,
+    int64_t grid, uint32_t cols, uint32_t rows, bool force,
+    zonvie_cell_age_cache *cache, const float **out_values);
+ZONVIE_API void zonvie_cell_age_end_upload(zonvie_cell_age_stores *stores);
+ZONVIE_API void zonvie_cell_age_drop(zonvie_cell_age_stores *stores, int64_t grid);
+ZONVIE_API void zonvie_cell_age_remove_all(zonvie_cell_age_stores *stores);
+
+/* The cells a screen-space iCellAge texture needs to cover a surface:
+   ceil(surface / cell) per axis, 0 x 0 while either metric is 0.
+   `row_h_px` is the grid row height with 'linespace' included — the height
+   given to zonvie_core_update_layout_px. Pure. */
+ZONVIE_API void zonvie_cell_age_surface_grid(float surface_w_px, float surface_h_px,
+    float cell_w_px, float row_h_px, uint32_t *out_cols, uint32_t *out_rows);
+
+/* Fill iCellSize, iGridOrigin, iTimeLastEdit, iCursorVisible and both
+   cursor styles of `u` for one surface. Call after iCurrentCursor and
+   iPreviousCursor are set; the styles are classified from those rects
+   against (cell_w_px, row_h_px). iCellSize.y is `row_h_px`, the grid row
+   height with 'linespace' included, so cell lookups track the drawn rows.
+   iTimeLastEdit is `time_last_edit` (the surface's
+   zonvie_cell_age_cache.last_edit) when `wants_edit_inputs`, else 0. Pure. */
+ZONVIE_API void zonvie_shader_fill_edit_uniforms(zonvie_shader_uniforms *u,
+    float cell_w_px, float row_h_px, float grid_origin_x_px, float grid_origin_y_px,
+    float time_last_edit, bool cursor_visible, bool wants_edit_inputs);
 
 /* Result of a GLSL -> target shading language compile.
    Owns an internal allocation; pass to zonvie_shader_result_destroy. */

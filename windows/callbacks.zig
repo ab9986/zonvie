@@ -2169,6 +2169,30 @@ pub fn onMainGridSize(ctx: ?*anyopaque, rows: u32, cols: u32) callconv(.c) void 
     }
 }
 
+/// Cells the core stamped as "just edited" this flush, for the iCellAge
+/// shader input. Core thread, grid_mu held — this only writes the renderer's
+/// CPU mirror; the GPU upload happens on the next draw. app.mu is held so
+/// device-lost recovery cannot swap `app.renderer` out from under the write.
+pub fn onCellAgeStamps(
+    ctx: ?*anyopaque,
+    stamps: ?[*]const core.zonvie_cell_stamp,
+    n: usize,
+    clear: i32,
+) callconv(.c) void {
+    const app: *App = @ptrCast(@alignCast(ctx.?));
+    app.mu.lockUncancelable(core.clock.io());
+    defer app.mu.unlock(core.clock.io());
+    if (app.renderer == null) return;
+    const r = &app.renderer.?;
+    // iTime base: the same origin updateCustomShaderUniforms uses, so the
+    // shader can compute `iTime - stamp` directly. External renderers copy
+    // the main one's shader start, so the same `now` holds for them.
+    const now = r.shaderTimeNow();
+    const slice: []const core.zonvie_cell_stamp =
+        if (stamps != null and n > 0) stamps.?[0..n] else &.{};
+    app.cell_age.apply(slice, clear != 0, now);
+}
+
 pub fn onLineSpace(ctx: ?*anyopaque, linespace_px: i32) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
 

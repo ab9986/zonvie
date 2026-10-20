@@ -21,11 +21,29 @@ final class CustomShaderPipeline {
     /// flag the shader would execute only when Neovim flushes, producing
     /// a static image for shaders whose output depends on `iTime`.
     let needsAnimation: Bool
+    /// True when the source reads the cell-age inputs. Aggregated by
+    /// SharedRenderResources so the cell-age texture and the core's stamp
+    /// lists exist only when something reads them.
+    let usesEditInputs: Bool
+    /// True when the source reads `iPrevFrame`. Gates the feedback pair.
+    let usesPrevFrame: Bool
+    /// True when the source declared `@zonvie-owns-cursor`.
+    let ownsCursor: Bool
 
-    private init(sourcePath: String, pipelineState: MTLRenderPipelineState, needsAnimation: Bool) {
+    private init(
+        sourcePath: String,
+        pipelineState: MTLRenderPipelineState,
+        needsAnimation: Bool,
+        usesEditInputs: Bool,
+        usesPrevFrame: Bool,
+        ownsCursor: Bool
+    ) {
         self.sourcePath = sourcePath
         self.pipelineState = pipelineState
         self.needsAnimation = needsAnimation
+        self.usesEditInputs = usesEditInputs
+        self.usesPrevFrame = usesPrevFrame
+        self.ownsCursor = ownsCursor
     }
 
     /// Whether the shader reads a per-frame uniform: the core's rule, shared
@@ -33,6 +51,27 @@ final class CustomShaderPipeline {
     static func detectNeedsAnimation(in source: String) -> Bool {
         var source = source
         return source.withUTF8 { zonvie_core_shader_needs_animation($0.baseAddress, $0.count) }
+    }
+
+    /// Whether the shader reads a Zonvie edit-effect input: the core's rule,
+    /// shared with Windows.
+    static func detectUsesEditInputs(in source: String) -> Bool {
+        var source = source
+        return source.withUTF8 { zonvie_core_shader_uses_edit_inputs($0.baseAddress, $0.count) }
+    }
+
+    /// Whether the shader reads iPrevFrame: the core's rule, shared with
+    /// Windows.
+    static func detectUsesPrevFrame(in source: String) -> Bool {
+        var source = source
+        return source.withUTF8 { zonvie_core_shader_uses_prev_frame($0.baseAddress, $0.count) }
+    }
+
+    /// Whether the shader opts into drawing the cursor: the core's rule,
+    /// shared with Windows.
+    static func detectOwnsCursor(in source: String) -> Bool {
+        var source = source
+        return source.withUTF8 { zonvie_core_shader_owns_cursor($0.baseAddress, $0.count) }
     }
 
 
@@ -106,11 +145,17 @@ final class CustomShaderPipeline {
         }
 
         let needsAnimation = detectNeedsAnimation(in: glslSource)
-        ZonvieCore.appLog("[CustomShader] loaded \(sourcePath) (needsAnimation=\(needsAnimation))")
+        let usesEditInputs = detectUsesEditInputs(in: glslSource)
+        let usesPrevFrame = detectUsesPrevFrame(in: glslSource)
+        let ownsCursor = detectOwnsCursor(in: glslSource)
+        ZonvieCore.appLog("[CustomShader] loaded \(sourcePath) (needsAnimation=\(needsAnimation) editInputs=\(usesEditInputs) prevFrame=\(usesPrevFrame) ownsCursor=\(ownsCursor))")
         return CustomShaderPipeline(
             sourcePath: sourcePath,
             pipelineState: pipelineState,
-            needsAnimation: needsAnimation
+            needsAnimation: needsAnimation,
+            usesEditInputs: usesEditInputs,
+            usesPrevFrame: usesPrevFrame,
+            ownsCursor: ownsCursor
         )
     }
 
@@ -148,13 +193,19 @@ final class CustomShaderPipeline {
     /// Shadertoy preamble's `layout(std140, binding = 1)`. Inlining
     /// avoids write races when several MTKViews animate simultaneously
     /// (each gets its own copy in the command buffer).
+    /// `prevFrame` and `cellAge` back the Zonvie edit-effect inputs
+    /// (`iPrevFrame` at texture 2, `iCellAge` at texture 3). Both are nil for
+    /// shaders that do not reference them; the fragment function then simply
+    /// never samples those slots.
     func encode(
         cmd: MTLCommandBuffer,
         input: MTLTexture,
         output: MTLTexture,
         copyVertexBuffer: MTLBuffer,
         sampler: MTLSamplerState,
-        uniforms: zonvie_shader_uniforms
+        uniforms: zonvie_shader_uniforms,
+        prevFrame: MTLTexture? = nil,
+        cellAge: MTLTexture? = nil
     ) -> Bool {
         let rpd = MTLRenderPassDescriptor()
         rpd.colorAttachments[0].texture = output
@@ -166,6 +217,14 @@ final class CustomShaderPipeline {
         enc.setVertexBuffer(copyVertexBuffer, offset: 0, index: 0)
         enc.setFragmentTexture(input, index: 0)
         enc.setFragmentSamplerState(sampler, index: 0)
+        if let prevFrame {
+            enc.setFragmentTexture(prevFrame, index: 2)
+            enc.setFragmentSamplerState(sampler, index: 2)
+        }
+        if let cellAge {
+            enc.setFragmentTexture(cellAge, index: 3)
+            enc.setFragmentSamplerState(sampler, index: 3)
+        }
         var u = uniforms
         enc.setFragmentBytes(&u, length: MemoryLayout<zonvie_shader_uniforms>.size, index: 1)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)

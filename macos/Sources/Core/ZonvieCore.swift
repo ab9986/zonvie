@@ -733,9 +733,9 @@ final class ZonvieCore {
 
     /// Apply blur effect to window using private macOS API
     static func applyWindowBlur(window: NSWindow, radius: Int) {
-        let caller = Thread.callStackSymbols.prefix(5).joined(separator: "\n  ")
         appLog("[DEBUG-BLUR] applyWindowBlur called: window=\(window.windowNumber) radius=\(radius) isOpaque=\(window.isOpaque) backgroundColor=\(String(describing: window.backgroundColor))")
-        appLog("[DEBUG-BLUR] callStack:\n  \(caller)")
+        // Inside the autoclosure: symbolicating the stack is not free.
+        appLog("[DEBUG-BLUR] callStack:\n  \(Thread.callStackSymbols.prefix(5).joined(separator: "\n  "))")
 
         let connection = CGSMainConnectionID()
         let windowNumber = window.windowNumber  // Already Int (NSInteger)
@@ -1612,6 +1612,17 @@ final class ZonvieCore {
                     String(bytes: UnsafeRawBufferPointer(start: ptr, count: Int(componentLen)), encoding: .utf8) ?? ""
                 } ?? ""
                 ZonvieCore.appLog("callback error: code=\(code) component=\(componentStr)")
+            },
+            on_cell_age_stamps: { ctx, stamps, n, clear in
+                guard let ctx else { return }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                // Core thread, grid_mu held. Only the CPU mirror is written;
+                // each surface uploads its own texture when it draws.
+                guard let shared = me.terminalView?.renderer.shared else { return }
+                let buf = (stamps != nil && n > 0)
+                    ? UnsafeBufferPointer(start: stamps!, count: n)
+                    : UnsafeBufferPointer<zonvie_cell_stamp>(start: nil, count: 0)
+                shared.cellAge.apply(buf, clear: clear != 0, now: shared.shaderTimeNow())
             }
         )
 
@@ -3018,6 +3029,14 @@ final class ZonvieCore {
         )
     }
 
+    /// Tell the core whether to build per-flush cell-age stamp lists. Driven
+    /// by the loaded shader set: only a shader that reads the edit inputs
+    /// turns this on, so the default path costs nothing.
+    func setShaderInputsEnabled(_ enabled: Bool) {
+        guard let core else { return }
+        zonvie_core_set_shader_inputs_enabled(core, enabled ? 1 : 0)
+    }
+
     /// Neovim changed the main grid size itself (`:set columns=` / `:set lines=`).
     /// Resize the main window so the terminal area becomes cols x rows cells.
     /// Runs on the core thread with grid_mu held, so the window work is
@@ -4279,6 +4298,10 @@ final class ZonvieCore {
                 Self.closeRemovedExternalWindow(window)
             }
         }
+        for parked in parkedDecoratedWindows.values {
+            Self.closeRemovedExternalWindow(parked.window)
+        }
+        parkedDecoratedWindows.removeAll()
         // Its message, prompt and mini panels are floating windows
         // of their own and would outlive it the same way.
         hideMessageWindow()
@@ -4293,6 +4316,10 @@ final class ZonvieCore {
     // MARK: - External Window Support
 
     private var externalWindows: [Int64: NSWindow] = [:]
+    /// Decorated windows ordered out at close, reused by the next open of the
+    /// same grid. Absent from every map above, so nothing routes to or asks
+    /// about them while hidden. Main thread.
+    private var parkedDecoratedWindows: [Int64: (window: NSWindow, view: ExternalGridView)] = [:]
 
     /// Whether `window` is this session's: its main window or one of its
     /// external windows. Main thread.
@@ -5042,19 +5069,6 @@ final class ZonvieCore {
                 return
             }
 
-            guard let commandQueue = renderer.metalDevice.makeCommandQueue() else {
-                let retryDelay = self.nextExternalResourceRetryDelay(gridId: gridId)
-                ZonvieCore.appLog("[external_window] required Metal resources unavailable; retrying gridId=\(gridId) in \(retryDelay)s")
-                self.queuePendingExternalWindowRequest(
-                    request,
-                    retryAfter: retryDelay
-                )
-                return
-            }
-
-            let isSpecialWindow = self.isDecoratedExternalGridKind(specialKind)
-
-            let styleMask = self.styleMaskForExternalWindow(kind: specialKind)
             let windowRect = self.buildInitialExternalWindowRect(
                 kind: specialKind,
                 gridId: gridId,
@@ -5069,48 +5083,68 @@ final class ZonvieCore {
                 sessionGeneration: sessionGeneration
             )
 
-            let window = self.makeExternalHostWindow(
-                kind: specialKind,
-                contentRect: windowRect,
-                styleMask: styleMask
-            )
-            self.applyExternalWindowSettings(window, kind: specialKind, win: win)
+            let window: NSWindow
+            let gridView: ExternalGridView
+            if let parked = self.parkedDecoratedWindows.removeValue(forKey: gridId) {
+                // The shell, view and queue from this grid's last showing; its
+                // rows were released at close, so nothing old can be drawn.
+                window = parked.window
+                gridView = parked.view
+                window.setFrame(windowRect, display: false)
+                gridView.hideWindowUntilFirstPresent()
+            } else {
+                guard let commandQueue = renderer.metalDevice.makeCommandQueue() else {
+                    let retryDelay = self.nextExternalResourceRetryDelay(gridId: gridId)
+                    ZonvieCore.appLog("[external_window] required Metal resources unavailable; retrying gridId=\(gridId) in \(retryDelay)s")
+                    self.queuePendingExternalWindowRequest(
+                        request,
+                        retryAfter: retryDelay
+                    )
+                    return
+                }
 
-            let blurEnabledForGrid = ZonvieConfig.shared.blurEnabled
-            let gridView = ExternalGridView(
-                gridId: gridId,
-                device: renderer.metalDevice,
-                commandQueue: commandQueue,
-                initialRows: Int(rows),
-                atlas: renderer.glyphAtlas,
-                shared: renderer.shared,
-                blurEnabled: blurEnabledForGrid,
-                isDecoratedSurface: isSpecialWindow
-            )
-            self.externalResourceRetryDelayByGrid.removeValue(forKey: gridId)
-            self.externalWindowRetryDeadlineByGrid.removeValue(forKey: gridId)
+                window = self.makeExternalHostWindow(
+                    kind: specialKind,
+                    contentRect: windowRect,
+                    styleMask: self.styleMaskForExternalWindow(kind: specialKind)
+                )
+                self.applyExternalWindowSettings(window, kind: specialKind, win: win)
 
-            // Window construction can initialize Metal/AppKit resources and
-            // process nested work. Do not publish a window if a newer close or
-            // replacement request arrived while that work was in progress.
-            guard self.isCurrentExternalWindowLifecycleToken(gridId: gridId, token: lifecycleToken) else {
-                ZonvieCore.appLog("[external_window] discarding stale constructed window gridId=\(gridId) token=\(lifecycleToken)")
-                window.close()
-                return
+                gridView = ExternalGridView(
+                    gridId: gridId,
+                    device: renderer.metalDevice,
+                    commandQueue: commandQueue,
+                    initialRows: Int(rows),
+                    atlas: renderer.glyphAtlas,
+                    shared: renderer.shared,
+                    blurEnabled: ZonvieConfig.shared.blurEnabled,
+                    isDecoratedSurface: self.isDecoratedExternalGridKind(specialKind)
+                )
+                self.externalResourceRetryDelayByGrid.removeValue(forKey: gridId)
+                self.externalWindowRetryDeadlineByGrid.removeValue(forKey: gridId)
+
+                // Window construction can initialize Metal/AppKit resources and
+                // process nested work. Do not publish a window if a newer close or
+                // replacement request arrived while that work was in progress.
+                guard self.isCurrentExternalWindowLifecycleToken(gridId: gridId, token: lifecycleToken) else {
+                    ZonvieCore.appLog("[external_window] discarding stale constructed window gridId=\(gridId) token=\(lifecycleToken)")
+                    window.close()
+                    return
+                }
+
+                gridView.mainTerminalView = mainView  // Enable key event forwarding
+                gridView.core = self
+
+                self.attachExternalGridView(gridId: gridId, window: window, gridView: gridView, kind: specialKind, geometry: geometry)
+
+                self.installExternalWindowDelegateIfNeeded(
+                    gridId: gridId,
+                    kind: specialKind,
+                    window: window,
+                    cellW: cellW,
+                    cellH: cellH
+                )
             }
-
-            gridView.mainTerminalView = mainView  // Enable key event forwarding
-            gridView.core = self
-
-            self.attachExternalGridView(gridId: gridId, window: window, gridView: gridView, kind: specialKind, geometry: geometry)
-
-            self.installExternalWindowDelegateIfNeeded(
-                gridId: gridId,
-                kind: specialKind,
-                window: window,
-                cellW: cellW,
-                cellH: cellH
-            )
             self.prepareExternalWindowForDisplay(window: window, kind: specialKind)
             self.registerExternalWindow(
                 gridId: gridId,
@@ -5363,6 +5397,7 @@ final class ZonvieCore {
         externalWindowInstalledSessionGenerations.removeValue(forKey: gridId)
         externalGridViewsLock.lock()
         let removedView = externalGridViews.removeValue(forKey: gridId)
+        terminalView?.renderer.shared.cellAge.drop(grid: gridId)
         externalGridViewsLock.unlock()
         // The view's own vertex storage goes when the view does, not on
         // on_grid_destroy: that fires while this close is still queued and
@@ -5420,6 +5455,9 @@ final class ZonvieCore {
                 return
             }
 
+            self.externalGridViewsLock.lock()
+            let removedView = self.externalGridViews[gridId]
+            self.externalGridViewsLock.unlock()
             let removedWindow = self.removeInstalledExternalWindow(gridId: gridId)
 
             // Drop config stashed before window creation for this grid.
@@ -5448,7 +5486,16 @@ final class ZonvieCore {
                     &self.externalPlacement, gridId, window.frame.origin.x, window.frame.origin.y,
                     installedSessionGeneration ?? currentSessionGeneration &+ 1, currentSessionGeneration)
                 ZonvieCore.appLog("[external_window] saved position for gridId=\(gridId): \(window.frame.origin)")
-                Self.closeRemovedExternalWindow(window)
+                // The cmdline, popupmenu and message windows close on every
+                // hide; rebuilding the shell, view and Metal queue each time
+                // was the bulk of showing one. Their grid ids are fixed.
+                if self.isDecoratedExternalGridKind(self.classifyExternalGridKind(gridId)),
+                   let view = removedView {
+                    window.orderOut(nil)
+                    self.parkedDecoratedWindows[gridId] = (window, view)
+                } else {
+                    Self.closeRemovedExternalWindow(window)
+                }
                 ZonvieCore.appLog("[external_window] closed window for gridId=\(gridId)")
                 // msg_show was stacked below msg_history: move it back up.
                 if gridId == ZonvieCore.msgHistoryGridId {
@@ -6216,13 +6263,14 @@ final class ZonvieCore {
         }
 
         // Content sent before the window existed was generated against an
-        // earlier flush's atlas and was not kept. Regenerate every grid through
-        // the normal flush bracket, which commits the atlas before external views.
+        // earlier flush's atlas and was not kept. Regenerate this surface's
+        // grids through the normal flush bracket, which commits the atlas
+        // before external views; no other surface lost anything.
         DispatchQueue.main.async { [weak self] in
             guard let self, let corePtr = self.core else { return }
             // Always defer one main-queue turn: this method can run inline from
             // zonvie_core_retry_flush on the main thread while grid_mu is held.
-            zonvie_core_force_resend(corePtr)
+            zonvie_core_force_resend_surface(corePtr, gridId)
             self.scheduleFlushRetry()
         }
     }
@@ -6821,10 +6869,34 @@ final class ZonvieCore {
         guard kind != .normal else { return }
         guard let context = makeDecoratedGridContext(gridId: gridId) else { return }
 
-        updateDecoratedBackground(kind: kind, gridId: gridId, context: context, gridView: gridView, bgColor: bgColor)
+        let theme = decoratedThemeColors(kind: kind)
+        updateDecoratedBackground(context: context, gridView: gridView, themeBg: theme.bg, bgColor: bgColor)
         updateDecoratedLayout(kind: kind, context: context, gridView: gridView, rows: rows, cols: cols)
         // Chrome must be updated AFTER layout so border uses the new layer.bounds
-        updateDecoratedWindowChrome(kind: kind, containerView: context.containerView)
+        updateDecoratedWindowChrome(kind: kind, containerView: context.containerView, borderColor: theme.border)
+    }
+
+    /// A decorated kind's theme background (MsgArea, or Pmenu) and, for the
+    /// cmdline and popupmenu, its Search border, under one grid_mu take: this
+    /// runs on the main thread on every show, where each separate lookup could
+    /// wait out a whole redraw batch.
+    private func decoratedThemeColors(kind: ExternalGridKind) -> (bg: NSColor?, border: NSColor?) {
+        guard let corePtr = self.core else { return (nil, nil) }
+        let bgName = kind == .popupmenu ? "Pmenu" : "MsgArea"
+        let wantsBorder = kind == .cmdline || kind == .popupmenu
+        var fg: [UInt32] = [0, 0]
+        var bg: [UInt32] = [0, 0]
+        var found: [Int32] = [0, 0]
+        let ok = bgName.withCString { bgPtr in
+            "Search".withCString { searchPtr in
+                let names: [UnsafePointer<CChar>?] = [bgPtr, wantsBorder ? searchPtr : nil]
+                return zonvie_core_get_hl_by_names_batch(corePtr, names, &fg, &bg, &found, 2)
+            }
+        }
+        guard ok != 0 else { return (nil, nil) }
+        let themeBg = found[0] != 0 ? Self.rgbColor(bg[0]) : nil
+        let border: NSColor? = wantsBorder ? (found[1] != 0 ? Self.rgbColor(bg[1]) : .yellow) : nil
+        return (themeBg, border)
     }
 
     private func makeDecoratedGridContext(gridId: Int64) -> DecoratedGridContext? {
@@ -6839,8 +6911,8 @@ final class ZonvieCore {
         return DecoratedGridContext(window: window, containerView: containerView, renderer: renderer, scale: scale)
     }
 
-    private func updateDecoratedBackground(kind: ExternalGridKind, gridId: Int64, context: DecoratedGridContext, gridView: ExternalGridView, bgColor: NSColor?) {
-        let resolvedBg = resolveHlGroupBgColor(kind: kind, gridId: gridId) ?? bgColor
+    private func updateDecoratedBackground(context: DecoratedGridContext, gridView: ExternalGridView, themeBg: NSColor?, bgColor: NSColor?) {
+        let resolvedBg = themeBg ?? bgColor
         guard let resolvedBg else { return }
 
         let adjustedBg = resolvedBg.adjustedForCmdlineBackground()
@@ -6877,13 +6949,14 @@ final class ZonvieCore {
         gridView.setGridBackground(rgb: Self.packSurfaceBg(marginBg), clearAlpha: Double(marginAlpha))
     }
 
-    private func updateDecoratedWindowChrome(kind: ExternalGridKind, containerView: NSView) {
+    /// `borderColor` nil looks the Search colour up.
+    private func updateDecoratedWindowChrome(kind: ExternalGridKind, containerView: NSView, borderColor: NSColor? = nil) {
         containerView.layer?.cornerRadius = Self.specialWindowCornerRadius
         containerView.layer?.cornerCurve = .continuous
 
         switch kind {
         case .cmdline, .popupmenu:
-            let borderColor = self.getSearchHighlightColor()
+            let borderColor = borderColor ?? self.getSearchHighlightColor()
             self.updateSpecialWindowBorder(containerView: containerView, borderColor: borderColor, lineWidth: 1.0)
         case .msgShow, .msgHistory, .normal:
             break
@@ -7334,8 +7407,12 @@ final class ZonvieCore {
         ZonvieCore.appLog("[cmdline_show] set cmdlineFirstc=\(firstc)")
 
         DispatchQueue.main.async { [weak self] in
-            self?.cmdlineFirstc = capturedFirstc
-            self?.updateCmdlineIcon(firstc: capturedFirstc)
+            guard let self else { return }
+            let changed = self.cmdlineFirstc != capturedFirstc
+            self.cmdlineFirstc = capturedFirstc
+            // Once per showing (hide resets firstc), not per keystroke: the
+            // icon is an SF Symbol build and a grid_mu highlight lookup.
+            if changed { self.updateCmdlineIcon(firstc: capturedFirstc) }
         }
     }
 

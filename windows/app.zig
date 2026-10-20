@@ -330,6 +330,11 @@ pub const COPY_BUTTON_REVERT_MS: c.UINT = 800;
 pub const TIMER_SCROLLBAR_DRAG_FLUSH: c.UINT_PTR = 22;
 /// One-shot re-read for a copy click whose grid try-lock was busy.
 pub const TIMER_COPY_BUTTON_RETRY: c.UINT_PTR = 23;
+/// A reused decorated window is shown cloaked and uncloaked by its first
+/// present; this bounds how long a showing whose present never comes stays
+/// invisible.
+pub const TIMER_EXTERNAL_UNCLOAK: c.UINT_PTR = 24;
+pub const EXTERNAL_UNCLOAK_TIMEOUT_MS: c.UINT = 250;
 pub const EXTERNAL_CREATE_RETRY_INTERVAL_MS: c.UINT = 100;
 pub const EXTERNAL_CREATE_RETRY_MAX_MS: u32 = 5000;
 /// Tray icon init delay in milliseconds
@@ -2827,6 +2832,8 @@ pub const ExternalWindow = struct {
     // back_tex holds the last row-mode frame. False until a full row frame
     // presents; every failure path and every recreate clears it.
     back_tex_valid: bool = false,
+    // A reused window shown cloaked: the next successful present uncloaks it.
+    uncloak_on_present: bool = false,
 
     pub fn deinit(
         self: *ExternalWindow,
@@ -2839,15 +2846,35 @@ pub const ExternalWindow = struct {
         // Destroy window first (this will process WM_DESTROY etc.)
         _ = c.DestroyWindow(self.hwnd);
 
-        // Now safe to release D3D resources
+        self.deinitKeepingWindow(alloc, row_vb_budget);
+        self.renderer.deinit();
+    }
+
+    /// Everything deinit releases but the HWND and the renderer, for a window
+    /// parked to be reused (ParkedExternalWindow).
+    pub fn deinitKeepingWindow(
+        self: *ExternalWindow,
+        alloc: std.mem.Allocator,
+        row_vb_budget: *RowVBPhysicalBudget,
+    ) void {
         self.paint_scratch.deinit(alloc);
         self.paint_row_ranges.deinit(alloc);
         self.decorated_scratch.deinit(alloc);
         self.surf.surface.deinitCpuState(alloc);
         self.surf.paint.deinit(alloc, row_vb_budget);
         self.surf.tbs.deinit(alloc); // Handles slot release + pool deinit
-        self.renderer.deinit();
     }
+};
+
+/// A decorated window (cmdline, popupmenu, message) hidden at close and kept
+/// for the next open of the same grid: Neovim hides the cmdline after every
+/// command, and a new HWND, swapchain and composition target each time was
+/// the bulk of showing it. Not in external_windows, so nothing routes to it,
+/// paints it or finds it by HWND. UI thread only.
+pub const ParkedExternalWindow = struct {
+    grid_id: i64,
+    hwnd: c.HWND,
+    renderer: d3d11.Renderer,
 };
 
 // =========================================================================
@@ -5910,6 +5937,12 @@ pub const App = struct {
     cursor_blink: core.frontend_rules.Blink = .{}, // .visible: the cursor is drawn
     cursor_blink_timer: c.UINT_PTR = 0, // Timer ID for blink
 
+    /// iCellAge mirrors for the main and every external window, written by
+    /// on_cell_age_stamps and read by each renderer's shaded draw.
+    cell_age: core.cell_age_store.Stores,
+    /// One slot per decorated grid id; see ParkedExternalWindow.
+    parked_external_windows: [4]?ParkedExternalWindow = .{null} ** 4,
+
     cursor_is_hand: bool = false, // URL hover: hand cursor
     url_cache_grid: i64 = 0,
     url_cache_row: i32 = 0,
@@ -6365,6 +6398,15 @@ pub const App = struct {
 
         if (self.renderer) |*r| r.deinit();
         self.renderer = null;
+        for (&self.parked_external_windows) |*slot| {
+            if (slot.*) |*p| {
+                _ = c.DestroyWindow(p.hwnd);
+                p.renderer.deinit();
+            }
+            slot.* = null;
+        }
+        // After every renderer that pointed at it.
+        self.cell_age.deinit();
 
         // Release App's own reference on the shared D3D11 device/context (the
         // renderer, as of this fix, takes and releases its OWN reference via

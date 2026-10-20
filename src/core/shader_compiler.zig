@@ -89,6 +89,14 @@ const shadertoy_preamble =
     \\// combined sampler, and a leading `_` on the texture would yield a
     \\// `__..._sampler` identifier that some d3dcompiler versions mishandle.
     \\layout(binding = 0) uniform sampler2D zonvie_iChannel0Tex;
+    \\// Zonvie edit-effect inputs. Bindings 2 and 3 are Zonvie-specific:
+    \\// Ghostty reserves iChannel1..3 (bindings it may claim later), so
+    \\// naming these separately keeps both shader ecosystems compatible.
+    \\// iPrevFrame is the PREVIOUS frame's final shader output, which is
+    \\// what makes a decaying ghost possible; iCellAge holds, per grid cell,
+    \\// the iTime at which that cell was last edited (0 = never).
+    \\layout(binding = 2) uniform sampler2D zonvie_iPrevFrameTex;
+    \\layout(binding = 3) uniform sampler2D iCellAge;
     \\
     \\layout(std140, binding = 1) uniform ZonvieShaderUniforms {
     \\    vec3 iResolution;
@@ -107,6 +115,19 @@ const shadertoy_preamble =
     \\    vec4 iCurrentCursorColor;
     \\    vec4 iPreviousCursorColor;
     \\    float iTimeCursorChange;
+    \\    // Three separate floats, NOT a vec2+float: std140 aligns a vec2 to
+    \\    // 8 bytes, which would push it to offset 152 and shift every field
+    \\    // below it out of step with zonvie_shader_uniforms.
+    \\    float _zonvie_pad_cursor0;
+    \\    float _zonvie_pad_cursor1;
+    \\    float _zonvie_pad_cursor2;
+    \\    // Zonvie edit-effect extensions (see zonvie_shader_uniforms).
+    \\    vec2 iCellSize;
+    \\    vec2 iGridOrigin;
+    \\    float iTimeLastEdit;
+    \\    int iCursorVisible;
+    \\    int iCurrentCursorStyle;
+    \\    int iPreviousCursorStyle;
     \\};
     \\
     \\layout(location = 0) in vec2 vUV;
@@ -115,17 +136,44 @@ const shadertoy_preamble =
     \\// Wrapper type + `texture()` overload: user code keeps writing
     \\// `texture(iChannel0, uv)` with a screen-space `uv`, and we
     \\// translate that to this window's local backTex UV under the hood.
+    \\// The wrappers sample LOD 0 explicitly: the textures have no mips, and
+    \\// an implicit-gradient sample inside a loop with divergent control
+    \\// flow forces D3DCompile to unroll it, which can hang for minutes.
     \\struct zonvie_iChannel0_t { int _d; };
     \\const zonvie_iChannel0_t iChannel0 = zonvie_iChannel0_t(0);
     \\vec4 texture(zonvie_iChannel0_t _ch, vec2 screen_uv) {
     \\    vec2 local_px = screen_uv * iResolution.xy - iWindowOffset;
     \\    vec2 local_uv = local_px / iWindowSize;
-    \\    return texture(zonvie_iChannel0Tex, local_uv);
+    \\    return textureLod(zonvie_iChannel0Tex, local_uv, 0.0);
     \\}
     \\vec4 textureLod(zonvie_iChannel0_t _ch, vec2 screen_uv, float lod) {
     \\    vec2 local_px = screen_uv * iResolution.xy - iWindowOffset;
     \\    vec2 local_uv = local_px / iWindowSize;
     \\    return textureLod(zonvie_iChannel0Tex, local_uv, lod);
+    \\}
+    \\
+    \\// iPrevFrame gets the same screen-space wrapper as iChannel0 so a
+    \\// shader can sample both with one UV.
+    \\struct zonvie_iPrevFrame_t { int _d; };
+    \\const zonvie_iPrevFrame_t iPrevFrame = zonvie_iPrevFrame_t(0);
+    \\vec4 texture(zonvie_iPrevFrame_t _ch, vec2 screen_uv) {
+    \\    vec2 local_px = screen_uv * iResolution.xy - iWindowOffset;
+    \\    vec2 local_uv = local_px / iWindowSize;
+    \\    return textureLod(zonvie_iPrevFrameTex, local_uv, 0.0);
+    \\}
+    \\
+    \\// Age of the cell under a screen-space pixel, in seconds, or a large
+    \\// value when that cell has never been edited. Wraps the texel fetch so
+    \\// shaders never have to know the cell-grid dimensions.
+    \\float zonvieCellAge(vec2 frag_px) {
+    \\    if (iCellSize.x <= 0.0 || iCellSize.y <= 0.0) return 1e9;
+    \\    vec2 cell = floor((frag_px - iGridOrigin) / iCellSize);
+    \\    ivec2 idx = ivec2(cell);
+    \\    ivec2 dim = textureSize(iCellAge, 0);
+    \\    if (idx.x < 0 || idx.y < 0 || idx.x >= dim.x || idx.y >= dim.y) return 1e9;
+    \\    float stamp = texelFetch(iCellAge, idx, 0).r;
+    \\    if (stamp <= 0.0) return 1e9;
+    \\    return max(0.0, iTime - stamp);
     \\}
     \\
     \\// ----- user source (mainImage) follows -----
@@ -153,7 +201,12 @@ const shadertoy_epilogue =
     \\    vec2 fragCoord = iWindowOffset + vUV * iWindowSize;
     \\    vec4 color = vec4(0.0, 0.0, 0.0, 1.0);
     \\    mainImage(color, fragCoord);
-    \\#ifdef ZONVIE_PRESERVE_ALPHA
+    \\#if defined(ZONVIE_PRESERVE_ALPHA) && defined(ZONVIE_SHADER_ALPHA)
+    \\    // A shader that `#define`s ZONVIE_SHADER_ALPHA owns the alpha: it
+    \\    // returns premultiplied rgba, normally the terminal's alpha, raised
+    \\    // where it paints something that must not let the blur through.
+    \\    zonvie_fragColor = color;
+    \\#elif defined(ZONVIE_PRESERVE_ALPHA)
     \\    // Preserve the terminal's alpha so window transparency/blur shows
     \\    // through the shader. backTex is premultiplied, so this matches the
     \\    // non-shader copy path for passthrough/tint shaders. Caveats: alpha is
@@ -192,6 +245,16 @@ fn wrapShadertoy(alloc: std.mem.Allocator, user_src: []const u8) ![]u8 {
 /// Shadertoy-style sources (those containing `mainImage`) are
 /// auto-wrapped with the preamble defined above before being handed to
 /// glslang.
+/// Print glslang's diagnostics for a failed stage to stderr. The C ABI only
+/// carries a fixed "GLSL parse failed" string, which leaves a shader author
+/// guessing; the actual line/column message lives in the shader's info log.
+fn logGlslangShaderInfo(shader: *glslang.glslang_shader_t, stage: []const u8) void {
+    const info = glslang.glslang_shader_get_info_log(shader);
+    if (info != null) {
+        std.debug.print("[shader_compiler] glslang {s} failed:\n{s}\n", .{ stage, std.mem.span(info) });
+    }
+}
+
 pub fn compileGlslToTarget(
     alloc: std.mem.Allocator,
     glsl_source: []const u8,
@@ -234,9 +297,11 @@ pub fn compileGlslToTarget(
     defer glslang.glslang_shader_delete(shader);
 
     if (glslang.glslang_shader_preprocess(shader, &input) == 0) {
+        logGlslangShaderInfo(shader, "preprocess");
         return CompileError.ParseFailed;
     }
     if (glslang.glslang_shader_parse(shader, &input) == 0) {
+        logGlslangShaderInfo(shader, "parse");
         return CompileError.ParseFailed;
     }
 
@@ -326,6 +391,8 @@ fn crossCompileSpirv(
     // mapping that matches what the HLSL side emits naturally:
     //   iChannel0  → texture(0) + sampler(0)
     //   UBO        → buffer(1)
+    //   iPrevFrame → texture(2) + sampler(2)
+    //   iCellAge   → texture(3) + sampler(3)
     if (target == .msl) {
         var bind_ubo: spvc.spvc_msl_resource_binding = undefined;
         spvc.spvc_msl_resource_binding_init(&bind_ubo);
@@ -343,6 +410,20 @@ fn crossCompileSpirv(
         bind_tex.msl_texture = 0;
         bind_tex.msl_sampler = 0;
         _ = spvc.spvc_compiler_msl_add_resource_binding(compiler, &bind_tex);
+
+        // Zonvie edit-effect samplers. Registered unconditionally: a shader
+        // that never references them produces no binding at all, and an
+        // unused mapping is ignored.
+        for ([_]u32{ 2, 3 }) |slot| {
+            var bind_edit: spvc.spvc_msl_resource_binding = undefined;
+            spvc.spvc_msl_resource_binding_init(&bind_edit);
+            bind_edit.stage = spvc.SpvExecutionModelFragment;
+            bind_edit.desc_set = 0;
+            bind_edit.binding = slot;
+            bind_edit.msl_texture = slot;
+            bind_edit.msl_sampler = slot;
+            _ = spvc.spvc_compiler_msl_add_resource_binding(compiler, &bind_edit);
+        }
     }
 
     var compiled_src: [*c]const u8 = undefined;
@@ -354,6 +435,148 @@ fn crossCompileSpirv(
     // dupe it into caller-owned memory before the defer cleans up.
     const src_slice = std.mem.span(compiled_src);
     return alloc.dupe(u8, src_slice) catch CompileError.OutOfMemory;
+}
+
+/// The reference Thymer shader, compiled for real by the tests below. Kept
+/// in the source rather than read from disk so the test is hermetic; it is
+/// the same shape as tmp/shaders/thymer.glsl and exercises every new input.
+const thymer_reference_glsl =
+    \\const float EDIT_DURATION_S = 0.15;
+    \\const float GHOST_TAU_S = 0.05;
+    \\float sdRoundBox(vec2 p, vec2 h, float r) {
+    \\    vec2 q = abs(p) - h + r;
+    \\    return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;
+    \\}
+    \\bool insideCursorRect(vec2 p, vec4 rect) {
+    \\    return p.x >= rect.x && p.x <= rect.x + rect.z &&
+    \\           p.y >= rect.y - rect.w && p.y <= rect.y;
+    \\}
+    \\void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+    \\    vec2 uv = fragCoord / iResolution.xy;
+    \\    vec4 base = texture(iChannel0, uv);
+    \\    if ((iTime - iTimeLastEdit) <= EDIT_DURATION_S) {
+    \\        float t = clamp(zonvieCellAge(fragCoord) / EDIT_DURATION_S, 0.0, 1.0);
+    \\        if (t < 1.0) {
+    \\            float scale = max(iCellSize.y, 1.0) / 20.0;
+    \\            vec4 cur = texture(iChannel0, uv) * scale;
+    \\            vec4 prev = cur;
+    \\            if (!insideCursorRect(fragCoord, iCurrentCursor) &&
+    \\                !insideCursorRect(fragCoord, iPreviousCursor)) {
+    \\                prev = texture(iPrevFrame, uv);
+    \\            }
+    \\            base = mix(cur, prev, exp(-iTimeDelta / GHOST_TAU_S));
+    \\        }
+    \\    }
+    \\    if ((iCurrentCursorStyle == 2 || iCurrentCursorStyle == 3) && iCursorVisible != 0) {
+    \\        vec2 p = fragCoord - vec2(iCurrentCursor.x, iCurrentCursor.y);
+    \\        float sd = sdRoundBox(p, iCurrentCursor.zw * 0.5, 1.5);
+    \\        float a = 1.0 - smoothstep(-0.5, 0.5, sd);
+    \\        base.rgb = mix(base.rgb, iCurrentCursorColor.rgb, a);
+    \\    }
+    \\    fragColor = base;
+    \\}
+;
+
+test "preamble uniform block matches zonvie_shader_uniforms offsets" {
+    // std140 alignment silently shifts every field below a misaligned one,
+    // which compiles fine and then reads the wrong bytes at runtime — that is
+    // exactly how the cursor style ended up reading past the end of the
+    // buffer. Compile a shader that reads the LAST field and check the
+    // generated MSL addresses the struct we actually upload.
+    const glsl =
+        \\void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+        \\    float a = iCellSize.x + iGridOrigin.y + iTimeLastEdit;
+        \\    float b = float(iCursorVisible + iCurrentCursorStyle + iPreviousCursorStyle);
+        \\    fragColor = vec4(a, b, 0.0, 1.0);
+        \\}
+    ;
+    const out = try compileGlslToTarget(std.testing.allocator, glsl, .msl);
+    defer std.testing.allocator.free(out);
+
+    // Walk the emitted MSL struct and confirm the field order survived the
+    // round trip; a std140 shift reorders or inserts padding members here.
+    const decl = std.mem.indexOf(u8, out, "iTimeCursorChange") orelse return error.NoUniformBlock;
+    const tail = out[decl..];
+    const i_cell = std.mem.indexOf(u8, tail, "iCellSize") orelse return error.NoCellSize;
+    const i_orig = std.mem.indexOf(u8, tail, "iGridOrigin") orelse return error.NoGridOrigin;
+    const i_last = std.mem.indexOf(u8, tail, "iTimeLastEdit") orelse return error.NoLastEdit;
+    const i_vis = std.mem.indexOf(u8, tail, "iCursorVisible") orelse return error.NoCursorVisible;
+    const i_cur = std.mem.indexOf(u8, tail, "iCurrentCursorStyle") orelse return error.NoCurStyle;
+    const i_prev = std.mem.indexOf(u8, tail, "iPreviousCursorStyle") orelse return error.NoPrevStyle;
+    try std.testing.expect(i_cell < i_orig);
+    try std.testing.expect(i_orig < i_last);
+    try std.testing.expect(i_last < i_vis);
+    try std.testing.expect(i_vis < i_cur);
+    try std.testing.expect(i_cur < i_prev);
+
+    // The padding between iTimeCursorChange and iCellSize must be three
+    // scalars. A vec2 there is the bug this test exists for: it aligns to 8
+    // and pushes iCellSize from offset 160 to 168.
+    const pad_region = tail[0..i_cell];
+    try std.testing.expect(std.mem.indexOf(u8, pad_region, "float2 _zonvie_pad") == null);
+    try std.testing.expect(std.mem.indexOf(u8, pad_region, "_zonvie_pad_cursor2") != null);
+}
+
+test "Thymer reference shader compiles to MSL with the Zonvie edit inputs" {
+    const out = try compileGlslToTarget(std.testing.allocator, thymer_reference_glsl, .msl);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(out.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, out, "metal_stdlib") != null);
+    // The slots CustomShaderPipeline.swift binds: iPrevFrame at 2, iCellAge at 3.
+    try expectDeclaredAt(out, "iPrevFrame", "[[texture(2)]]");
+    try expectDeclaredAt(out, "iCellAge", "[[texture(3)]]");
+}
+
+test "Thymer reference shader compiles to HLSL with the Zonvie edit inputs" {
+    const out = try compileGlslToTarget(std.testing.allocator, thymer_reference_glsl, .hlsl);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(out.len > 0);
+    // The slots d3d11_renderer.zig binds with PSSetShaderResources(2|3).
+    try expectDeclaredAt(out, "iPrevFrame", "register(t2)");
+    try expectDeclaredAt(out, "iCellAge", "register(t3)");
+}
+
+/// Fails unless some line of `out` declares `name` with `binding`.
+fn expectDeclaredAt(out: []const u8, name: []const u8, binding: []const u8) !void {
+    var it = std.mem.splitScalar(u8, out, '\n');
+    while (it.next()) |line| {
+        if (std.mem.indexOf(u8, line, name) != null and std.mem.indexOf(u8, line, binding) != null) return;
+    }
+    std.debug.print("no line declares {s} at {s}\n", .{ name, binding });
+    return error.TestExpectedBinding;
+}
+
+test "Ghostty cursor_blaze shape still compiles against the extended preamble" {
+    // The uniform additions are appended, so a shader written for the
+    // 160-byte Ghostty-compatible block must keep compiling untouched.
+    const glsl =
+        \\float ease(float x) { return pow(1.0 - x, 10.0); }
+        \\void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+        \\    fragColor = texture(iChannel0, fragCoord.xy / iResolution.xy);
+        \\    vec4 cc = iCurrentCursor;
+        \\    vec4 pc = iPreviousCursor;
+        \\    float progress = clamp((iTime - iTimeCursorChange) / 0.5, 0.0, 1.0);
+        \\    float d = distance(cc.xy, pc.xy) * ease(progress);
+        \\    fragColor = mix(fragColor, iCurrentCursorColor, clamp(d, 0.0, 1.0) * 0.2);
+        \\}
+    ;
+    const out = try compileGlslToTarget(std.testing.allocator, glsl, .msl);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(out.len > 0);
+}
+
+test "shaders referencing Ghostty's reserved iChannel1 still fail" {
+    // Zonvie deliberately does NOT claim iChannel1..3; leaving them
+    // undeclared is what keeps the slot free for a future Ghostty release.
+    const glsl =
+        \\void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+        \\    fragColor = texture(iChannel1, fragCoord.xy / iResolution.xy);
+        \\}
+    ;
+    try std.testing.expectError(
+        CompileError.ParseFailed,
+        compileGlslToTarget(std.testing.allocator, glsl, .msl),
+    );
 }
 
 test "compile trivial GLSL fragment shader to MSL" {
@@ -427,4 +650,45 @@ test "compile Shadertoy-style mainImage source to HLSL with auto-wrap" {
     try std.testing.expect(std.mem.indexOf(u8, out, "register(b1)") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "register(t0)") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "register(s0)") != null);
+}
+
+test "screen-space texture wrappers never emit an implicit-gradient Sample" {
+    // A gradient sample under divergent control flow makes D3DCompile try
+    // to unroll the enclosing loop; with a variable trip count it hangs.
+    const glsl =
+        \\void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+        \\    vec3 acc = vec3(0.0);
+        \\    int n = int(iTime) & 7;
+        \\    for (int i = 0; i < n; i++) {
+        \\        vec2 uv = (fragCoord + vec2(float(i), 0.0)) / iResolution.xy;
+        \\        vec3 c = texture(iChannel0, uv).rgb;
+        \\        if (c.r < 0.5) continue;
+        \\        acc += c + texture(iPrevFrame, uv).rgb;
+        \\    }
+        \\    fragColor = vec4(acc, 1.0);
+        \\}
+    ;
+    const out = try compileGlslToTarget(std.testing.allocator, glsl, .hlsl);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, ".Sample(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "zonvie_iChannel0Tex.SampleLevel(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "zonvie_iPrevFrameTex.SampleLevel(") != null);
+}
+
+test "ZONVIE_SHADER_ALPHA hands the alpha to the shader under preserve_alpha" {
+    // The colour the shader writes, alpha included, reaches the output only
+    // when the shader opted in; plain preserve_alpha replaces the alpha with
+    // the terminal's.
+    const body =
+        \\void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+        \\    fragColor = vec4(texture(iChannel0, fragCoord / iResolution.xy).rgb, 0.375);
+        \\}
+    ;
+    const owned = try compileGlslToTarget(std.testing.allocator, "#define ZONVIE_PRESERVE_ALPHA 1\n#define ZONVIE_SHADER_ALPHA 1\n" ++ body, .msl);
+    defer std.testing.allocator.free(owned);
+    try std.testing.expect(std.mem.indexOf(u8, owned, "out.zonvie_fragColor = color;") != null);
+
+    const pinned = try compileGlslToTarget(std.testing.allocator, "#define ZONVIE_PRESERVE_ALPHA 1\n" ++ body, .msl);
+    defer std.testing.allocator.free(pinned);
+    try std.testing.expect(std.mem.indexOf(u8, pinned, "out.zonvie_fragColor = color;") == null);
 }

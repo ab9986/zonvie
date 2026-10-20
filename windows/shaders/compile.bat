@@ -16,6 +16,15 @@ if errorlevel 1 (
     exit /b 1
 )
 
+echo Compiling custom-post and bloom shaders...
+fxc /T vs_5_0 /E VSCustomPost /O3 /Fo vs_custom_post.cso main.hlsl || exit /b 1
+fxc /T vs_5_0 /E VSFullscreen /O3 /Fo vs_fullscreen.cso main.hlsl || exit /b 1
+fxc /T ps_5_0 /E PSGlowExtract /O3 /Fo ps_glow_extract.cso main.hlsl || exit /b 1
+fxc /T ps_5_0 /E PSGlowOcclude /O3 /Fo ps_glow_occlude.cso main.hlsl || exit /b 1
+fxc /T ps_5_0 /E PSKawaseDown /O3 /Fo ps_kawase_down.cso main.hlsl || exit /b 1
+fxc /T ps_5_0 /E PSKawaseUp /O3 /Fo ps_kawase_up.cso main.hlsl || exit /b 1
+fxc /T ps_5_0 /E PSGlowComposite /O3 /Fo ps_glow_composite.cso main.hlsl || exit /b 1
+
 echo.
 echo Shaders compiled successfully!
 echo.

@@ -1792,7 +1792,12 @@ pub fn handleRedraw(
             .grid_scroll => try onGridScroll(grid, log, tuples),
             .hl_attr_define => try onHlAttrDefine(hl, arena, tuples),
             .hl_group_set => try onHlGroupSet(hl, tuples),
-            .default_colors_set => try onDefaultColorsSet(hl, tuples, opt_ctx, default_colors_fn),
+            .default_colors_set => {
+                // Not a keystroke edit anywhere: every texture's ghosts were
+                // drawn against the old colours.
+                grid.markCellStampBulk();
+                try onDefaultColorsSet(hl, tuples, opt_ctx, default_colors_fn);
+            },
             .option_set => try onOptionSet(arena, log, tuples, opt_ctx, guifont_fn, linespace_ctx, linespace_fn),
             .mode_info_set => try onModeInfoSet(grid, log, tuples),
             .mode_change => try onModeChange(grid, log, tuples),
@@ -1857,6 +1862,12 @@ fn onGridResize(
         if (t[0] != .int or t[1] != .int or t[2] != .int) continue;
 
         const grid_id = checkedGridId(t[0].int) orelse continue;
+        // Not a keystroke edit: this grid's texture is stale. A float
+        // (or a grid not shown yet) only overlays the main window, so
+        // resizing it moves none of the text a ghost sits on.
+        const overlay = isOverlayGrid(grid, grid_id) and
+            (grid.win_layer.contains(grid_id) or grid.bufForConst(grid_id) == null);
+        if (!overlay) grid.noteNonEditRedraw(grid_id);
 
         const width = checkedU32(t[1].int) orelse continue;
         const height = checkedU32(t[2].int) orelse continue;
@@ -1890,6 +1901,8 @@ fn onGridClear(
         // grid_clear: [grid]
         if (t.len < 1 or t[0] != .int) continue;
         const grid_id = checkedGridId(t[0].int) orelse continue;
+        // Not a keystroke edit: this grid's texture is stale.
+        grid.noteNonEditRedraw(grid_id);
         grid.clearGrid(grid_id);
     }
 }
@@ -1927,6 +1940,11 @@ fn onGridDestroy(
             log.write("grid_destroy: rejected attempt to destroy main grid (grid_id=1)\n", .{});
             continue;
         }
+        // Not a keystroke edit: this grid's texture is stale. A float's
+        // text was only drawn over the main window; whether the main
+        // window's own text moved is told by win_pos, not by this.
+        if (!isOverlayGrid(grid, grid_id) or grid.external_grids.contains(grid_id))
+            grid.noteNonEditRedraw(grid_id);
         try grid.destroyGrid(grid_id);
     }
 }
@@ -2023,6 +2041,10 @@ fn onWinPos(
     log: *Logger,
     tuples: []mp.Value,
 ) !void {
+    // Not a keystroke edit: the main window's composited layout
+    // moved, so its texture is stale. (Only its texture: an
+    // external window's is indexed by its own grid.)
+    grid.noteNonEditRedraw(1);
     // win_pos: [grid, win, startrow, startcol, width, height]
     for (tuples) |tv| {
         if (tv != .arr) continue;
@@ -2041,6 +2063,13 @@ fn onWinPos(
     }
 }
 
+/// A grid other than the main one that the cursor is not on: its
+/// placement can change what is drawn over the main window, never where
+/// the main window's own text sits.
+fn isOverlayGrid(grid: *const Grid, grid_id: i64) bool {
+    return grid_id != 1 and grid_id != grid.cursor_grid;
+}
+
 fn onWinHideClose(
     grid: *Grid,
     tuples: []mp.Value,
@@ -2053,6 +2082,10 @@ fn onWinHideClose(
         const t = tv.arr;
         if (t.len < 1 or t[0] != .int) continue;
         const grid_id = checkedGridId(t[0].int) orelse continue;
+        // Not a keystroke edit: a window left the composited layout. A
+        // float going away uncovers text that never moved.
+        if (!(isOverlayGrid(grid, grid_id) and grid.win_layer.contains(grid_id)))
+            grid.noteNonEditRedraw(1);
         // Track if a composited (non-external, non-float) editor window
         // is being closed. The promotion logic uses this to detect when
         // Neovim re-composites grid 2 as a fallback in the same batch.
@@ -2091,6 +2124,10 @@ fn onWinViewport(
         const curcol = t[5].int;
         const line_count = t[6].int;
         const scroll_delta = t[7].int;
+        // A viewport that scrolled is a repaint even when it
+        // arrives as grid_line rows (smoothscroll, wrapped lines)
+        // rather than grid_scroll.
+        if (scroll_delta != 0) grid.noteNonEditRedraw(grid_id);
 
         log.write("[win_viewport] grid_id={d} topline={d} line_count={d}\n", .{ grid_id, topline, line_count });
         try grid.setViewport(grid_id, win, topline, botline, curline, curcol, line_count, scroll_delta);
@@ -2126,7 +2163,6 @@ fn onWinFloatPos(
     log: *Logger,
     tuples: []mp.Value,
 ) !void {
-
     // Observed (older nvim): [grid, win, anchor, anchor_grid, anchor_row, anchor_col, mouse_enabled, zindex]
     // Docs (newer nvim):     [grid, win, anchor, anchor_grid, anchor_row, anchor_col, mouse_enabled,
     //                         zindex, compindex, screen_row, screen_col]
@@ -2145,6 +2181,10 @@ fn onWinFloatPos(
         const grid_id = checkedGridId(t[0].int) orelse continue;
         const win_id = t[1].int;
         const zindex = t[7].int;
+        // A float overlays the main window without moving its text, so
+        // placing one (a completion popup, every few keystrokes) keeps the
+        // smoke. Only a float holding the cursor carries ghosts of its own.
+        if (!isOverlayGrid(grid, grid_id)) grid.noteNonEditRedraw(1);
 
         // Optional fields (newer form)
         var compindex: i64 = 0;
@@ -2280,7 +2320,15 @@ fn onWinExternalPos(
             },
             else => return err,
         };
-        _ = is_new; // Callback notification is handled by nvim_core after redraw processing
+        // Callback notification is handled by nvim_core after redraw processing.
+        // A grid that just left the main window takes whatever it had
+        // composited there with it, so the main texture is stale. Neovim also
+        // resends this event for a window that is already external, in
+        // nearly every flush while one exists; that changes nothing on the
+        // main window and must not erase the smoke of a keystroke typed there.
+        // The external window's own texture is in its own coordinates and
+        // keeps its stamps either way.
+        if (is_new) grid.noteNonEditRedraw(1);
     }
 }
 
@@ -2340,6 +2388,8 @@ fn onGridScroll(
         if (t[0] != .int or t[1] != .int or t[2] != .int or t[3] != .int or t[4] != .int or t[5] != .int or t[6] != .int) continue;
 
         const grid_id = checkedGridId(t[0].int) orelse continue;
+        // Not a keystroke edit: this grid's content moved.
+        grid.noteNonEditRedraw(grid_id);
 
         const top = loggedRange(log, "grid_scroll", t[1].int, checkedU32(t[1].int)) orelse continue;
         const bot = loggedRange(log, "grid_scroll", t[2].int, checkedU32(t[2].int)) orelse continue;
@@ -2751,6 +2801,15 @@ fn onGridLine(
 
         const row = checkedU32(t[1].int) orelse continue;
         var col = checkedU32(t[2].int) orelse continue;
+        // Start of the span this tuple writes, for the cell-age
+        // stamp below (col advances as cells are written), and
+        // the bounds of the cells whose CONTENT actually changed
+        // within it. Neovim rewrites cells it did not change —
+        // a backspace at end of line can resend the whole tail
+        // — and only real changes are edits.
+        const stamp_col_start = col;
+        var changed_lo: u32 = std.math.maxInt(u32);
+        var changed_hi: u32 = 0;
 
         // Update order (existing behavior)
         grid.noteGridLine(grid_id);
@@ -2843,6 +2902,21 @@ fn onGridLine(
                     hl_to_use = grid.getCellHLGrid(grid_id, row, col - 1);
                 }
 
+                if (grid.shader_inputs_enabled) {
+                    // Glyph identity only, not the highlight: a
+                    // cell that keeps its character but changes
+                    // attributes is the same glyph re-styled —
+                    // an IME preedit committed with Enter swaps
+                    // the underlined preedit hl for the normal
+                    // one, and that must not read as typing the
+                    // text a second time.
+                    const was = grid.getCellGrid(grid_id, row, col);
+                    if (was.cp != cp) {
+                        changed_lo = @min(changed_lo, col);
+                        changed_hi = @max(changed_hi, col + 1);
+                    }
+                }
+
                 try grid.putCellGridCluster(
                     grid_id,
                     row,
@@ -2853,6 +2927,102 @@ fn onGridLine(
                 );
 
                 col += 1;
+            }
+        }
+
+        // Cell-age stamp for the iCellAge shader input. Gates, in
+        // order: the frontend asked for the data; this is a grid
+        // with a known screen position; and the tuple did not
+        // rewrite the whole row. The MODE gate is not applied:
+        // Neovim may order the `mode_change` to Insert AFTER the
+        // `grid_line` carrying the first typed character in the
+        // same batch, and gating on the mode here silently dropped
+        // that first keystroke.
+        //
+        // The full-row check is what keeps wrap reflow, `:s`, and
+        // scrolls that arrive as grid_line (smoothscroll, wrapped
+        // lines) from stamping — those rewrite every column, while
+        // typing touches a handful. Grid.stampEditedCells applies
+        // the remaining flush-level bulk guard.
+        if (grid.shader_inputs_enabled) {
+            // Where this grid's cells live. Grid 1 IS the main
+            // window's screen; under ext_multigrid a composited
+            // float is a sub-grid whose screen origin comes from
+            // win_pos, and it stamps the main window's texture at
+            // that offset. An EXTERNAL window (win_external_pos)
+            // has its own cell-age texture, indexed by its own
+            // grid coordinates, so it stamps under its grid id
+            // with a zero origin. A sub-grid with neither is not
+            // on any screen and stamps nothing.
+            const is_external = grid_id != 1 and grid.external_grids.contains(grid_id);
+            const stamp_grid: i64 = if (is_external) grid_id else 1;
+            const origin: ?grid_mod.GridPos = if (grid_id == 1 or is_external)
+                grid_mod.GridPos{ .row = 0, .col = 0 }
+            else
+                grid.win_pos.get(grid_id);
+
+            if (origin) |o| {
+                // Saturating adds throughout. `row` only passed
+                // checkedU32 (it is bounds-checked against the
+                // grid where cells are WRITTEN, not here), and a
+                // win_pos origin is equally unvalidated, so a
+                // wrapping `row + o.row` would land a hostile row
+                // on top of a real one — and panic in a safe
+                // build before it got the chance. Saturation puts
+                // the value nowhere near a cursor row, so the
+                // guard below rejects it.
+                const screen_row = row +| o.row;
+                const written = col - stamp_col_start;
+                const changed: u32 = if (changed_hi > changed_lo) changed_hi - changed_lo else 0;
+                // The cursor's row in the same coordinate space
+                // as screen_row: an external grid's cursor counts
+                // only when the cursor is ON that grid; on the
+                // main screen a cursor inside a composited float
+                // is offset by that float's win_pos.
+                const cursor_row_here: ?u32 = if (is_external)
+                    (if (grid.cursor_grid == grid_id) grid.cursor_row else null)
+                else if (grid.cursor_grid == 1)
+                    grid.cursor_row
+                else if (grid.win_pos.get(grid.cursor_grid)) |cp|
+                    grid.cursor_row +| cp.row
+                else
+                    null;
+                // Only the cursor's row and its neighbours are an
+                // edit. Everything else a keystroke repaints —
+                // the showmode line, the ruler, a statusline —
+                // is bookkeeping: it neither stamps nor turns
+                // the flush into a bulk repaint. Without this a
+                // plain `a` produced three touched rows (edit,
+                // showmode, ruler) and the row guard cleared the
+                // very keystroke that entered Insert mode.
+                const near_cursor = if (cursor_row_here) |cr|
+                    screen_row +| 1 >= cr and screen_row <= cr +| 1
+                else
+                    false;
+                if (written > 0 and near_cursor) {
+                    // "Full-row rewrite" is judged by what CHANGED,
+                    // not by what was sent: Neovim resends the
+                    // whole row for an insert at column 0 or on a
+                    // short line (every line of a small float),
+                    // and judging by `written` there turned one
+                    // typed glyph into a bulk repaint with no
+                    // smoke. A span of changed glyphs wider than
+                    // half the row is a reflow/scroll/substitute.
+                    if (grid_cols > 0 and changed *| 2 > grid_cols) {
+                        grid.markCellStampBulk();
+                    } else if (changed > 0) {
+                        // Stamp only the cells that changed, so
+                        // untouched glyphs in a resent tail get
+                        // no halo — the demo shows none on
+                        // standing text.
+                        grid.stampEditedCells(
+                            stamp_grid,
+                            screen_row,
+                            changed_lo +| o.col,
+                            changed,
+                        );
+                    }
+                }
             }
         }
     }
@@ -4828,4 +4998,694 @@ test "a split window hidden by a tab switch is external again on its next win_po
     try std.testing.expect(grid.isExternalGrid(3));
     try std.testing.expect(!grid.win_pos.contains(3));
     try std.testing.expectEqual(@as(i32, 4), grid.external_grids.get(3).?.start_row);
+}
+
+// ---------------------------------------------------------------------------
+// Cell-age stamp tests
+//
+// These drive real `grid_line` events through handleRedraw so the gates are
+// exercised where they actually run.
+// ---------------------------------------------------------------------------
+
+/// Arm stamping and set the mode, so each test can knock out one gate.
+fn armCellStamps(grid: *Grid, mode: []const u8) void {
+    grid.shader_inputs_enabled = true;
+    grid.resetCellStamps();
+    @memset(&grid.current_mode_name, 0);
+    const n = @min(mode.len, grid.current_mode_name.len - 1);
+    @memcpy(grid.current_mode_name[0..n], mode[0..n]);
+}
+
+test "cell stamps record the span a keystroke wrote in insert mode" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(2, 20);
+    armCellStamps(&grid, "insert");
+
+    const cells = [_]mp.Value{try testCell(arena, "a", 0, null)};
+    var events = [_]mp.Value{try testGridLineEvent(arena, 1, 0, 3, &cells)};
+    try runRedrawEvents(&grid, &hl, arena, &events);
+
+    try std.testing.expect(!grid.cell_stamp_clear);
+    try std.testing.expectEqual(@as(usize, 1), grid.cell_stamp_count);
+    try std.testing.expectEqual(@as(u16, 0), grid.cell_stamps[0].row);
+    try std.testing.expectEqual(@as(u16, 3), grid.cell_stamps[0].col);
+    try std.testing.expectEqual(@as(u16, 1), grid.cell_stamps[0].count);
+    try std.testing.expectEqual(@as(i16, 1), grid.cell_stamps[0].grid);
+}
+
+test "cell stamps count repeat-expanded cells, not tuple entries" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(2, 20);
+    armCellStamps(&grid, "insert");
+
+    grid.cursor_row = 1;
+    const cells = [_]mp.Value{try testCell(arena, "x", 0, 4)};
+    var events = [_]mp.Value{try testGridLineEvent(arena, 1, 1, 2, &cells)};
+    try runRedrawEvents(&grid, &hl, arena, &events);
+
+    try std.testing.expectEqual(@as(usize, 1), grid.cell_stamp_count);
+    try std.testing.expectEqual(@as(u16, 1), grid.cell_stamps[0].row);
+    try std.testing.expectEqual(@as(u16, 2), grid.cell_stamps[0].col);
+    try std.testing.expectEqual(@as(u16, 4), grid.cell_stamps[0].count);
+}
+
+test "gate 1: a flush made only of small grid_line writes is deliverable in any mode" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(2, 20);
+    // Normal mode: `x` is still a keystroke edit and gets its halo.
+    armCellStamps(&grid, "normal");
+
+    const cells = [_]mp.Value{try testCell(arena, "a", 0, null)};
+    var events = [_]mp.Value{try testGridLineEvent(arena, 1, 0, 3, &cells)};
+    try runRedrawEvents(&grid, &hl, arena, &events);
+
+    try std.testing.expectEqual(@as(usize, 1), grid.cell_stamp_count);
+    try std.testing.expect(!grid.cell_stamp_clear);
+    try std.testing.expect(!grid.cellStampGridCleared(1));
+}
+
+test "gate 1: a flush that also scrolled is not an edit and clears instead" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(4, 20);
+    armCellStamps(&grid, "insert");
+
+    // The same small grid_line as above, but the batch also carries a
+    // grid_scroll: the screen content moved, so nothing may be stamped and
+    // any existing ghost must be dropped.
+    const cells = [_]mp.Value{try testCell(arena, "a", 0, null)};
+    var events = [_]mp.Value{
+        (try testGridScrollEvent(arena, 0, 2, 0, 20, 1, 0))[0],
+        try testGridLineEvent(arena, 1, 0, 3, &cells),
+    };
+    try runRedrawEvents(&grid, &hl, arena, &events);
+
+    try std.testing.expect(grid.cellStampGridCleared(1));
+    var out: [grid_mod.cell_stamp_capacity + grid_mod.max_stamp_clear_grids]grid_mod.CellStamp = undefined;
+    const n = grid.buildCellStampDelivery(&out);
+    // One clear marker for the main texture, and the stamp is dropped.
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(@as(u16, 0), out[0].count);
+    try std.testing.expectEqual(@as(i16, 1), out[0].grid);
+}
+
+test "a non-edit on the main window does not clear an external grid's stamps" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(4, 20);
+    try grid.resizeGrid(7, 3, 10);
+    _ = try grid.setWinExternalPos(7, 1000);
+    armCellStamps(&grid, "insert");
+    grid.cursor_grid = 7;
+    grid.cursor_row = 1;
+
+    // The float is typed into, and the same batch scrolls the MAIN grid
+    // (the ruler repaint that follows every keystroke, say).
+    const cells = [_]mp.Value{try testCell(arena, "a", 0, null)};
+    var events = [_]mp.Value{
+        try testGridLineEvent(arena, 7, 1, 3, &cells),
+        (try testGridScrollEvent(arena, 0, 2, 0, 20, 1, 0))[0],
+    };
+    try runRedrawEvents(&grid, &hl, arena, &events);
+
+    try std.testing.expect(grid.cellStampGridCleared(1));
+    try std.testing.expect(!grid.cellStampGridCleared(7));
+    var out: [grid_mod.cell_stamp_capacity + grid_mod.max_stamp_clear_grids]grid_mod.CellStamp = undefined;
+    const n = grid.buildCellStampDelivery(&out);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(@as(u16, 0), out[0].count); // clear main
+    try std.testing.expectEqual(@as(i16, 1), out[0].grid);
+    try std.testing.expectEqual(@as(i16, 7), out[1].grid); // the float's stamp survives
+    try std.testing.expectEqual(@as(u16, 1), out[1].count);
+    try std.testing.expectEqual(@as(u16, 3), out[1].col);
+}
+
+test "rows away from the cursor (showmode, ruler) neither stamp nor clear" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(6, 12);
+    armCellStamps(&grid, "insert");
+    grid.cursor_row = 0;
+
+    // What a single `a` keystroke emits besides the edit: a full-width
+    // "-- INSERT --" on the last row and a ruler update on the row above.
+    // Neither is near the cursor, so the flush must stay a clean edit.
+    const showmode = [_]mp.Value{try testCell(arena, "-", 0, 12)};
+    const ruler = [_]mp.Value{try testCell(arena, "1", 0, 3)};
+    const edit = [_]mp.Value{try testCell(arena, "Z", 0, null)};
+    var events = [_]mp.Value{
+        try testGridLineEvent(arena, 1, 5, 0, &showmode),
+        try testGridLineEvent(arena, 1, 4, 8, &ruler),
+        try testGridLineEvent(arena, 1, 0, 5, &edit),
+    };
+    try runRedrawEvents(&grid, &hl, arena, &events);
+
+    try std.testing.expectEqual(@as(usize, 1), grid.cell_stamp_count);
+    try std.testing.expectEqual(@as(u16, 0), grid.cell_stamps[0].row);
+    try std.testing.expectEqual(@as(u16, 5), grid.cell_stamps[0].col);
+    try std.testing.expect(!grid.cell_stamp_clear);
+    try std.testing.expect(!grid.cellStampGridCleared(1));
+}
+
+test "only cells whose content changed are stamped, not the whole resent span" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(2, 20);
+    grid.cursor_row = 0;
+
+    // Seed "abcd" at cols 2..5 without stamping.
+    grid.shader_inputs_enabled = false;
+    const seed = [_]mp.Value{
+        try testCell(arena, "a", 0, null), try testCell(arena, "b", 0, null),
+        try testCell(arena, "c", 0, null), try testCell(arena, "d", 0, null),
+    };
+    var seed_ev = [_]mp.Value{try testGridLineEvent(arena, 1, 0, 2, &seed)};
+    try runRedrawEvents(&grid, &hl, arena, &seed_ev);
+
+    // Neovim resends "abc" unchanged and only the last cell differs ("X").
+    armCellStamps(&grid, "insert");
+    const resend = [_]mp.Value{
+        try testCell(arena, "a", 0, null), try testCell(arena, "b", 0, null),
+        try testCell(arena, "c", 0, null), try testCell(arena, "X", 0, null),
+    };
+    var ev = [_]mp.Value{try testGridLineEvent(arena, 1, 0, 2, &resend)};
+    try runRedrawEvents(&grid, &hl, arena, &ev);
+
+    try std.testing.expectEqual(@as(usize, 1), grid.cell_stamp_count);
+    try std.testing.expectEqual(@as(u16, 5), grid.cell_stamps[0].col);
+    try std.testing.expectEqual(@as(u16, 1), grid.cell_stamps[0].count);
+}
+
+test "a highlight-only change on an already-drawn glyph is not an edit (IME commit)" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(2, 20);
+    grid.cursor_row = 0;
+
+    // The preedit is drawn with hl 7 (underlined) — that IS typing, so it
+    // stamps.
+    armCellStamps(&grid, "insert");
+    const preedit = [_]mp.Value{
+        try testCell(arena, "\u{3042}", 7, null), try testCell(arena, "\u{3044}", 7, null),
+    };
+    var ev1 = [_]mp.Value{try testGridLineEvent(arena, 1, 0, 2, &preedit)};
+    try runRedrawEvents(&grid, &hl, arena, &ev1);
+    try std.testing.expectEqual(@as(usize, 1), grid.cell_stamp_count);
+    try std.testing.expectEqual(@as(u16, 2), grid.cell_stamps[0].count);
+
+    // Enter commits: the same glyphs come back with the normal hl 0. The
+    // glyphs are already on screen, so nothing is stamped.
+    grid.resetCellStamps();
+    const commit = [_]mp.Value{
+        try testCell(arena, "\u{3042}", 0, null), try testCell(arena, "\u{3044}", 0, null),
+    };
+    var ev2 = [_]mp.Value{try testGridLineEvent(arena, 1, 0, 2, &commit)};
+    try runRedrawEvents(&grid, &hl, arena, &ev2);
+    try std.testing.expectEqual(@as(usize, 0), grid.cell_stamp_count);
+
+    // Sanity: a real change in the same span still stamps that cell only.
+    const edit = [_]mp.Value{
+        try testCell(arena, "\u{3042}", 0, null), try testCell(arena, "\u{3046}", 0, null),
+    };
+    var ev3 = [_]mp.Value{try testGridLineEvent(arena, 1, 0, 2, &edit)};
+    try runRedrawEvents(&grid, &hl, arena, &ev3);
+    try std.testing.expectEqual(@as(usize, 1), grid.cell_stamp_count);
+    try std.testing.expectEqual(@as(u16, 3), grid.cell_stamps[0].col);
+    try std.testing.expectEqual(@as(u16, 1), grid.cell_stamps[0].count);
+}
+
+test "an external grid stamps under its own id with grid-local coordinates" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(2, 20);
+    try grid.resizeGrid(7, 3, 10);
+    _ = try grid.setWinExternalPos(7, 1000);
+    armCellStamps(&grid, "insert");
+
+    // Cursor elsewhere (main grid): the external grid's row is not near it.
+    grid.cursor_grid = 1;
+    grid.cursor_row = 1;
+    const cells = [_]mp.Value{try testCell(arena, "a", 0, null)};
+    var ev1 = [_]mp.Value{try testGridLineEvent(arena, 7, 1, 3, &cells)};
+    try runRedrawEvents(&grid, &hl, arena, &ev1);
+    try std.testing.expectEqual(@as(usize, 0), grid.cell_stamp_count);
+
+    // Cursor on the external grid, same row: stamped under grid 7, local
+    // row/col, untouched by the main window's cursor row.
+    grid.resetCellStamps();
+    grid.cursor_grid = 7;
+    grid.cursor_row = 1;
+    const cells2 = [_]mp.Value{try testCell(arena, "b", 0, null)};
+    var ev2 = [_]mp.Value{try testGridLineEvent(arena, 7, 1, 3, &cells2)};
+    try runRedrawEvents(&grid, &hl, arena, &ev2);
+    try std.testing.expectEqual(@as(usize, 1), grid.cell_stamp_count);
+    try std.testing.expectEqual(@as(i16, 7), grid.cell_stamps[0].grid);
+    try std.testing.expectEqual(@as(u16, 1), grid.cell_stamps[0].row);
+    try std.testing.expectEqual(@as(u16, 3), grid.cell_stamps[0].col);
+    try std.testing.expectEqual(@as(u16, 1), grid.cell_stamps[0].count);
+}
+
+test "a grid_line row that would overflow screen space neither panics nor stamps" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(4, 20);
+    armCellStamps(&grid, "insert");
+    grid.cursor_grid = 1;
+    grid.cursor_row = 0;
+
+    // maxInt(u32) passes checkedU32; the stamp block used to compute
+    // `row + o.row` and `screen_row + 1` on it and trap in a safe build.
+    const cells = [_]mp.Value{try testCell(arena, "a", 0, null)};
+    var events = [_]mp.Value{try testGridLineEvent(arena, 1, std.math.maxInt(u32), 0, &cells)};
+    try runRedrawEvents(&grid, &hl, arena, &events);
+
+    try std.testing.expectEqual(@as(usize, 0), grid.cell_stamp_count);
+    try std.testing.expect(!grid.cellStampGridCleared(1));
+}
+
+test "a composited float row that would overflow when offset by win_pos neither panics nor stamps" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(4, 20);
+    // A composited float placed with a non-zero win_pos row: the stamp block
+    // adds that origin to the event's row. maxInt(u32) + 2 wrapped.
+    try grid.resizeGrid(3, 2, 10);
+    try grid.setWinPos(3, 1000, 2, 0);
+    armCellStamps(&grid, "insert");
+    grid.cursor_grid = 1;
+    grid.cursor_row = 2;
+
+    const cells = [_]mp.Value{try testCell(arena, "a", 0, null)};
+    var events = [_]mp.Value{try testGridLineEvent(arena, 3, std.math.maxInt(u32), 0, &cells)};
+    try runRedrawEvents(&grid, &hl, arena, &events);
+
+    try std.testing.expectEqual(@as(usize, 0), grid.cell_stamp_count);
+    try std.testing.expect(!grid.cellStampGridCleared(1));
+}
+
+test "a cursor on a composited float at a hostile row neither panics nor stamps" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(4, 20);
+    try grid.resizeGrid(3, 2, 10);
+    try grid.setWinPos(3, 1000, 1, 0);
+    armCellStamps(&grid, "insert");
+    // The cursor sits on the float; the stamp block adds the float's
+    // win_pos row to cursor_row to compare in screen space. setCursor
+    // bounds-checks, so plant the hostile value directly, as a torn or
+    // stale field would.
+    grid.cursor_grid = 3;
+    grid.cursor_row = std.math.maxInt(u32);
+
+    const cells = [_]mp.Value{try testCell(arena, "a", 0, null)};
+    var events = [_]mp.Value{try testGridLineEvent(arena, 1, 0, 3, &cells)};
+    try runRedrawEvents(&grid, &hl, arena, &events);
+
+    try std.testing.expectEqual(@as(usize, 0), grid.cell_stamp_count);
+    try std.testing.expect(!grid.cellStampGridCleared(1));
+}
+
+test "gate 2: a sub-grid with no screen position stamps nothing" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(2, 20);
+    armCellStamps(&grid, "insert");
+
+    const cells = [_]mp.Value{try testCell(arena, "a", 0, null)};
+    var events = [_]mp.Value{try testGridLineEvent(arena, 7, 0, 3, &cells)};
+    try runRedrawEvents(&grid, &hl, arena, &events);
+
+    try std.testing.expectEqual(@as(usize, 0), grid.cell_stamp_count);
+}
+
+test "gate 3: a full-row rewrite clears instead of stamping" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(2, 8);
+    armCellStamps(&grid, "insert");
+
+    const cells = [_]mp.Value{try testCell(arena, "y", 0, 8)};
+    var events = [_]mp.Value{try testGridLineEvent(arena, 1, 0, 0, &cells)};
+    try runRedrawEvents(&grid, &hl, arena, &events);
+
+    try std.testing.expect(grid.cell_stamp_clear);
+    try std.testing.expectEqual(@as(usize, 0), grid.cell_stamp_count);
+}
+
+test "gate 3: a whole-row resend that changed a few cells stamps those cells (insert at column 0)" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(2, 8);
+    grid.cursor_row = 0;
+
+    // Seed "hello" at col 0 without stamping.
+    grid.shader_inputs_enabled = false;
+    const seed = [_]mp.Value{
+        try testCell(arena, "h", 0, null), try testCell(arena, "e", 0, null),
+        try testCell(arena, "l", 0, null), try testCell(arena, "l", 0, null),
+        try testCell(arena, "o", 0, null), try testCell(arena, " ", 0, 3),
+    };
+    var seed_ev = [_]mp.Value{try testGridLineEvent(arena, 1, 0, 0, &seed)};
+    try runRedrawEvents(&grid, &hl, arena, &seed_ev);
+
+    // Typing "x" at column 0: Neovim resends all 8 cells ("xhello  "), but
+    // only the span 0..6 shifted — that is 6 of 8, more than half, so this
+    // particular insert is a reflow. Overwrite instead: `rx` at column 0
+    // resends the row with exactly one changed cell.
+    armCellStamps(&grid, "insert");
+    const resend = [_]mp.Value{
+        try testCell(arena, "x", 0, null), try testCell(arena, "e", 0, null),
+        try testCell(arena, "l", 0, null), try testCell(arena, "l", 0, null),
+        try testCell(arena, "o", 0, null), try testCell(arena, " ", 0, 3),
+    };
+    var ev = [_]mp.Value{try testGridLineEvent(arena, 1, 0, 0, &resend)};
+    try runRedrawEvents(&grid, &hl, arena, &ev);
+
+    try std.testing.expect(!grid.cell_stamp_clear);
+    try std.testing.expectEqual(@as(usize, 1), grid.cell_stamp_count);
+    try std.testing.expectEqual(@as(u16, 0), grid.cell_stamps[0].col);
+    try std.testing.expectEqual(@as(u16, 1), grid.cell_stamps[0].count);
+
+    // More than half the row changed: bulk.
+    grid.resetCellStamps();
+    const many = [_]mp.Value{
+        try testCell(arena, "a", 0, null), try testCell(arena, "b", 0, null),
+        try testCell(arena, "c", 0, null), try testCell(arena, "d", 0, null),
+        try testCell(arena, "e", 0, null), try testCell(arena, " ", 0, 3),
+    };
+    var ev2 = [_]mp.Value{try testGridLineEvent(arena, 1, 0, 0, &many)};
+    try runRedrawEvents(&grid, &hl, arena, &ev2);
+    try std.testing.expect(grid.cell_stamp_clear);
+}
+
+test "gate 4: more rows than the bulk guard allows clears instead of stamping" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(8, 20);
+    armCellStamps(&grid, "insert");
+    // Rows 0..2 are all within one row of the cursor, so the row guard is
+    // what decides, not the cursor-proximity rule.
+    grid.cursor_row = 1;
+
+    const n = grid_mod.max_stamped_rows + 1;
+    var events: std.ArrayListUnmanaged(mp.Value) = .empty;
+    defer events.deinit(arena);
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const cells = try arena.alloc(mp.Value, 1);
+        cells[0] = try testCell(arena, "z", 0, null);
+        try events.append(arena, try testGridLineEvent(arena, 1, i, 0, cells));
+    }
+    try runRedrawEvents(&grid, &hl, arena, events.items);
+
+    try std.testing.expect(grid.cell_stamp_clear);
+    try std.testing.expectEqual(@as(usize, 0), grid.cell_stamp_count);
+}
+
+test "gate 4 boundary: exactly max_stamped_rows rows still stamp" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(8, 20);
+    armCellStamps(&grid, "insert");
+    // Rows 0..2 are all within one row of the cursor, so the row guard is
+    // what decides, not the cursor-proximity rule.
+    grid.cursor_row = 1;
+
+    var events: std.ArrayListUnmanaged(mp.Value) = .empty;
+    defer events.deinit(arena);
+    var i: u32 = 0;
+    while (i < grid_mod.max_stamped_rows) : (i += 1) {
+        const cells = try arena.alloc(mp.Value, 1);
+        cells[0] = try testCell(arena, "z", 0, null);
+        try events.append(arena, try testGridLineEvent(arena, 1, i, 0, cells));
+    }
+    try runRedrawEvents(&grid, &hl, arena, events.items);
+
+    try std.testing.expect(!grid.cell_stamp_clear);
+    try std.testing.expectEqual(grid_mod.max_stamped_rows, grid.cell_stamp_count);
+}
+
+test "opt-out: nothing is recorded while shader inputs are disabled" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(2, 20);
+    armCellStamps(&grid, "insert");
+    grid.shader_inputs_enabled = false;
+
+    const cells = [_]mp.Value{try testCell(arena, "a", 0, null)};
+    var events = [_]mp.Value{try testGridLineEvent(arena, 1, 0, 3, &cells)};
+    try runRedrawEvents(&grid, &hl, arena, &events);
+
+    try std.testing.expectEqual(@as(usize, 0), grid.cell_stamp_count);
+    try std.testing.expect(!grid.cell_stamp_clear);
+}
+
+test "a resent win_external_pos does not clear the main window's stamps" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(4, 20);
+    try grid.resizeGrid(7, 3, 10);
+    _ = try grid.setWinExternalPos(7, 1000);
+    armCellStamps(&grid, "insert");
+    grid.cursor_grid = 1;
+    grid.cursor_row = 0;
+
+    // Neovim resends win_external_pos for a window that is already external
+    // in the flush that follows a keystroke in the main window. Nothing
+    // moved on the main window, so the keystroke's stamp must survive.
+    const cells = [_]mp.Value{try testCell(arena, "a", 0, null)};
+    var events = [_]mp.Value{
+        try testGridLineEvent(arena, 1, 0, 3, &cells),
+        (try testIntEvent(arena, "win_external_pos", &.{ 7, 1000 }))[0],
+    };
+    try runRedrawEvents(&grid, &hl, arena, &events);
+
+    try std.testing.expect(!grid.cellStampGridCleared(1));
+    try std.testing.expectEqual(@as(usize, 1), grid.cell_stamp_count);
+}
+
+test "a window that newly becomes external clears the main window's stamps" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(4, 20);
+    try grid.resizeGrid(7, 3, 10);
+    armCellStamps(&grid, "insert");
+
+    // Grid 7 leaves the main window: whatever it had composited there is gone.
+    var events = [_]mp.Value{(try testIntEvent(arena, "win_external_pos", &.{ 7, 1000 }))[0]};
+    try runRedrawEvents(&grid, &hl, arena, &events);
+
+    try std.testing.expect(grid.cellStampGridCleared(1));
+}
+
+fn testFloatPosEvent(arena: std.mem.Allocator, grid_id: i64) ![]mp.Value {
+    const t = try arena.alloc(mp.Value, 8);
+    t[0] = .{ .int = grid_id };
+    t[1] = .{ .int = 1000 + grid_id }; // win
+    t[2] = .{ .str = "NW" };
+    t[3] = .{ .int = 1 }; // anchor_grid
+    t[4] = .{ .int = 1 }; // anchor_row
+    t[5] = .{ .int = 2 }; // anchor_col
+    t[6] = .{ .bool = true }; // mouse_enabled
+    t[7] = .{ .int = 50 }; // zindex
+    return testEvent(arena, "win_float_pos", t);
+}
+
+test "a popup float opening and closing keeps the main window's stamps" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(4, 20);
+    armCellStamps(&grid, "insert");
+    grid.cursor_grid = 1;
+    grid.cursor_row = 0;
+
+    // A completion popup opens with the keystroke: the float only overlays
+    // the main window, so the typed cell's stamp must survive.
+    const cells = [_]mp.Value{try testCell(arena, "a", 0, null)};
+    var line = [_]mp.Value{try testGridLineEvent(arena, 1, 0, 3, &cells)};
+    try runRedrawEvents(&grid, &hl, arena, &line);
+    try runRedrawEvents(&grid, &hl, arena, try testIntEvent(arena, "grid_resize", &.{ 8, 10, 3 }));
+    try runRedrawEvents(&grid, &hl, arena, try testFloatPosEvent(arena, 8));
+    try std.testing.expect(!grid.cellStampGridCleared(1));
+    try std.testing.expectEqual(@as(usize, 1), grid.cell_stamp_count);
+
+    // The next keystroke closes it again.
+    grid.resetCellStamps();
+    const cells2 = [_]mp.Value{try testCell(arena, "b", 0, null)};
+    var line2 = [_]mp.Value{try testGridLineEvent(arena, 1, 0, 4, &cells2)};
+    try runRedrawEvents(&grid, &hl, arena, &line2);
+    try runRedrawEvents(&grid, &hl, arena, try testIntEvent(arena, "grid_resize", &.{ 8, 12, 3 }));
+    try runRedrawEvents(&grid, &hl, arena, try testIntEvent(arena, "win_close", &.{8}));
+    try runRedrawEvents(&grid, &hl, arena, try testIntEvent(arena, "grid_destroy", &.{8}));
+    try std.testing.expect(!grid.cellStampGridCleared(1));
+    try std.testing.expectEqual(@as(usize, 1), grid.cell_stamp_count);
+}
+
+test "moving the float that holds the cursor clears the main window's stamps" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(4, 20);
+    try grid.resizeGrid(8, 1, 10);
+    try runRedrawEvents(&grid, &hl, arena, try testFloatPosEvent(arena, 8));
+    armCellStamps(&grid, "insert");
+    grid.cursor_grid = 8;
+
+    // The ghosts typed into this float sit where the float was.
+    try runRedrawEvents(&grid, &hl, arena, try testFloatPosEvent(arena, 8));
+    try std.testing.expect(grid.cellStampGridCleared(1));
+}
+
+test "closing a split window clears the main window's stamps" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(4, 20);
+    try grid.resizeGrid(3, 2, 20);
+    try runRedrawEvents(&grid, &hl, arena, try testIntEvent(arena, "win_pos", &.{ 3, 1003, 2, 0, 20, 2 }));
+    armCellStamps(&grid, "insert");
+    grid.cursor_grid = 1;
+
+    // The windows left behind resize into the closed one's rows.
+    try runRedrawEvents(&grid, &hl, arena, try testIntEvent(arena, "win_close", &.{3}));
+    try std.testing.expect(grid.cellStampGridCleared(1));
 }

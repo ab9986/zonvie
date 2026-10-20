@@ -1596,7 +1596,12 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     const title_len = std.unicode.utf8ToUtf16Le(&title_wide, title_str) catch 0;
     title_wide[title_len] = 0; // null terminate
 
-    const hwnd = c.CreateWindowExW(
+    const parked = takeParkedExternalWindow(app, req.grid_id);
+    const hwnd = if (parked) |p| reused: {
+        const move_flags: c.UINT = if (pos_x == c.CW_USEDEFAULT) c.SWP_NOMOVE else 0;
+        _ = c.SetWindowPos(p.hwnd, null, pos_x, pos_y, window_w, window_h, move_flags | c.SWP_NOZORDER | c.SWP_NOACTIVATE);
+        break :reused p.hwnd;
+    } else c.CreateWindowExW(
         dwExStyle,
         external_window_class_name.ptr,
         @ptrCast(title_wide[0..title_len :0].ptr),
@@ -1654,10 +1659,21 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
         }
     }
 
+    // A reused window's swapchain still holds its last showing's frame:
+    // cloaked until the first new one presents (uncloakAfterPresent).
+    if (parked != null) setCloaked(hwnd, true);
     // Show window without activating (SW_SHOWNA = 8)
     _ = c.ShowWindow(hwnd, 8);
 
-    const renderer = newExternalRenderer(app, hwnd) orelse {
+    const renderer = if (parked) |p| reused: {
+        var r = p.renderer;
+        r.resize() catch {
+            r.deinit();
+            _ = c.DestroyWindow(hwnd);
+            return .retry;
+        };
+        break :reused r;
+    } else newExternalRenderer(app, hwnd, req.grid_id) orelse {
         _ = c.DestroyWindow(hwnd);
         return .retry;
     };
@@ -1752,6 +1768,7 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
         // WM_DPICHANGED only reports a later move; the scrollbar strip and
         // resize insets read this from the first resize on.
         .dpi_scale = @as(f32, @floatFromInt(window_mod.GetDpiForWindow(hwnd.?))) / 96.0,
+        .uncloak_on_present = parked != null,
     };
     if (!window_mod.installWindowWakeCookie(hwnd.?, ext_window_ptr.window_wake_cookie)) {
         app.mu.unlock(core.clock.io());
@@ -1797,6 +1814,7 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
 
     // Set App pointer as user data for WndProc access
     app_mod.setApp(hwnd.?, app);
+    if (parked != null) _ = c.SetTimer(hwnd, app_mod.TIMER_EXTERNAL_UNCLOAK, app_mod.EXTERNAL_UNCLOAK_TIMEOUT_MS, null);
 
     if (app.external_windows.get(req.grid_id)) |ext_win| {
         if (!applyPendingExternalVerticesLocked(app, req.grid_id, ext_win) and applog.isEnabled()) {
@@ -1828,10 +1846,10 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
 
     app.mu.unlock(core.clock.io());
 
-    // Layout and rows may have arrived before this HWND was registered.
-    // Never acquire the core lock while holding app.mu (callbacks take the
-    // locks in the opposite direction).
-    core.zonvie_core_force_resend(app.corep);
+    // Layout and rows may have arrived before this HWND was registered; only
+    // this window's surface lost them. Never acquire the core lock while
+    // holding app.mu (callbacks take the locks in the opposite direction).
+    core.zonvie_core_force_resend_surface(app.corep, req.grid_id);
     if (app.corep) |corep| app_mod.zonvie_core_retry_flush(corep);
 
     // Register the OLE drop target outside the lock: RegisterDragDrop is a COM
@@ -2013,6 +2031,62 @@ pub fn windowOuterSizePx(hwnd: c.HWND, client_w: c_int, client_h: c_int) OuterSi
     return outerSizePx(styles, client_w, client_h, window_mod.GetDpiForWindow(hwnd));
 }
 
+const DWMWA_CLOAK: c.DWORD = 13;
+
+/// Cloaked, the window stays shown to Win32 (so it still gets WM_PAINT) but
+/// DWM composites nothing for it. HRESULT ignored: pre-Windows 8 no-op.
+fn setCloaked(hwnd: c.HWND, cloaked: bool) void {
+    var v: c.BOOL = if (cloaked) c.TRUE else c.FALSE;
+    _ = c.DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &v, @sizeOf(c.BOOL));
+}
+
+/// Show a reused window's first new frame: its swapchain still holds the last
+/// frame it presented before it was hidden.
+pub fn uncloakAfterPresent(ext_win: *app_mod.ExternalWindow) void {
+    if (!ext_win.uncloak_on_present) return;
+    ext_win.uncloak_on_present = false;
+    _ = c.KillTimer(ext_win.hwnd, app_mod.TIMER_EXTERNAL_UNCLOAK);
+    setCloaked(ext_win.hwnd, false);
+}
+
+/// Keep a closing decorated window's HWND and renderer for its grid's next
+/// open, releasing the rest. False when there is no free slot; the caller
+/// then destroys it as before.
+fn parkExternalWindow(app: *App, grid_id: i64, ext_win: *app_mod.ExternalWindow) bool {
+    if (classifyExternalSurface(grid_id) == .normal or ext_win.renderer.device_lost) return false;
+    const slot = for (&app.parked_external_windows) |*s| {
+        if (s.* == null) break s;
+    } else return false;
+    _ = c.SetWindowLongPtrW(ext_win.hwnd, c.GWLP_USERDATA, 0);
+    _ = c.KillTimer(ext_win.hwnd, app_mod.TIMER_EXTERNAL_UNCLOAK);
+    _ = c.ShowWindow(ext_win.hwnd, c.SW_HIDE);
+    setCloaked(ext_win.hwnd, false);
+    ext_win.deinitKeepingWindow(app.alloc, &app.row_vb_budget);
+    slot.* = .{ .grid_id = grid_id, .hwnd = ext_win.hwnd, .renderer = ext_win.renderer };
+    return true;
+}
+
+/// The parked window for `grid_id`, removed from its slot. One left on a
+/// device since replaced is destroyed instead: its renderer cannot draw.
+fn takeParkedExternalWindow(app: *App, grid_id: i64) ?app_mod.ParkedExternalWindow {
+    for (&app.parked_external_windows) |*s| {
+        const p = s.* orelse continue;
+        if (p.grid_id != grid_id) continue;
+        s.* = null;
+        var parked = p;
+        if (parked.renderer.device_lost or parked.renderer.device != app.d3d_device) {
+            _ = c.DestroyWindow(parked.hwnd);
+            parked.renderer.deinit();
+            return null;
+        }
+        // Inputs derived from the last showing's grid, which is gone.
+        parked.renderer.cell_age_cache = .{};
+        parked.renderer.feedback_primed = false;
+        return parked;
+    }
+    return null;
+}
+
 pub fn closeExternalWindowOnUIThread(app: *App, grid_id: i64) void {
     if (applog.isEnabled()) applog.appLog("[win] closeExternalWindowOnUIThread: grid_id={d}\n", .{grid_id});
 
@@ -2046,6 +2120,8 @@ pub fn closeExternalWindowOnUIThread(app: *App, grid_id: i64) void {
 
     // Remove from external_windows HashMap and get the entry
     const entry = app.external_windows.fetchRemove(grid_id);
+    // A later window reusing this grid id must start unedited.
+    app.cell_age.drop(grid_id);
     // Evict the scrollbar viewport cache entry for this grid; nothing else
     // removes it once the grid is gone (a dead grid_id is never re-queried),
     // so long sessions would otherwise accumulate one stale entry per
@@ -2087,7 +2163,7 @@ pub fn closeExternalWindowOnUIThread(app: *App, grid_id: i64) void {
         }
 
         // deinit handles DestroyWindow and resource cleanup
-        ext_win.deinit(app.alloc, &app.row_vb_budget);
+        if (!parkExternalWindow(app, grid_id, ext_win)) ext_win.deinit(app.alloc, &app.row_vb_budget);
         if (applog.isEnabled()) applog.appLog("[win] destroyed external window hwnd={*}\n", .{ext_win.hwnd});
         app.alloc.destroy(ext_win); // free the heap box itself; deinit() only frees its owned sub-resources
 
@@ -2729,6 +2805,10 @@ pub export fn ExternalWndProc(
                 const ext_window: ?*app_mod.ExternalWindow = if (hit) |h| h.win else null;
 
                 if (ext_window) |ext_win| {
+                    if (timer_id == app_mod.TIMER_EXTERNAL_UNCLOAK) {
+                        uncloakAfterPresent(ext_win);
+                        return 0;
+                    }
                     if (scrollbar.onTimer(app, scrollbar.externalSurface(ext_win, grid_id.?), timer_id)) {
                         return 0;
                     } else if (timer_id == app_mod.TIMER_COPY_BUTTON_REVERT) {
@@ -2959,9 +3039,15 @@ pub fn serviceDeferredSizeReplays(app: *App) void {
 /// shares the App device, so until that is published there is none, and
 /// it loads the main window's custom post-process shaders so overlays get the
 /// same effect through their own back_tex.
-pub fn newExternalRenderer(app: *App, hwnd: c.HWND) ?d3d11.Renderer {
+pub fn newExternalRenderer(app: *App, hwnd: c.HWND, grid_id: i64) ?d3d11.Renderer {
     const device = app.d3d_device orelse return null;
     const device_ctx = app.d3d_ctx orelse return null;
+    // One composition device serves every HWND on this D3D device; a window
+    // only needs its own target and visual on it.
+    const shared_dcomp = if (app.renderer) |*main_r|
+        (if (main_r.device == device) main_r.dcomp_device else null)
+    else
+        null;
     var renderer = d3d11.Renderer.initWithDevice(
         app.alloc,
         hwnd,
@@ -2970,11 +3056,19 @@ pub fn newExternalRenderer(app: *App, hwnd: c.HWND) ?d3d11.Renderer {
         device,
         device_ctx,
         false,
+        shared_dcomp,
     ) catch |e| {
         if (applog.isEnabled()) applog.appLog("[win] d3d11.Renderer.initWithDevice failed for external window: {any}\n", .{e});
         return null;
     };
-    renderer.loadCustomShaderPipelines(&app.config);
+    // The main renderer already compiled this config's shaders on this device;
+    // compiling them again kept a cmdline that opens on every `:` blank for
+    // the whole compile.
+    const adopted = if (app.renderer) |*main_r| renderer.adoptShadersFrom(main_r) else false;
+    if (!adopted) renderer.loadCustomShaderPipelines(&app.config);
+    // The core stamps an external window under its own grid id.
+    renderer.cell_age = &app.cell_age;
+    renderer.cell_age_grid = grid_id;
     if (app.corep) |corep| {
         if (core.zonvie_core_get_glow_enabled(corep)) _ = renderer.prepareBloomShaders();
     }
@@ -3148,11 +3242,20 @@ pub fn syncExternalShaderFrame(app: *App, hwnd: c.HWND, g_sh: *d3d11.Renderer, c
             g_sh.shader_cursor_previous_color = main_r3.shader_cursor_previous_color;
             g_sh.shader_cursor_change_time = main_r3.shader_cursor_change_time;
         }
+        // iCellSize, which also sizes this window's cell-age grid; the core
+        // stamps it under this window's grid id.
+        g_sh.cell_w_px = app.cell_w_px;
+        g_sh.cell_h_px = app.rowHeightPx();
     }
     g_sh.shader_screen_w = screen_w;
     g_sh.shader_screen_h = screen_h;
     g_sh.shader_window_offset_x = off_x;
     g_sh.shader_window_offset_y = off_y;
+    // iCellAge cell (0,0) is where the grid's cells start, past a decorated
+    // surface's icon strip and padding.
+    const content = decoratedContentOriginPx(app, classifyExternalSurface(g_sh.cell_age_grid));
+    g_sh.shader_grid_origin = .{ off_x + content.x, off_y + content.y };
+    g_sh.cursor_blink_on = app.cursor_blink.visible;
 }
 
 pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
@@ -3297,7 +3400,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
         const cursor_items = render_pipeline_helpers.cursorVertsForFrame(
             app_mod.Vertex,
             tbs_cursor.verts.items,
-            app.cursor_blink.visible,
+            app.cursor_blink.visible and !g.shaderDrawsCursorNow(),
         );
         if (cursor_items.len > 0) {
             ext_win.paint_scratch.ensureUnusedCapacity(app.alloc, cursor_items.len) catch {
@@ -3309,7 +3412,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
         vert_count = ext_win.paint_scratch.items.len;
     }
 
-    const cursor_blink_visible = app.cursor_blink.visible;
+    const cursor_blink_visible = app.cursor_blink.visible and !g.shaderDrawsCursorNow();
 
     // Dirty state snapshot from TBS (row-mode normal windows only).
     const dirty_row_keys = &ext_win.surf.paint.dirty_row_keys;
@@ -3463,6 +3566,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                 return;
             }
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow present succeeded\n", .{});
+            uncloakAfterPresent(ext_win);
             if (applog.isEnabled()) applog.appLog("[trace] event=frame_done surface={d}\n", .{grid_id});
             ext_win.surf.completePaintRetry();
             return;
