@@ -399,6 +399,10 @@ final class MetalTerminalView: GridInputView {
 
         renderer.onBeforeCommittedSnapshot = { [weak self] in
             guard let self else { return }
+            // Drain seeds against the revision whose rows are snapshotted; a
+            // commit landing after onPreDraw would otherwise draw its rows a
+            // frame before their seed (ExternalGridView does the same).
+            self.scrollModel?.serviceFrame()
             self.scrollModel?.processPendingScrollClears()
             self.updateScrollShaderOffset()
         }

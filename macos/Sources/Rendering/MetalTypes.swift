@@ -265,8 +265,9 @@ struct RetainedScrollRow {
 final class ScrollRetention {
     /// The ease covers at most a wheel event's worth of rows ('mousescroll'
     /// ver; zonvie_scroll_spring_seed), so the depth follows ver. Never below
-    /// two, which a ver of 1 still needs while a held key outruns the ease.
-    static let minDepthRows = 2
+    /// five: a held key at 60 rows/s trails the spring by ~4-4.5 rows, and a
+    /// cap below that saturates every frame and passes arrival jitter through.
+    static let minDepthRows = 5
     /// The spring's own cap (min(ver, 8) rows): a band no ease can open is
     /// never retained for.
     static let maxDepthRows = 8

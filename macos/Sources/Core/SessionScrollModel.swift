@@ -1341,8 +1341,12 @@ final class SessionScrollModel {
             var spring = smoothScrollGrids.contains(gridId)
                 ? (easeSprings[gridId] ?? zonvie_scroll_spring()) : zonvie_scroll_spring()
             spring.offset_px = Double(scrollOffsetPx[gridId] ?? 0)
+            // The spring caps at the ver it is given. A step within ver is
+            // given the retention floor instead, so a held key's lag fits;
+            // a larger step keeps ver and snaps as before.
+            let capVer = abs(rowsDelta) <= ver ? max(ver, ScrollRetention.minDepthRows) : ver
             guard zonvie_scroll_spring_seed(&spring, nowNs, Int32(clamping: rowsDelta),
-                                            Int32(clamping: Int(rowHeightPx.rounded())), Int32(clamping: ver),
+                                            Int32(clamping: Int(rowHeightPx.rounded())), Int32(clamping: capVer),
                                             UInt8(ZONVIE_LARGE_JUMP_SNAP)) else { continue }
             easeSprings[gridId] = spring
             scrollOffsetPx[gridId] = CGFloat(spring.offset_px)
@@ -1602,7 +1606,7 @@ final class SessionScrollModel {
         // stretch then paints over the rows that ARE retained. A 'mousescroll'
         // past the depth loses the excess to a jump either way; taking it here
         // at least keeps the band consistent.
-        let ver = min(core?.getMouseScrollVer() ?? 0, ScrollRetention.maxDepthRows)
+        let ver = ScrollRetention.depthRows(forBandRows: core?.getMouseScrollVer() ?? 0)
         let cells = max(Self.scrollMaxOverscrollCells, CGFloat(ver))
         let maxOffsetPx = safeCellHeightPx * cells
         guard maxOffsetPx > 0 else { return 0 }
