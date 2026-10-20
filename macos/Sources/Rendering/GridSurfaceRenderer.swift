@@ -1808,6 +1808,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         return min(us, 2_000) * 1_000
     }()
     static let commitGuardBandSpacingNs: UInt64 = 4_000_000
+    /// A commit this recent means the producer is streaming: Neovim's 16ms
+    /// timers land 17-18ms apart, so one vsync period alone is too tight.
+    static let commitGuardBandStreamWindowNs: UInt64 = 20_000_000
 
     /// Continuous-scroll guard band, shared by both surfaces' draws.
     ///
@@ -3259,12 +3262,16 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             lock.lock()
             let guardBandSmoothScrolling = scrollOffsetLatch.isSmoothScrolling
             lock.unlock()
+            // A scroll's first ~0.6s streams one commit per vsync with no
+            // offset yet, and its near misses drop frames the same way.
+            let guardBandStreaming = guardBandSmoothScrolling
+                || hadRecentCommit(withinNs: Self.commitGuardBandStreamWindowNs)
             Self.waitCommitGuardBand(
                 shared: shared,
                 lock: lock,
                 commitRevision: { self.commitRevision },
                 lastDrawnRevision: lastDrawnRevision,
-                isSmoothScrolling: guardBandSmoothScrolling,
+                isSmoothScrolling: guardBandStreaming,
                 timedOutRevision: &guardBandTimedOutRevision
             )
 

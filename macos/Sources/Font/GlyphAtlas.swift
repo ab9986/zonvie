@@ -14,6 +14,12 @@ final class GlyphAtlas {
     // Serializes zeroChunk use and texture zero-fill without extending mu
     // across Metal allocation/replace calls.
     private var textureCreateLock = os_unfair_lock()
+    // Guards `publishedMetrics` only. The core thread holds `mu` across each
+    // glyph's rasterization, and the main thread reads cell metrics several
+    // times per frame; reading them under `mu` stalled draws for whole
+    // rasterization bursts. Taken inside `mu` by the writer, alone by readers.
+    private var metricsMu = os_unfair_lock()
+    private var publishedMetrics: (width: Float, height: Float, ascent: Float, descent: Float) = (9, 18, 0, 0)
 
     private let device: MTLDevice
     private var font: CTFont
@@ -195,13 +201,12 @@ final class GlyphAtlas {
 
     /// Synchronized snapshot of all four font metrics. setFont()/
     /// setBackingScale() write these fields under `mu` from the core/RPC
-    /// thread; the render thread must read them together under the same
-    /// lock to avoid combining a fresh value in one field with a stale
-    /// value in another for one frame.
+    /// thread; recomputeMetrics() publishes all four together, so a reader
+    /// never combines a fresh value in one field with a stale one in another.
     func fontMetricsSnapshot() -> (width: Float, height: Float, ascent: Float, descent: Float) {
-        os_unfair_lock_lock(&mu)
-        defer { os_unfair_lock_unlock(&mu) }
-        return (cellWidthPx, cellHeightPx, ascentPx, descentPx)
+        os_unfair_lock_lock(&metricsMu)
+        defer { os_unfair_lock_unlock(&metricsMu) }
+        return publishedMetrics
     }
 
     // Cross-command-queue read/write synchronization for the shared atlas
@@ -773,6 +778,9 @@ final class GlyphAtlas {
             descentPx = Float(descent)
             cellHeightPx = Float(ceil(ascent + descent))
         }
+        os_unfair_lock_lock(&metricsMu)
+        publishedMetrics = (cellWidthPx, cellHeightPx, ascentPx, descentPx)
+        os_unfair_lock_unlock(&metricsMu)
     }
 
     // NOTE: only call when holding mu. Full rebuild: font + metrics + caches + atlas.
