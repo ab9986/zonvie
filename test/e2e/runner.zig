@@ -275,6 +275,11 @@ test "e2e:ext_anchor_scroll_under_float" {
     try @import("scenarios/ext_anchor_scroll_under_float.zig").run(testing.allocator);
 }
 
+test "e2e:rpc_notify_not_broadcast" {
+    try requireNvim();
+    try @import("scenarios/rpc_notify_not_broadcast.zig").run(testing.allocator);
+}
+
 test "e2e:agent_status_notify" {
     try requireNvim();
     try @import("scenarios/agent_status_notify.zig").run(testing.allocator);

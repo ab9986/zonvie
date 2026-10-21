@@ -15,8 +15,10 @@ The agent CLI sets its terminal's OSC window title. While thinking it animates a
 Braille spinner (`⠋⠙⠹…`, U+2800–U+28FF) as the leading glyph; when idle it shows
 a static marker (Claude: `✳`, Codex: bare title). `zonvie_agent_status.lua`
 captures the title via the `TermRequest` autocmd, classifies the first codepoint,
-and broadcasts a per-tabpage integer `state` to zonvie with
-`vim.rpcnotify(0, "zonvie_agent_status", { tab = <int>, state = <int>, title = <str> })`.
+and sends a per-tabpage integer `state` to zonvie's RPC channel with
+`vim.rpcnotify(vim.g.zonvie_channel, "zonvie_agent_status", { tab = <int>, state = <int>, title = <str> })`
+(`vim.g.zonvie_channel` is set by zonvie on attach; channel 0 would broadcast
+to every RPC client, such as coc.nvim).
 zonvie's frontend owns the per-tab indicator glyph + spinner (no agent-side
 configuration required). State codes (see `include/zonvie_core.h`): `0`=none,
 `1`=idle, `2`=working/claude, `3`=working/braille, `4`=waiting for user input.

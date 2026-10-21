@@ -11,7 +11,7 @@
 --   owns the per-tab indicator glyph + spinner animation.
 --
 -- Payload contract (must match include/zonvie_core.h on_agent_status):
---   vim.rpcnotify(0, 'zonvie_agent_status', { tab = <int>, state = <int>, title = <str> })
+--   vim.rpcnotify(vim.g.zonvie_channel, 'zonvie_agent_status', { tab = <int>, state = <int>, title = <str> })
 --   Low 7 bits of state: 0=none, 1=idle (agent present, done), 2=working/claude,
 --          3=working/braille (codex & generic), 4=waiting for user input.
 --   Bit 7 (0x80) is a "fire the OS notification now" flag, set on a
@@ -74,8 +74,11 @@ end
 local function report(tab, state, title, notify)
   if not notify and last[tab] == state then return end -- debounce spinner-frame churn
   last[tab] = state
-  -- Broadcast to all RPC channels; zonvie's UI channel handles it.
-  vim.rpcnotify(0, "zonvie_agent_status",
+  -- zonvie's own channel (it sets vim.g.zonvie_channel on attach). Channel 0
+  -- would broadcast to every RPC client, e.g. coc.nvim, which logs an error
+  -- for notifications it has no handler for. pcall: once zonvie detaches from
+  -- a server that keeps running, its channel is closed and rpcnotify raises.
+  pcall(vim.rpcnotify, vim.g.zonvie_channel or 0, "zonvie_agent_status",
     { tab = tab, state = notify and (state + 128) or state, title = title or "" })
 end
 

@@ -1282,7 +1282,12 @@ pub fn setupAgentStatus(self: *Core) void {
         \\local function report(tab, state, title, notify)
         \\  if not notify and last[tab] == state then return end
         \\  last[tab] = state
-        \\  vim.rpcnotify(0, 'zonvie_agent_status',
+        \\  -- zonvie's own channel (set by setupClipboard on this pipe, ahead of
+        \\  -- us). Channel 0 would broadcast to every RPC client, and coc.nvim
+        \\  -- logs an error for each notification it has no handler for.
+        \\  -- pcall: a server attached with --connect-nvim outlives the GUI, and
+        \\  -- rpcnotify on its closed channel raises "Invalid channel".
+        \\  pcall(vim.rpcnotify, vim.g.zonvie_channel or 0, 'zonvie_agent_status',
         \\    { tab = tab, state = notify and (state + 128) or state, title = title or '' })
         \\end
         \\-- Rank states so a tab with several agent buffers surfaces the most
@@ -1461,7 +1466,10 @@ pub fn setupMouseScrollReporter(self: *Core) void {
         \\  local ms = vim.o.mousescroll or ''
         \\  local n = tonumber(ms:match('ver:(%d+)'))
         \\  local h = tonumber(ms:match('hor:(%d+)'))
-        \\  vim.rpcnotify(0, 'zonvie_mousescroll', n or 3, h or 6)
+        \\  -- Own channel, not 0: a broadcast reaches other RPC clients too.
+        \\  -- pcall: the channel is closed once the GUI detaches from a server
+        \\  -- that keeps running.
+        \\  pcall(vim.rpcnotify, vim.g.zonvie_channel or 0, 'zonvie_mousescroll', n or 3, h or 6)
         \\end
         \\report()
         \\local grp = vim.api.nvim_create_augroup('zonvie_mousescroll', { clear = true })
