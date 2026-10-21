@@ -222,14 +222,15 @@ private enum ScrollRetentionTests {
         requireEqual(retention.publishedCount(gridId: 3), 1, "the second grid gets its own")
 
         // And the depth is per grid, not shared between them.
+        let depth = retention.depthRows
         retention.beginFlush()
         retention.beginStep(gridId: 2, rowsDelta: 1, pivotTargetRow: 0)
-        for row in 0..<5 { retention.stage(makeRow(retention, gridId: 2, targetRow: row)) }
+        for row in 0..<(depth + 2) { retention.stage(makeRow(retention, gridId: 2, targetRow: row)) }
         retention.beginStep(gridId: 3, rowsDelta: 1, pivotTargetRow: 0)
-        for row in 0..<5 { retention.stage(makeRow(retention, gridId: 3, targetRow: row)) }
+        for row in 0..<(depth + 2) { retention.stage(makeRow(retention, gridId: 3, targetRow: row)) }
         _ = retention.commit()
-        requireEqual(retention.publishedCount(gridId: 2), 3, "first grid holds a full depth")
-        requireEqual(retention.publishedCount(gridId: 3), 3, "second grid holds a full depth")
+        requireEqual(retention.publishedCount(gridId: 2), depth, "first grid holds a full depth")
+        requireEqual(retention.publishedCount(gridId: 3), depth, "second grid holds a full depth")
     }
 
     /// A step must not drag another grid's rows along with it: they describe
@@ -693,13 +694,14 @@ private enum ScrollRetentionTests {
     private static func verifyDepthClamp(device: MTLDevice) {
         let retention = ScrollRetention(device: device)
         retention.setDepthRows(2)
+        let depth = retention.depthRows
         retention.beginFlush()
         retention.beginStep(gridId: 2, rowsDelta: 1, pivotTargetRow: 0)
-        for row in 0..<5 {
+        for row in 0..<(depth + 3) {
             retention.stage(makeRow(retention, gridId: 2, targetRow: row))
         }
         _ = retention.commit()
-        requireEqual(retention.publishedCount(gridId: 2), 2, "a step keeps at most depth rows")
+        requireEqual(retention.publishedCount(gridId: 2), depth, "a step keeps at most depth rows")
     }
 
     private static func verifyDirtyRowsTravelWithTheShift() {
