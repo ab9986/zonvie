@@ -211,6 +211,12 @@ final class SessionScrollModel {
     /// re-read every tick. Meaningful only for grids in smoothScrollGrids.
     /// Guarded by scrollOffsetLock.
     private var easeSprings: [Int64: zonvie_scroll_spring] = [:]
+    /// The springs' clock. Draws start 13-20ms apart while their frames reach
+    /// the glass exactly one refresh apart, so the springs advance by whole
+    /// refresh periods, not by the draw's own time. `easeClockPhaseNs` is the
+    /// draw phase that maps onto that grid. Main thread only (frame callbacks).
+    private var easeClockNs: Int64 = 0
+    private var easeClockPhaseNs: Int64 = 0
 
     /// Maximum visual overscroll (rubber-band depth), in cells. Shared by the
     /// renderer clamp (clampVisualScrollOffsetPx) and the rubber-band
@@ -1243,6 +1249,34 @@ final class SessionScrollModel {
         // to avoid deadlock when this is called from Zig thread (which holds grid_mu).
     }
 
+    /// The draw's time rounded to whole refresh periods since the last tick.
+    /// Several ticks within one frame advance it once. Main thread only.
+    private func advanceEaseClock() -> Int64 {
+        let rawNs = Int64(clamping: DispatchTime.now().uptimeNanoseconds)
+        // The view draws at its own preferred rate, which a 120Hz panel does
+        // not raise, so the period is the longer of the two.
+        let view = core?.terminalView
+        let refreshS = view?.window?.screen?.minimumRefreshInterval ?? 0
+        let drawS = view.map { 1.0 / Double(max($0.preferredFramesPerSecond, 1)) } ?? 0
+        let periodS = max(refreshS, drawS)
+        let periodNs = periodS > 0 ? Int64(periodS * 1e9) : 16_666_667
+        if easeClockNs == 0 {
+            easeClockNs = rawNs
+            easeClockPhaseNs = rawNs
+            return easeClockNs
+        }
+        let elapsedNs = rawNs - easeClockPhaseNs
+        let periods = elapsedNs >= 0
+            ? (elapsedNs + periodNs / 2) / periodNs
+            : 0
+        easeClockNs += periods * periodNs
+        easeClockPhaseNs += periods * periodNs
+        // Follow the draw phase slowly, so a period slightly off the real
+        // refresh cannot drift the rounding boundary into the jitter.
+        easeClockPhaseNs += (rawNs - easeClockPhaseNs) / 8
+        return easeClockNs
+    }
+
     /// Advance and seed the keyboard sub-row scroll ease: the core's spring
     /// (zonvie_scroll_spring), the one Windows runs. Each grid's spring is
     /// ticked before this frame's seed lands, so a seed is never decayed over
@@ -1253,7 +1287,7 @@ final class SessionScrollModel {
         guard rowHeightPx > 0 else { return }
 
         let now = CFAbsoluteTimeGetCurrent()
-        let nowNs = Int64(clamping: DispatchTime.now().uptimeNanoseconds)
+        let nowNs = advanceEaseClock()
         let ver = core?.getMouseScrollVer() ?? 0
         // The band an eased step opens is as wide as a wheel event's rows, the
         // most a seed can cover.
@@ -1437,8 +1471,8 @@ final class SessionScrollModel {
         // nothing spent, and the picture jumped a whole row. Running them from
         // every surface's frame also means a paused or occluded main window
         // cannot stall an external window's animation. Calling twice in one
-        // frame is harmless: the decay is wall-clock based, so the second call
-        // advances it by ~0.
+        // frame is harmless: the ease clock advances at most once per frame,
+        // and the gesture decay is wall-clock based.
         tickGestureSmoothScroll()
         tickSmoothScroll()
         tickScrollEdgeBounce()
